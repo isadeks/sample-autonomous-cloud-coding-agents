@@ -134,6 +134,8 @@ def _run_task_background(
     branch_name: str = "",
     pr_number: str = "",
     cedar_policies: list[str] | None = None,
+    channel_source: str = "",
+    channel_metadata: dict[str, str] | None = None,
 ) -> None:
     """Run the agent task in a background thread."""
     global _background_pipeline_failed
@@ -173,6 +175,8 @@ def _run_task_background(
             branch_name=branch_name,
             pr_number=pr_number,
             cedar_policies=cedar_policies,
+            channel_source=channel_source,
+            channel_metadata=channel_metadata,
         )
         _background_pipeline_failed = False
     except Exception as e:
@@ -226,6 +230,8 @@ def invoke_agent(request: Request, body: InvocationRequest):
     branch_name = inp.get("branch_name", "")
     pr_number = str(inp.get("pr_number", ""))
     cedar_policies = inp.get("cedar_policies") or []
+    channel_source = inp.get("channel_source", "") or ""
+    channel_metadata = inp.get("channel_metadata") or {}
 
     # Extract AgentCore session ID from request headers for OTEL correlation
     session_id = request.headers.get("x-amzn-bedrock-agentcore-runtime-session-id", "")
@@ -251,6 +257,8 @@ def invoke_agent(request: Request, body: InvocationRequest):
             branch_name,
             pr_number,
             cedar_policies,
+            channel_source,
+            channel_metadata,
         ),
     )
     # Track the thread for graceful shutdown BEFORE starting it so

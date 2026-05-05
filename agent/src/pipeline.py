@@ -13,7 +13,8 @@ from pydantic import ValidationError
 
 import memory as agent_memory
 import task_state
-from config import AGENT_WORKSPACE, build_config, get_config
+from channel_mcp import configure_channel_mcp
+from config import AGENT_WORKSPACE, build_config, get_config, resolve_linear_api_token
 from context import assemble_prompt, fetch_github_issue
 from models import AgentResult, HydratedContext, RepoSetup, TaskConfig, TaskResult
 from observability import task_span
@@ -149,6 +150,8 @@ def run_task(
     branch_name: str = "",
     pr_number: str = "",
     cedar_policies: list[str] | None = None,
+    channel_source: str = "",
+    channel_metadata: dict[str, str] | None = None,
 ) -> dict:
     """Run the full agent pipeline and return a serialized result dict.
 
@@ -179,6 +182,8 @@ def run_task(
         task_type=task_type,
         branch_name=branch_name,
         pr_number=pr_number,
+        channel_source=channel_source,
+        channel_metadata=channel_metadata,
     )
 
     # Inject Cedar policies into config for the PolicyEngine in runner.py
@@ -277,6 +282,15 @@ def run_task(
                 setup_span.set_attribute("build.before", setup.build_before)
 
             system_prompt = build_system_prompt(config, setup, hc, system_prompt_overrides)
+
+            # Channel-specific MCP wiring (Linear only, for v1). Must happen
+            # before discover_project_config so the scan picks up the file we
+            # just wrote. Resolve the API token from Secrets Manager *before*
+            # writing .mcp.json so the child SDK process inherits the env var
+            # that the MCP server entry references via ${LINEAR_API_TOKEN}.
+            if config.channel_source == "linear":
+                resolve_linear_api_token()
+            configure_channel_mcp(setup.repo_dir, config.channel_source)
 
             # Log discovered repo-level project configuration
             # (all files loaded by setting_sources=["project"])

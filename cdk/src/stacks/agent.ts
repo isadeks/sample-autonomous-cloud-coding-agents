@@ -443,6 +443,15 @@ export class AgentStack extends Stack {
       guardrailVersion: inputGuardrail.guardrailVersion,
     });
 
+    // Pipe the Linear API token secret into the AgentCore runtime so the
+    // agent's `resolve_linear_api_token()` can populate `LINEAR_API_TOKEN`
+    // for the Linear MCP's `${LINEAR_API_TOKEN}` placeholder.
+    linearIntegration.apiTokenSecret.grantRead(runtime);
+    cfnRuntime.addPropertyOverride(
+      'EnvironmentVariables.LINEAR_API_TOKEN_SECRET_ARN',
+      linearIntegration.apiTokenSecret.secretArn,
+    );
+
     new CfnOutput(this, 'LinearWebhookSecretArn', {
       value: linearIntegration.webhookSecret.secretArn,
       description: 'Secrets Manager ARN for the Linear webhook signing secret — populate via `bgagent linear setup`',

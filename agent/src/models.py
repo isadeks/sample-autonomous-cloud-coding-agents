@@ -108,6 +108,11 @@ class TaskConfig(BaseModel):
     branch_name: str = ""
     pr_number: str = ""
     task_id: str = ""
+    # Inbound channel the task was submitted from (mirrors ChannelSource in
+    # cdk/src/handlers/shared/types.ts). Gates channel-specific MCP wiring and
+    # prompt additions. Empty string means "no channel context" (legacy / local).
+    channel_source: str = ""
+    channel_metadata: dict[str, str] = Field(default_factory=dict)
     # Enriched mid-flight by pipeline.py:
     cedar_policies: list[str] = []
     issue: GitHubIssue | None = None

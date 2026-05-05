@@ -75,7 +75,39 @@ def build_system_prompt(
         n = len(overrides)
         log("TASK", f"Applied system prompt overrides ({n} chars)")
 
+    # Channel-specific guidance (appended last so channel instructions sit
+    # close to the end of the prompt, where the model weights recency).
+    channel_addendum = _channel_prompt_addendum(config)
+    if channel_addendum:
+        system_prompt += channel_addendum
+
     return system_prompt
+
+
+def _channel_prompt_addendum(config: TaskConfig) -> str:
+    """Return channel-specific prompt guidance, or empty string.
+
+    For Linear-origin tasks, instruct the agent to post progress comments and
+    transition state using the already-loaded Linear MCP tools. The tool names
+    are stated explicitly so the agent doesn't grope for them.
+    """
+    if config.channel_source != "linear":
+        return ""
+    issue_identifier = config.channel_metadata.get("linear_issue_identifier") or ""
+    issue_ref = f" (`{issue_identifier}`)" if issue_identifier else ""
+    return (
+        "\n\n## Linear issue progress updates\n\n"
+        f"This task was submitted from a Linear issue{issue_ref}. The Linear MCP "
+        "server is loaded — use its tools to keep the reporter informed:\n\n"
+        "- When you start working: call `mcp__linear-server__save_comment` with a "
+        "short \"🤖 Starting on this issue…\" message.\n"
+        "- When you open a PR: call `mcp__linear-server__save_comment` with the PR "
+        "URL, and `mcp__linear-server__update_issue` to transition state (e.g. to "
+        "`In Review`) if the workspace has that state.\n"
+        "- On completion or failure: call `mcp__linear-server__save_comment` with "
+        "the final status.\n\n"
+        "Keep comments concise. Do not mirror the full agent transcript back to Linear."
+    )
 
 
 def discover_project_config(repo_dir: str) -> dict[str, list[str]]:
