@@ -288,6 +288,13 @@ async function getBotToken(teamId: string): Promise<string | null> {
   return getSlackSecret(`${SLACK_SECRET_PREFIX}${teamId}`);
 }
 
+/** Slack error codes that definitively mean the bot cannot post in this channel. */
+const CHANNEL_ACCESS_HARD_FAILURES = new Set([
+  'channel_not_found', // private channel the bot hasn't been invited to
+  'not_in_channel',    // public channel the bot isn't in (some workspaces require join)
+  'missing_scope',     // bot lacks the scope it needs — admin must reinstall
+]);
+
 async function checkChannelAccess(teamId: string, channelId: string): Promise<{ ok: boolean; error?: string }> {
   // DM channels always work — notifications fall back to user ID.
   if (channelId.startsWith('D')) return { ok: true };
@@ -308,18 +315,20 @@ async function checkChannelAccess(teamId: string, channelId: string): Promise<{ 
     const result = await response.json() as { ok: boolean; channel?: { is_private: boolean; is_member: boolean }; error?: string };
 
     if (!result.ok) {
-      // channel_not_found means the bot can't see it — private channel, not invited.
-      if (result.error === 'channel_not_found') {
+      // Hard failures: the bot definitively cannot post here. Fail closed so the
+      // task isn't created silently into a dead-letter channel.
+      if (result.error && CHANNEL_ACCESS_HARD_FAILURES.has(result.error)) {
         return { ok: false, error: ':lock: This is a private channel and the bot is not a member. Invite the bot first with `/invite @bgagent`, or submit from a public channel or DM.' };
       }
-      // Unknown Slack error — surface it rather than silently allowing.
-      // The task would otherwise be created but the user would never see a
-      // notification land, with no hint of what went wrong.
-      logger.warn('Channel access check returned unknown error', { error: result.error, channel_id: channelId });
-      return {
-        ok: false,
-        error: `:warning: Couldn't verify the bot can post in this channel (Slack error: \`${result.error ?? 'unknown'}\`). Try again or submit from a public channel or DM.`,
-      };
+      // Anything else (ratelimited, internal_error, fatal_error, network blip) is
+      // likely transient — fail open and let slack-notify surface any real delivery
+      // failure downstream. Blocking task submission on a 30-second Slack blip is
+      // a worse UX than creating a task that notifies late.
+      logger.warn('Channel access check: transient/unknown Slack error, failing open', {
+        error: result.error,
+        channel_id: channelId,
+      });
+      return { ok: true };
     }
 
     if (result.channel?.is_private && !result.channel?.is_member) {
@@ -328,11 +337,11 @@ async function checkChannelAccess(teamId: string, channelId: string): Promise<{ 
 
     return { ok: true };
   } catch (err) {
-    logger.warn('Channel access check failed', { error: err instanceof Error ? err.message : String(err) });
-    return {
-      ok: false,
-      error: ':warning: Couldn\'t reach Slack to verify channel access. Please try again in a moment.',
-    };
+    // Network-level failure — treat the same as a transient Slack error.
+    logger.warn('Channel access check network failure, failing open', {
+      error: err instanceof Error ? err.message : String(err),
+    });
+    return { ok: true };
   }
 }
 

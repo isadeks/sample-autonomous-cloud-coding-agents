@@ -175,6 +175,22 @@ describe('slack-command-processor handler', () => {
     expect(createTaskCoreMock).not.toHaveBeenCalled();
   });
 
+  test('mention submit fails open on transient Slack errors (ratelimited, internal_error)', async () => {
+    ddbSend.mockResolvedValueOnce({ Item: { status: 'active', platform_user_id: 'cognito-1' } });
+    ddbSend.mockResolvedValue({ Item: { status: 'active' } });
+    // conversations.info returns a non-hard failure — task creation should proceed.
+    fetchMock.mockResolvedValueOnce({
+      ok: true,
+      json: () => Promise.resolve({ ok: false, error: 'ratelimited' }),
+    });
+    createTaskCoreMock.mockResolvedValueOnce({
+      statusCode: 201,
+      body: JSON.stringify({ data: { task_id: 'T1', repo: 'org/repo', status: 'SUBMITTED' } }),
+    });
+    await handler(mention({ text: 'submit org/repo fix' }));
+    expect(createTaskCoreMock).toHaveBeenCalledTimes(1);
+  });
+
   test('link subcommand persists pending mapping with a link code', async () => {
     ddbSend.mockResolvedValueOnce({}); // Put pending mapping
     await handler(slashCommand({ text: 'link' }));
