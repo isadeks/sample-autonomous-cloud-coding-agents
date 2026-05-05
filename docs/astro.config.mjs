@@ -51,6 +51,7 @@ export default defineConfig({
             { slug: 'using/using-the-rest-api' },
             { slug: 'using/using-the-cli' },
             { slug: 'using/webhook-integration' },
+            { slug: 'using/slack-setup-guide' },
             { slug: 'using/task-lifecycle' },
             { slug: 'using/what-the-agent-does' },
             { slug: 'using/tips-for-being-a-good-citizen' },

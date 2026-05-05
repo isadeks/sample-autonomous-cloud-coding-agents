@@ -43,6 +43,7 @@ function rewriteDocsLinkTarget(target) {
     DEVELOPER_GUIDE: '/developer-guide/introduction',
     USER_GUIDE: '/using/overview',
     CONTRIBUTING: '/developer-guide/contributing',
+    SLACK_SETUP_GUIDE: '/using/slack-setup-guide',
   };
 
   /** `splitGuide` emits each `##` from DEVELOPER_GUIDE as its own page — map #anchors to those routes. */
@@ -214,6 +215,12 @@ mirrorMarkdownFile(
 mirrorMarkdownFile(
   path.join(docsRoot, 'guides', 'PROMPT_GUIDE.md'),
   path.join('src', 'content', 'docs', 'customizing', 'Prompt-engineering.md'),
+);
+
+// --- Slack Setup Guide: mirror to using/ ---
+mirrorMarkdownFile(
+  path.join(docsRoot, 'guides', 'SLACK_SETUP_GUIDE.md'),
+  path.join('src', 'content', 'docs', 'using', 'Slack-setup-guide.md'),
 );
 
 // --- Roadmap: mirror to roadmap/ ---
