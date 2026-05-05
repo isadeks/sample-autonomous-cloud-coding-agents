@@ -49,18 +49,45 @@ const NOTIFIABLE_EVENTS = new Set([
  * 2. If channel_source is 'slack', render a Block Kit message and post to Slack.
  * 3. Thread replies under the initial message using stored slack_thread_ts.
  *
- * Notifications are best-effort — failures are logged but never fail the stream.
+ * Infrastructure errors (DynamoDB, Secrets Manager) are rethrown so Lambda's
+ * configured retry/bisect behavior can do its job. Slack API errors are
+ * treated as delivery failures and logged but never fail the batch.
  */
 export async function handler(event: DynamoDBStreamEvent): Promise<void> {
   for (const record of event.Records) {
     try {
       await processRecord(record);
     } catch (err) {
-      logger.warn('Failed to process Slack notification for stream record', {
+      // Slack delivery errors are terminal — swallow after logging so the batch
+      // isn't retried for something a retry can't fix.
+      if (err instanceof SlackApiError) {
+        logger.warn('Slack delivery failed', {
+          error: err.message,
+          event_id: record.eventID,
+        });
+        continue;
+      }
+      // Infrastructure errors (DynamoDB throttling, Secrets Manager outage, etc.)
+      // rethrow so Lambda retries the batch per the configured retryAttempts +
+      // bisectBatchOnError behavior.
+      logger.error('Infrastructure error processing Slack notification', {
         error: err instanceof Error ? err.message : String(err),
         event_id: record.eventID,
       });
+      throw err;
     }
+  }
+}
+
+/**
+ * Thrown when the Slack API returns an error after a successful HTTP call.
+ * Tagged so the batch handler can swallow it without retrying — Slack errors
+ * are not recoverable by retrying the stream record.
+ */
+class SlackApiError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'SlackApiError';
   }
 }
 
@@ -73,10 +100,19 @@ async function processRecord(record: DynamoDBRecord): Promise<void> {
 
   if (!eventType || !taskId || !NOTIFIABLE_EVENTS.has(eventType)) return;
 
+  // Load the task record first so we can skip non-Slack tasks before touching
+  // their DynamoDB row with dedup writes.
+  const taskResult = await ddb.send(new GetCommand({
+    TableName: TASK_TABLE,
+    Key: { task_id: taskId },
+  }));
+
+  const task = taskResult.Item as TaskRecord | undefined;
+  if (!task || task.channel_source !== 'slack') return;
+
   // Deduplicate terminal notifications — the orchestrator may write multiple
   // failure/completion events (retries). Use a conditional update to claim
   // the right to send the terminal notification.
-
   if (TERMINAL_EVENTS.has(eventType)) {
     try {
       await ddb.send(new UpdateCommand({
@@ -95,15 +131,6 @@ async function processRecord(record: DynamoDBRecord): Promise<void> {
     }
   }
 
-  // Load the task record.
-  const taskResult = await ddb.send(new GetCommand({
-    TableName: TASK_TABLE,
-    Key: { task_id: taskId },
-  }));
-
-  const task = taskResult.Item as TaskRecord | undefined;
-  if (!task || task.channel_source !== 'slack') return;
-
   const channelMeta = task.channel_metadata;
   if (!channelMeta?.slack_team_id || !channelMeta?.slack_channel_id) {
     logger.warn('Slack task missing channel metadata', { task_id: taskId });
@@ -120,9 +147,10 @@ async function processRecord(record: DynamoDBRecord): Promise<void> {
     return;
   }
 
-  // Parse event metadata if present.
+  // Parse event metadata if present. Failures are logged and treated as "no metadata" —
+  // the surfaced fallback reason is "Unknown error" which is user-hostile without a log.
   const eventMetadata = newImage.metadata?.S
-    ? safeJsonParse(newImage.metadata.S)
+    ? safeJsonParse(newImage.metadata.S, { task_id: taskId, event_type: eventType })
     : undefined;
 
   // Render the Slack message.
@@ -167,12 +195,10 @@ async function processRecord(record: DynamoDBRecord): Promise<void> {
   const result = await response.json() as { ok: boolean; ts?: string; error?: string };
 
   if (!result.ok) {
-    logger.warn('Slack API returned error', {
-      error: result.error,
-      task_id: taskId,
-      event_type: eventType,
-    });
-    return;
+    // Slack API errors are not retryable via the Lambda batch (re-processing the
+    // stream record won't make Slack start accepting the message), so throw a
+    // tagged error and let the batch handler swallow it after logging.
+    throw new SlackApiError(`slack chat.postMessage failed: ${result.error ?? 'unknown'} (task_id=${taskId} event_type=${eventType})`);
   }
 
   // Emoji reaction on the root message — the user's @mention or the task_created message.
@@ -324,10 +350,15 @@ async function deleteMessage(botToken: string, channel: string, messageTs: strin
   }
 }
 
-function safeJsonParse(text: string): Record<string, unknown> | null {
+function safeJsonParse(text: string, context?: Record<string, unknown>): Record<string, unknown> | null {
   try {
     return JSON.parse(text);
-  } catch {
+  } catch (err) {
+    logger.warn('Failed to parse event metadata JSON', {
+      ...context,
+      error: err instanceof Error ? err.message : String(err),
+      preview: text.length > 200 ? `${text.slice(0, 200)}...` : text,
+    });
     return null;
   }
 }

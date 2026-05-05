@@ -19,26 +19,58 @@
 
 import * as crypto from 'crypto';
 import { DynamoDBClient } from '@aws-sdk/client-dynamodb';
-import { DynamoDBDocumentClient, GetCommand, PutCommand, UpdateCommand } from '@aws-sdk/lib-dynamodb';
+import { DynamoDBDocumentClient, GetCommand, PutCommand } from '@aws-sdk/lib-dynamodb';
 import { createTaskCore } from './shared/create-task-core';
 import { logger } from './shared/logger';
+import { slackFetch } from './shared/slack-api';
 import { getSlackSecret, SLACK_SECRET_PREFIX } from './shared/slack-verify';
 import type { SlackCommandPayload } from './slack-commands';
 
-/** Extended payload for mention-sourced commands (no response_url available). */
-interface MentionPayload extends SlackCommandPayload {
-  readonly source?: 'mention';
+/**
+ * Payload fields every inbound event carries, whether it came from a slash
+ * command or an @mention.
+ */
+interface BasePayload {
+  readonly text: string;
+  readonly user_id: string;
+  readonly team_id: string;
+  readonly channel_id: string;
+}
+
+/** Slash-command invocation — has a usable response_url, no mention context. */
+export interface SlashCommandEvent extends BasePayload, SlackCommandPayload {
+  readonly source: 'slash';
+}
+
+/** @mention invocation — no response_url; reply via chat.postMessage in-thread. */
+export interface MentionEvent extends BasePayload {
+  readonly source: 'mention';
   readonly mention_thread_ts?: string;
+}
+
+/** Discriminated union of the inbound events the processor accepts. */
+export type CommandProcessorEvent = SlashCommandEvent | MentionEvent;
+
+/**
+ * Legacy shape — the slash-command acknowledger (`slack-commands.ts`) forwards
+ * payloads without a `source` field. Normalize those into SlashCommandEvent so
+ * the handler body only has to reason about the discriminated union.
+ */
+type RawEvent = CommandProcessorEvent | SlackCommandPayload;
+
+function normalizeEvent(event: RawEvent): CommandProcessorEvent {
+  if ('source' in event && event.source) {
+    return event;
+  }
+  return { ...event, source: 'slash' };
 }
 
 const ddb = DynamoDBDocumentClient.from(new DynamoDBClient({}));
 
 const USER_MAPPING_TABLE = process.env.SLACK_USER_MAPPING_TABLE_NAME!;
 const INSTALLATION_TABLE = process.env.SLACK_INSTALLATION_TABLE_NAME!;
-const TASK_TABLE = process.env.TASK_TABLE_NAME!;
 
-/** Link code length and TTL. */
-const LINK_CODE_LENGTH = 6;
+/** Link code TTL. */
 const LINK_CODE_TTL_S = 10 * 60; // 10 minutes
 
 /**
@@ -48,7 +80,8 @@ const LINK_CODE_TTL_S = 10 * 60; // 10 minutes
  * Posts results back to Slack via `response_url` (slash commands) or
  * `chat.postMessage` (@mentions).
  */
-export async function handler(event: MentionPayload): Promise<void> {
+export async function handler(raw: RawEvent): Promise<void> {
+  const event = normalizeEvent(raw);
   const text = (event.text ?? '').trim();
   const parts = text.split(/\s+/);
   const subcommand = parts[0]?.toLowerCase() ?? '';
@@ -100,7 +133,7 @@ export async function handler(event: MentionPayload): Promise<void> {
 type ReplyFn = (text: string) => Promise<void>;
 
 /** Build a reply function that posts in-thread via chat.postMessage for @mentions. */
-function buildMentionReply(event: MentionPayload): ReplyFn {
+function buildMentionReply(event: MentionEvent): ReplyFn {
   return async (text: string) => {
     const botToken = await getBotToken(event.team_id);
     if (!botToken) {
@@ -128,7 +161,7 @@ function buildMentionReply(event: MentionPayload): ReplyFn {
 
 // ─── Submit ───────────────────────────────────────────────────────────────────
 
-async function handleSubmit(event: MentionPayload, args: string[], reply: ReplyFn): Promise<void> {
+async function handleSubmit(event: MentionEvent, args: string[], reply: ReplyFn): Promise<void> {
   if (args.length === 0) {
     await reply('Usage: `/bgagent submit org/repo#42 description`');
     return;
@@ -138,7 +171,7 @@ async function handleSubmit(event: MentionPayload, args: string[], reply: ReplyF
   const platformUserId = await lookupPlatformUser(event.team_id, event.user_id);
   if (!platformUserId) {
     await reply(':link: Your Slack account is not linked. Run `/bgagent link` first.');
-    if (event.source === 'mention' && event.mention_thread_ts) {
+    if (event.mention_thread_ts) {
       await swapReaction(event.team_id, event.channel_id, event.mention_thread_ts, 'eyes', 'x');
     }
     return;
@@ -149,7 +182,7 @@ async function handleSubmit(event: MentionPayload, args: string[], reply: ReplyF
   const { repo, issueNumber } = parseRepoArg(repoArg);
   if (!repo) {
     await reply(`Invalid repo format: \`${repoArg}\`. Expected \`org/repo\` or \`org/repo#42\`.`);
-    if (event.source === 'mention' && event.mention_thread_ts) {
+    if (event.mention_thread_ts) {
       await swapReaction(event.team_id, event.channel_id, event.mention_thread_ts, 'eyes', 'x');
     }
     return;
@@ -165,14 +198,14 @@ async function handleSubmit(event: MentionPayload, args: string[], reply: ReplyF
   // Remaining args are the task description.
   const description = args.slice(1).join(' ') || undefined;
 
-  // For @mentions, include the thread_ts so notifications thread under the mention.
+  // handleSubmit is only invoked for the mention path, so there's no response_url.
+  // Notifications thread under the user's @mention message using mention_thread_ts.
   const channelMetadata: Record<string, string> = {
     slack_team_id: event.team_id,
     slack_channel_id: event.channel_id,
     slack_user_id: event.user_id,
-    slack_response_url: event.response_url,
   };
-  if (event.source === 'mention' && event.mention_thread_ts) {
+  if (event.mention_thread_ts) {
     channelMetadata.slack_thread_ts = event.mention_thread_ts;
   }
 
@@ -194,21 +227,16 @@ async function handleSubmit(event: MentionPayload, args: string[], reply: ReplyF
   // Extract task info from the response.
   const body = JSON.parse(result.body);
   if (result.statusCode === 201 && body.data) {
-    // For @mentions, the notify handler posts the task_created message in-thread —
-    // don't duplicate it here. Only reply for slash commands (which have a response_url).
-    if (event.source !== 'mention') {
-      const task = body.data;
-      await reply(
-        `:white_check_mark: Task created!\n*ID:* \`${task.task_id}\`\n*Repo:* \`${task.repo}\`\n*Status:* ${task.status}`,
-      );
-    }
-  } else {
-    const errMsg = body.error?.message ?? 'Unknown error';
-    await reply(`:x: Failed to create task: ${errMsg}`);
-    // Swap reaction to :x: on the mention message.
-    if (event.source === 'mention' && event.mention_thread_ts) {
-      await swapReaction(event.team_id, event.channel_id, event.mention_thread_ts, 'eyes', 'x');
-    }
+    // The notify handler posts the task_created message in-thread — don't
+    // duplicate it here on the mention path.
+    return;
+  }
+
+  const errMsg = body.error?.message ?? 'Unknown error';
+  await reply(`:x: Failed to create task: ${errMsg}`);
+  // Swap reaction to :x: on the mention message.
+  if (event.mention_thread_ts) {
+    await swapReaction(event.team_id, event.channel_id, event.mention_thread_ts, 'eyes', 'x');
   }
 }
 
@@ -222,102 +250,9 @@ function parseRepoArg(arg: string): { repo: string | null; issueNumber?: number 
   };
 }
 
-// ─── Status ───────────────────────────────────────────────────────────────────
-
-async function handleStatus(event: MentionPayload, taskId: string | undefined, reply: ReplyFn): Promise<void> {
-  if (!taskId) {
-    await reply('Usage: `/bgagent status <task_id>`');
-    return;
-  }
-
-  const result = await ddb.send(new GetCommand({
-    TableName: TASK_TABLE,
-    Key: { task_id: taskId },
-  }));
-
-  if (!result.Item) {
-    await reply(`:mag: Task \`${taskId}\` not found.`);
-    return;
-  }
-
-  const task = result.Item;
-  const lines = [
-    ':clipboard: *Task Status*',
-    `*ID:* \`${task.task_id}\``,
-    `*Repo:* \`${task.repo}\``,
-    `*Status:* ${statusEmoji(task.status as string)} ${task.status}`,
-  ];
-  if (task.task_description) lines.push(`*Description:* ${truncate(task.task_description as string, 200)}`);
-  if (task.pr_url) lines.push(`*PR:* <${task.pr_url}|Pull Request>`);
-  if (task.error_message) lines.push(`*Error:* ${truncate(task.error_message as string, 200)}`);
-  if (task.duration_s != null) lines.push(`*Duration:* ${formatDuration(Number(task.duration_s))}`);
-  if (task.cost_usd != null) lines.push(`*Cost:* $${Number(task.cost_usd).toFixed(2)}`);
-
-  await reply(lines.join('\n'));
-}
-
-// ─── Cancel ───────────────────────────────────────────────────────────────────
-
-async function handleCancel(event: MentionPayload, taskId: string | undefined, reply: ReplyFn): Promise<void> {
-  if (!taskId) {
-    await reply('Usage: `/bgagent cancel <task_id>`');
-    return;
-  }
-
-  const platformUserId = await lookupPlatformUser(event.team_id, event.user_id);
-  if (!platformUserId) {
-    await reply(':link: Your Slack account is not linked. Run `/bgagent link` first.');
-    return;
-  }
-
-  // Load the task to verify ownership.
-  const result = await ddb.send(new GetCommand({
-    TableName: TASK_TABLE,
-    Key: { task_id: taskId },
-  }));
-
-  if (!result.Item) {
-    await reply(`:mag: Task \`${taskId}\` not found.`);
-    return;
-  }
-
-  if (result.Item.user_id !== platformUserId) {
-    await reply(':no_entry: You can only cancel your own tasks.');
-    return;
-  }
-
-  // Attempt to mark as cancelled via conditional update.
-  const ACTIVE_STATUSES = ['SUBMITTED', 'HYDRATING', 'RUNNING', 'FINALIZING'];
-  try {
-    await ddb.send(new UpdateCommand({
-      TableName: TASK_TABLE,
-      Key: { task_id: taskId },
-      UpdateExpression: 'SET #s = :cancelled, updated_at = :now',
-      ConditionExpression: '#s IN (:s1, :s2, :s3, :s4)',
-      ExpressionAttributeNames: { '#s': 'status' },
-      ExpressionAttributeValues: {
-        ':cancelled': 'CANCELLED',
-        ':now': new Date().toISOString(),
-        ':s1': ACTIVE_STATUSES[0],
-        ':s2': ACTIVE_STATUSES[1],
-        ':s3': ACTIVE_STATUSES[2],
-        ':s4': ACTIVE_STATUSES[3],
-      },
-    }));
-    await reply(`:no_entry_sign: Task \`${taskId}\` has been cancelled.`);
-  } catch (err) {
-    const errorName = (err as Error)?.name;
-    if (errorName === 'ConditionalCheckFailedException') {
-      await reply(`:warning: Task \`${taskId}\` is already in a terminal state.`);
-    } else {
-      throw err;
-    }
-  }
-}
-
 // ─── Link ─────────────────────────────────────────────────────────────────────
 
-async function handleLink(event: MentionPayload, reply: ReplyFn): Promise<void> {
+async function handleLink(event: CommandProcessorEvent, reply: ReplyFn): Promise<void> {
   // Generate a 6-character alphanumeric code.
   const code = crypto.randomBytes(3).toString('hex').toUpperCase();
   const now = new Date().toISOString();
@@ -358,7 +293,13 @@ async function checkChannelAccess(teamId: string, channelId: string): Promise<{ 
   if (channelId.startsWith('D')) return { ok: true };
 
   const botToken = await getBotToken(teamId);
-  if (!botToken) return { ok: true }; // Can't check, allow and let notify handle errors.
+  if (!botToken) {
+    logger.warn('Channel access check skipped: bot token missing', { team_id: teamId });
+    return {
+      ok: false,
+      error: ':warning: The Slack integration is not fully configured (missing bot token). Ask your workspace admin to reinstall the app.',
+    };
+  }
 
   try {
     const response = await fetch(`https://slack.com/api/conversations.info?channel=${channelId}`, {
@@ -371,7 +312,14 @@ async function checkChannelAccess(teamId: string, channelId: string): Promise<{ 
       if (result.error === 'channel_not_found') {
         return { ok: false, error: ':lock: This is a private channel and the bot is not a member. Invite the bot first with `/invite @bgagent`, or submit from a public channel or DM.' };
       }
-      return { ok: true }; // Unknown error, allow and let notify handle it.
+      // Unknown Slack error — surface it rather than silently allowing.
+      // The task would otherwise be created but the user would never see a
+      // notification land, with no hint of what went wrong.
+      logger.warn('Channel access check returned unknown error', { error: result.error, channel_id: channelId });
+      return {
+        ok: false,
+        error: `:warning: Couldn't verify the bot can post in this channel (Slack error: \`${result.error ?? 'unknown'}\`). Try again or submit from a public channel or DM.`,
+      };
     }
 
     if (result.channel?.is_private && !result.channel?.is_member) {
@@ -381,7 +329,10 @@ async function checkChannelAccess(teamId: string, channelId: string): Promise<{ 
     return { ok: true };
   } catch (err) {
     logger.warn('Channel access check failed', { error: err instanceof Error ? err.message : String(err) });
-    return { ok: true }; // Fail open — don't block submit on a check failure.
+    return {
+      ok: false,
+      error: ':warning: Couldn\'t reach Slack to verify channel access. Please try again in a moment.',
+    };
   }
 }
 
@@ -435,46 +386,9 @@ async function postToSlack(responseUrl: string, text: string): Promise<void> {
   }
 }
 
-function statusEmoji(status: string): string {
-  switch (status) {
-    case 'SUBMITTED': return ':inbox_tray:';
-    case 'HYDRATING': return ':droplet:';
-    case 'RUNNING': return ':gear:';
-    case 'FINALIZING': return ':hourglass:';
-    case 'COMPLETED': return ':white_check_mark:';
-    case 'FAILED': return ':x:';
-    case 'CANCELLED': return ':no_entry_sign:';
-    case 'TIMED_OUT': return ':hourglass:';
-    default: return ':grey_question:';
-  }
-}
-
-function truncate(text: string, maxLen: number): string {
-  if (text.length <= maxLen) return text;
-  return text.slice(0, maxLen - 3) + '...';
-}
-
-function formatDuration(seconds: number): string {
-  if (seconds < 60) return `${Math.round(seconds)}s`;
-  const m = Math.floor(seconds / 60);
-  const s = Math.round(seconds % 60);
-  if (m < 60) return s > 0 ? `${m}m ${s}s` : `${m}m`;
-  const h = Math.floor(m / 60);
-  const remainM = m % 60;
-  return remainM > 0 ? `${h}h ${remainM}m` : `${h}h`;
-}
-
 async function swapReaction(teamId: string, channelId: string, messageTs: string, remove: string, add: string): Promise<void> {
   const botToken = await getBotToken(teamId);
   if (!botToken) return;
-  await fetch('https://slack.com/api/reactions.remove', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json; charset=utf-8', 'Authorization': `Bearer ${botToken}` },
-    body: JSON.stringify({ channel: channelId, timestamp: messageTs, name: remove }),
-  }).catch(() => {});
-  await fetch('https://slack.com/api/reactions.add', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json; charset=utf-8', 'Authorization': `Bearer ${botToken}` },
-    body: JSON.stringify({ channel: channelId, timestamp: messageTs, name: add }),
-  }).catch(() => {});
+  await slackFetch(botToken, 'reactions.remove', { channel: channelId, timestamp: messageTs, name: remove });
+  await slackFetch(botToken, 'reactions.add', { channel: channelId, timestamp: messageTs, name: add });
 }

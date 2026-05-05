@@ -36,24 +36,31 @@ const MAX_TIMESTAMP_AGE_S = 5 * 60;
 /**
  * Fetch a secret from Secrets Manager with in-memory caching.
  * @param secretId - the full Secrets Manager secret ID or ARN.
+ * @param forceRefresh - bypass the cache and re-fetch from Secrets Manager.
  * @returns the secret string, or null if not found.
  */
-export async function getSlackSecret(secretId: string): Promise<string | null> {
+export async function getSlackSecret(secretId: string, forceRefresh = false): Promise<string | null> {
   const now = Date.now();
-  const cached = secretCache.get(secretId);
-  if (cached && cached.expiresAt > now) {
-    return cached.secret;
+  if (!forceRefresh) {
+    const cached = secretCache.get(secretId);
+    if (cached && cached.expiresAt > now) {
+      return cached.secret;
+    }
   }
 
   try {
     const result = await sm.send(new GetSecretValueCommand({ SecretId: secretId }));
-    if (!result.SecretString) return null;
+    if (!result.SecretString) {
+      secretCache.delete(secretId);
+      return null;
+    }
     secretCache.set(secretId, { secret: result.SecretString, expiresAt: now + CACHE_TTL_MS });
     return result.SecretString;
   } catch (err) {
     const errorName = (err as Error)?.name;
     if (errorName === 'ResourceNotFoundException') {
       logger.error('Slack secret not found in Secrets Manager', { secret_id: secretId });
+      secretCache.delete(secretId);
       return null;
     }
     logger.error('Failed to fetch Slack secret from Secrets Manager', {
@@ -62,6 +69,15 @@ export async function getSlackSecret(secretId: string): Promise<string | null> {
     });
     throw err;
   }
+}
+
+/**
+ * Explicitly drop a cached secret. Called when rotation is suspected —
+ * e.g. signature verification fails with an otherwise valid-looking request.
+ * @param secretId - the Secrets Manager secret ID or ARN to evict.
+ */
+export function invalidateSlackSecretCache(secretId: string): void {
+  secretCache.delete(secretId);
 }
 
 /**
@@ -108,4 +124,34 @@ export function verifySlackSignature(
     });
     return false;
   }
+}
+
+/**
+ * Verify a Slack request, transparently re-fetching the signing secret once
+ * if the cached copy is rejected. After rotation, warm Lambdas keep the old
+ * cached secret until their 5-minute TTL elapses — this forces an early refresh.
+ *
+ * @param secretId - Secrets Manager ARN/ID for the signing secret.
+ * @param signature - the `X-Slack-Signature` header value.
+ * @param timestamp - the `X-Slack-Request-Timestamp` header value.
+ * @param body - the raw request body string.
+ * @returns true if the request is authentic (after at most one refresh retry).
+ */
+export async function verifySlackRequest(
+  secretId: string,
+  signature: string,
+  timestamp: string,
+  body: string,
+): Promise<boolean> {
+  const cached = await getSlackSecret(secretId);
+  if (cached && verifySlackSignature(cached, signature, timestamp, body)) {
+    return true;
+  }
+
+  // Cache might be stale after a signing-secret rotation — evict and try once more.
+  invalidateSlackSecretCache(secretId);
+  const fresh = await getSlackSecret(secretId, true);
+  if (!fresh) return false;
+  if (fresh === cached) return false; // Same secret, still invalid — don't double-log.
+  return verifySlackSignature(fresh, signature, timestamp, body);
 }

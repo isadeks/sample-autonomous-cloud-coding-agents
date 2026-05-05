@@ -17,15 +17,62 @@
  *  SOFTWARE.
  */
 
+import { formatDuration, truncate } from './slack-format';
 import type { TaskRecord } from './types';
 
-/** A Slack Block Kit block element. */
-export interface SlackBlock {
-  readonly type: string;
-  readonly text?: { readonly type: string; readonly text: string };
-  readonly elements?: ReadonlyArray<Record<string, unknown>>;
+/** A Slack Block Kit mrkdwn text object. */
+interface MrkdwnText {
+  readonly type: 'mrkdwn';
+  readonly text: string;
+}
+
+/** A Slack Block Kit plain_text text object. */
+interface PlainText {
+  readonly type: 'plain_text';
+  readonly text: string;
+  readonly emoji?: boolean;
+}
+
+/** Section block: a single line/paragraph of mrkdwn content. */
+export interface SectionBlock {
+  readonly type: 'section';
+  readonly text: MrkdwnText;
   readonly block_id?: string;
 }
+
+/** Link-out button: opens a URL in a new tab. No action_id needed. */
+export interface LinkButtonElement {
+  readonly type: 'button';
+  readonly text: PlainText;
+  readonly url: string;
+  readonly style?: 'primary' | 'danger';
+}
+
+/** Actionable button: triggers a Block Kit interaction callback via action_id. */
+export interface ActionButtonElement {
+  readonly type: 'button';
+  readonly text: PlainText;
+  readonly action_id: string;
+  readonly style?: 'primary' | 'danger';
+  readonly confirm?: {
+    readonly title: PlainText;
+    readonly text: MrkdwnText;
+    readonly confirm: PlainText;
+    readonly deny: PlainText;
+  };
+}
+
+export type ButtonElement = LinkButtonElement | ActionButtonElement;
+
+/** Actions block: a row of interactive elements (buttons, menus, etc.). */
+export interface ActionsBlock {
+  readonly type: 'actions';
+  readonly block_id: string;
+  readonly elements: ReadonlyArray<ButtonElement>;
+}
+
+/** Any Block Kit block this module renders. */
+export type SlackBlock = SectionBlock | ActionsBlock;
 
 /** A Slack message payload suitable for chat.postMessage. */
 export interface SlackMessage {
@@ -86,7 +133,7 @@ function taskCompletedMessage(
 ): SlackMessage {
   const parts = [`:white_check_mark: *Task completed* for \`${task.repo}\``];
   const stats: string[] = [];
-  if (task.duration_s != null) stats.push(formatDuration(Number(task.duration_s)));
+  if (task.duration_s != null) stats.push(formatDuration(task.duration_s));
   if (task.cost_usd != null) stats.push(`$${Number(task.cost_usd).toFixed(2)}`);
   if (stats.length > 0) parts.push(stats.join(' · '));
   const text = parts.join('\n');
@@ -157,30 +204,15 @@ function simpleStatusMessage(
   };
 }
 
-function section(text: string): SlackBlock {
+function section(text: string): SectionBlock {
   return { type: 'section', text: { type: 'mrkdwn', text } };
 }
 
-function truncate(text: string, maxLen: number): string {
-  if (text.length <= maxLen) return text;
-  return text.slice(0, maxLen - 3) + '...';
+function actions(blockId: string, elements: ReadonlyArray<ButtonElement>): ActionsBlock {
+  return { type: 'actions', block_id: blockId, elements };
 }
 
-function formatDuration(seconds: number): string {
-  if (seconds < 60) return `${Math.round(seconds)}s`;
-  const m = Math.floor(seconds / 60);
-  const s = Math.round(seconds % 60);
-  if (m < 60) return s > 0 ? `${m}m ${s}s` : `${m}m`;
-  const h = Math.floor(m / 60);
-  const remainM = m % 60;
-  return remainM > 0 ? `${h}h ${remainM}m` : `${h}h`;
-}
-
-function actions(blockId: string, elements: Record<string, unknown>[]): SlackBlock {
-  return { type: 'actions', block_id: blockId, elements } as unknown as SlackBlock;
-}
-
-function linkButton(label: string, url: string): Record<string, unknown> {
+function linkButton(label: string, url: string): LinkButtonElement {
   return {
     type: 'button',
     text: { type: 'plain_text', text: label },
@@ -189,7 +221,7 @@ function linkButton(label: string, url: string): Record<string, unknown> {
   };
 }
 
-function dangerButton(label: string, actionId: string): Record<string, unknown> {
+function dangerButton(label: string, actionId: string): ActionButtonElement {
   return {
     type: 'button',
     text: { type: 'plain_text', text: label },

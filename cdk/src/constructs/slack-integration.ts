@@ -310,8 +310,10 @@ export class SlackIntegration extends Construct {
       },
       bundling: commonBundling,
     });
+    // slackCommandsFn verifies the Slack signing secret (granted above) and
+    // async-invokes the processor Lambda — it never reads bot tokens, so the
+    // bgagent/slack/* wildcard grant is intentionally omitted here.
     this.signingSecret.grantRead(slackCommandsFn);
-    slackCommandsFn.addToRolePolicy(readSlackSecretsPolicy);
     commandProcessorFn.grantInvoke(slackCommandsFn);
 
     // --- Account Linking (Cognito-authenticated) ---

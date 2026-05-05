@@ -48,6 +48,16 @@ interface SlackOAuthResponse {
  * After a workspace admin authorizes the Slack App, Slack redirects here
  * with a `code` query parameter. This handler exchanges the code for a
  * bot token, stores it in Secrets Manager, and records the installation.
+ *
+ * **CSRF note:** this handler does not validate a `state` parameter
+ * (RFC 6749 §10.12). In OAuth V2, the `code` exchange at Slack also
+ * requires the app's `client_secret`, which is not available to an attacker —
+ * so a forged callback cannot complete the token exchange. The residual
+ * risk is a confused-deputy scenario where a workspace admin who clicked a
+ * legitimate install link on another tab is instead logged against an
+ * attacker-initiated install. Mitigating that requires per-session signed
+ * state storage and is tracked as a follow-up. For now, the `client_secret`
+ * requirement on Slack's side provides the primary defense.
  */
 export async function handler(event: APIGatewayProxyEvent): Promise<APIGatewayProxyResult> {
   try {

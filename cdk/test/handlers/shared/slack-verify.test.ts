@@ -18,7 +18,19 @@
  */
 
 import * as crypto from 'crypto';
-import { verifySlackSignature } from '../../../src/handlers/shared/slack-verify';
+
+const smSendMock = jest.fn();
+jest.mock('@aws-sdk/client-secrets-manager', () => ({
+  SecretsManagerClient: jest.fn(() => ({ send: smSendMock })),
+  GetSecretValueCommand: jest.fn((input) => ({ input })),
+}));
+
+// Imported after the mock is registered.
+import {
+  invalidateSlackSecretCache,
+  verifySlackRequest,
+  verifySlackSignature,
+} from '../../../src/handlers/shared/slack-verify';
 
 describe('verifySlackSignature', () => {
   const signingSecret = 'test-signing-secret-abc123';
@@ -71,5 +83,66 @@ describe('verifySlackSignature', () => {
     const sig = makeSignature(ts, body);
 
     expect(verifySlackSignature(signingSecret, sig, ts, 'tampered-body')).toBe(false);
+  });
+});
+
+describe('verifySlackRequest', () => {
+  const SECRET_ARN = 'arn:aws:secretsmanager:us-east-1:123:secret:bgagent/slack/signing-XYZ';
+
+  function signWith(secret: string, timestamp: string, body: string): string {
+    return 'v0=' + crypto.createHmac('sha256', secret).update(`v0:${timestamp}:${body}`).digest('hex');
+  }
+
+  beforeEach(() => {
+    smSendMock.mockReset();
+    invalidateSlackSecretCache(SECRET_ARN);
+  });
+
+  test('verifies with cached secret on first call', async () => {
+    const secret = 'cached-secret';
+    smSendMock.mockResolvedValueOnce({ SecretString: secret });
+
+    const ts = String(Math.floor(Date.now() / 1000));
+    const body = 'token=abc';
+    const sig = signWith(secret, ts, body);
+
+    expect(await verifySlackRequest(SECRET_ARN, sig, ts, body)).toBe(true);
+    expect(smSendMock).toHaveBeenCalledTimes(1);
+  });
+
+  test('refetches and verifies when cached secret was rotated out', async () => {
+    // First fetch: stale secret (will fail verification).
+    // Second fetch (forced refresh): rotated secret (succeeds).
+    smSendMock
+      .mockResolvedValueOnce({ SecretString: 'stale-secret' })
+      .mockResolvedValueOnce({ SecretString: 'rotated-secret' });
+
+    const ts = String(Math.floor(Date.now() / 1000));
+    const body = 'token=abc';
+    const sig = signWith('rotated-secret', ts, body);
+
+    expect(await verifySlackRequest(SECRET_ARN, sig, ts, body)).toBe(true);
+    expect(smSendMock).toHaveBeenCalledTimes(2);
+  });
+
+  test('does not re-verify when refreshed secret is identical to cached one', async () => {
+    const secret = 'same-secret';
+    smSendMock
+      .mockResolvedValueOnce({ SecretString: secret })
+      .mockResolvedValueOnce({ SecretString: secret });
+
+    const ts = String(Math.floor(Date.now() / 1000));
+    const body = 'token=abc';
+    const sig = 'v0=deadbeef';
+
+    expect(await verifySlackRequest(SECRET_ARN, sig, ts, body)).toBe(false);
+    expect(smSendMock).toHaveBeenCalledTimes(2);
+  });
+
+  test('returns false when secret cannot be fetched', async () => {
+    smSendMock.mockRejectedValue(Object.assign(new Error('not found'), { name: 'ResourceNotFoundException' }));
+
+    const ts = String(Math.floor(Date.now() / 1000));
+    expect(await verifySlackRequest(SECRET_ARN, 'v0=whatever', ts, 'body')).toBe(false);
   });
 });

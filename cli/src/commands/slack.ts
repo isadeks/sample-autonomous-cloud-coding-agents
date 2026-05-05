@@ -350,7 +350,16 @@ async function getStackOutput(region: string, stackName: string, outputKey: stri
     const outputs = result.Stacks?.[0]?.Outputs ?? [];
     const output = outputs.find((o) => o.OutputKey === outputKey);
     return output?.OutputValue ?? null;
-  } catch {
-    return null;
+  } catch (err) {
+    // Only swallow the "stack does not exist" case — that's the "not deployed yet"
+    // path callers expect as null. Auth failures (ExpiredToken,
+    // UnauthorizedOperation, AccessDenied, etc.) must surface so users see the
+    // real error instead of a misleading "stack not deployed" message.
+    const name = (err as Error)?.name ?? '';
+    const message = (err as Error)?.message ?? '';
+    if (name === 'ValidationError' && /does not exist/i.test(message)) {
+      return null;
+    }
+    throw err;
   }
 }

@@ -20,7 +20,7 @@
 import { InvokeCommand, LambdaClient } from '@aws-sdk/client-lambda';
 import type { APIGatewayProxyEvent, APIGatewayProxyResult } from 'aws-lambda';
 import { logger } from './shared/logger';
-import { getSlackSecret, verifySlackSignature } from './shared/slack-verify';
+import { getSlackSecret, verifySlackRequest } from './shared/slack-verify';
 
 const lambdaClient = new LambdaClient({});
 
@@ -53,7 +53,7 @@ export async function handler(event: APIGatewayProxyEvent): Promise<APIGatewayPr
       return slackResponse('Request body is required.');
     }
 
-    // Verify Slack signing secret.
+    // Verify Slack signing secret (re-fetches if the cached value was rotated out).
     const signingSecret = await getSlackSecret(SIGNING_SECRET_ARN);
     if (!signingSecret) {
       logger.error('Slack signing secret not found');
@@ -63,7 +63,7 @@ export async function handler(event: APIGatewayProxyEvent): Promise<APIGatewayPr
     const signature = event.headers['X-Slack-Signature'] ?? event.headers['x-slack-signature'] ?? '';
     const timestamp = event.headers['X-Slack-Request-Timestamp'] ?? event.headers['x-slack-request-timestamp'] ?? '';
 
-    if (!verifySlackSignature(signingSecret, signature, timestamp, event.body)) {
+    if (!await verifySlackRequest(SIGNING_SECRET_ARN, signature, timestamp, event.body)) {
       logger.warn('Invalid Slack command signature');
       return { statusCode: 401, headers: { 'Content-Type': 'text/plain' }, body: 'Invalid signature' };
     }

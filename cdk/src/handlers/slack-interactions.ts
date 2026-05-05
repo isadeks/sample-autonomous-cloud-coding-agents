@@ -21,7 +21,7 @@ import { DynamoDBClient } from '@aws-sdk/client-dynamodb';
 import { DynamoDBDocumentClient, GetCommand, UpdateCommand } from '@aws-sdk/lib-dynamodb';
 import type { APIGatewayProxyEvent, APIGatewayProxyResult } from 'aws-lambda';
 import { logger } from './shared/logger';
-import { getSlackSecret, SLACK_SECRET_PREFIX, verifySlackSignature } from './shared/slack-verify';
+import { getSlackSecret, SLACK_SECRET_PREFIX, verifySlackRequest } from './shared/slack-verify';
 
 const ddb = DynamoDBDocumentClient.from(new DynamoDBClient({}));
 
@@ -55,7 +55,7 @@ export async function handler(event: APIGatewayProxyEvent): Promise<APIGatewayPr
       return jsonResponse(400, { error: 'Request body is required' });
     }
 
-    // Verify Slack signing secret.
+    // Verify Slack signing secret (re-fetches if the cached value was rotated out).
     const signingSecret = await getSlackSecret(SIGNING_SECRET_ARN);
     if (!signingSecret) {
       logger.error('Slack signing secret not found');
@@ -65,7 +65,7 @@ export async function handler(event: APIGatewayProxyEvent): Promise<APIGatewayPr
     const signature = event.headers['X-Slack-Signature'] ?? event.headers['x-slack-signature'] ?? '';
     const timestamp = event.headers['X-Slack-Request-Timestamp'] ?? event.headers['x-slack-request-timestamp'] ?? '';
 
-    if (!verifySlackSignature(signingSecret, signature, timestamp, event.body)) {
+    if (!await verifySlackRequest(SIGNING_SECRET_ARN, signature, timestamp, event.body)) {
       logger.warn('Invalid Slack interaction signature');
       return jsonResponse(401, { error: 'Invalid signature' });
     }

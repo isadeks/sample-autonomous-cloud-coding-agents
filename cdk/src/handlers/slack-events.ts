@@ -23,7 +23,9 @@ import { DeleteSecretCommand, SecretsManagerClient } from '@aws-sdk/client-secre
 import { DynamoDBDocumentClient, UpdateCommand } from '@aws-sdk/lib-dynamodb';
 import type { APIGatewayProxyEvent, APIGatewayProxyResult } from 'aws-lambda';
 import { logger } from './shared/logger';
-import { getSlackSecret, SLACK_SECRET_PREFIX, verifySlackSignature } from './shared/slack-verify';
+import { slackFetch } from './shared/slack-api';
+import { getSlackSecret, SLACK_SECRET_PREFIX, verifySlackRequest } from './shared/slack-verify';
+import type { MentionEvent } from './slack-command-processor';
 
 const ddb = DynamoDBDocumentClient.from(new DynamoDBClient({}));
 const sm = new SecretsManagerClient({});
@@ -60,22 +62,38 @@ interface SlackEventPayload {
  * - `app_uninstalled` event (mark installation revoked, delete bot token)
  * - `tokens_revoked` event (same cleanup)
  */
+/** Event types where retries are idempotent and must be re-processed. */
+const RETRY_ALLOWED_EVENT_TYPES = new Set(['app_uninstalled', 'tokens_revoked']);
+
 export async function handler(event: APIGatewayProxyEvent): Promise<APIGatewayProxyResult> {
   try {
     if (!event.body) {
       return jsonResponse(400, { error: 'Request body is required' });
     }
 
-    // Slack retries events if we don't respond within 3 seconds. Ack retries
-    // immediately to prevent duplicate task creation.
-    const retryNum = event.headers['X-Slack-Retry-Num'] ?? event.headers['x-slack-retry-num'];
-    if (retryNum) {
-      logger.info('Acknowledging Slack retry', { retry_num: retryNum });
-      return jsonResponse(200, { ok: true });
+    // Verify Slack signing secret for every request — including url_verification.
+    // Slack signs all requests; skipping verification exposes the endpoint.
+    // The only reason to bypass is initial setup before the signing secret is populated.
+    const signature = event.headers['X-Slack-Signature'] ?? event.headers['x-slack-signature'] ?? '';
+    const timestamp = event.headers['X-Slack-Request-Timestamp'] ?? event.headers['x-slack-request-timestamp'] ?? '';
+    const signingSecret = await getSlackSecret(SIGNING_SECRET_ARN);
+
+    if (!signingSecret) {
+      // Secret hasn't been populated yet — allow url_verification so the Slack App can be
+      // wired up during initial setup, but reject anything else.
+      logger.warn('Slack signing secret not populated — bypassing verification for url_verification only');
+      const payload: SlackEventPayload = JSON.parse(event.body);
+      if (payload.type === 'url_verification' && payload.challenge) {
+        return jsonResponse(200, { challenge: payload.challenge });
+      }
+      return jsonResponse(500, { error: 'Internal configuration error' });
     }
 
-    // Parse the payload first — url_verification must respond before signature check
-    // to complete the Slack app setup flow.
+    if (!await verifySlackRequest(SIGNING_SECRET_ARN, signature, timestamp, event.body)) {
+      logger.warn('Invalid Slack event signature');
+      return jsonResponse(401, { error: 'Invalid signature' });
+    }
+
     const payload: SlackEventPayload = JSON.parse(event.body);
 
     // URL verification challenge — Slack sends this when configuring the event URL.
@@ -83,24 +101,21 @@ export async function handler(event: APIGatewayProxyEvent): Promise<APIGatewayPr
       return jsonResponse(200, { challenge: payload.challenge });
     }
 
-    // Verify Slack signing secret for all other event types.
-    const signingSecret = await getSlackSecret(SIGNING_SECRET_ARN);
-    if (!signingSecret) {
-      logger.error('Slack signing secret not found');
-      return jsonResponse(500, { error: 'Internal configuration error' });
-    }
-
-    const signature = event.headers['X-Slack-Signature'] ?? event.headers['x-slack-signature'] ?? '';
-    const timestamp = event.headers['X-Slack-Request-Timestamp'] ?? event.headers['x-slack-request-timestamp'] ?? '';
-
-    if (!verifySlackSignature(signingSecret, signature, timestamp, event.body)) {
-      logger.warn('Invalid Slack event signature');
-      return jsonResponse(401, { error: 'Invalid signature' });
+    // Slack retries events if we don't respond within 3 seconds. Ack retries
+    // immediately for user-facing events (mentions, DMs) to prevent duplicate task
+    // creation — the idempotency cost of processing the same app_mention twice is
+    // a double-submit. For security-critical revocation events, we MUST process
+    // retries so a transient failure on first delivery doesn't leave the workspace
+    // with a live bot token after uninstall.
+    const retryNum = event.headers['X-Slack-Retry-Num'] ?? event.headers['x-slack-retry-num'];
+    const eventType = payload.type === 'event_callback' ? payload.event?.type : undefined;
+    if (retryNum && !(eventType && RETRY_ALLOWED_EVENT_TYPES.has(eventType))) {
+      logger.info('Acknowledging Slack retry without reprocessing', { retry_num: retryNum, event_type: eventType });
+      return jsonResponse(200, { ok: true });
     }
 
     // Dispatch by event type.
     if (payload.type === 'event_callback' && payload.event) {
-      const eventType = payload.event.type;
       const teamId = payload.team_id;
 
       if ((eventType === 'app_uninstalled' || eventType === 'tokens_revoked') && teamId) {
@@ -170,26 +185,14 @@ async function handleAppMention(
       const mentionTs = threadTs ?? messageTs;
       // Swap :eyes: to :x: on the mention
       if (mentionTs) {
-        await fetch('https://slack.com/api/reactions.remove', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json; charset=utf-8', 'Authorization': `Bearer ${botToken}` },
-          body: JSON.stringify({ channel: channelId, timestamp: mentionTs, name: 'eyes' }),
-        }).catch(() => {});
-        await fetch('https://slack.com/api/reactions.add', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json; charset=utf-8', 'Authorization': `Bearer ${botToken}` },
-          body: JSON.stringify({ channel: channelId, timestamp: mentionTs, name: 'x' }),
-        }).catch(() => {});
+        await slackFetch(botToken, 'reactions.remove', { channel: channelId, timestamp: mentionTs, name: 'eyes' });
+        await slackFetch(botToken, 'reactions.add', { channel: channelId, timestamp: mentionTs, name: 'x' });
       }
-      await fetch('https://slack.com/api/chat.postMessage', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json; charset=utf-8', 'Authorization': `Bearer ${botToken}` },
-        body: JSON.stringify({
-          channel: channelId,
-          thread_ts: mentionTs,
-          text: ':x: Please include a repo — e.g. `@Shoof fix the bug in org/repo#42`',
-        }),
-      }).catch(() => {});
+      await slackFetch(botToken, 'chat.postMessage', {
+        channel: channelId,
+        thread_ts: mentionTs,
+        text: ':x: Please include a repo — e.g. `@Shoof fix the bug in org/repo#42`',
+      });
     }
     return;
   }
@@ -198,18 +201,12 @@ async function handleAppMention(
   const description = text.replace(repo, '').replace(/\s+/g, ' ').trim();
   const commandText = `submit ${repo} ${description}`;
 
-  const mentionPayload = {
-    command: '/bgagent',
+  const mentionPayload: MentionEvent = {
     text: commandText,
-    response_url: '',
-    trigger_id: '',
     user_id: userId,
-    user_name: '',
     team_id: teamId,
-    team_domain: '',
     channel_id: channelId,
-    channel_name: '',
-    source: 'mention' as const,
+    source: 'mention',
     mention_thread_ts: threadTs ?? messageTs,
   };
 
@@ -218,11 +215,7 @@ async function handleAppMention(
   if (mentionTs) {
     const botToken = await getSlackSecret(`${SLACK_SECRET_PREFIX}${teamId}`);
     if (botToken) {
-      await fetch('https://slack.com/api/reactions.add', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json; charset=utf-8', 'Authorization': `Bearer ${botToken}` },
-        body: JSON.stringify({ channel: channelId, timestamp: mentionTs, name: 'eyes' }),
-      }).catch(() => {});
+      await slackFetch(botToken, 'reactions.add', { channel: channelId, timestamp: mentionTs, name: 'eyes' });
     }
   }
 
@@ -242,13 +235,29 @@ async function handleAppMention(
     logger.error('Failed to invoke command processor for app_mention', {
       error: err instanceof Error ? err.message : String(err),
     });
+    // Mirror the no-repo-found failure UX: swap :eyes: to :x: and reply in thread
+    // so the user isn't left staring at a stuck :eyes: reaction forever.
+    const botToken = await getSlackSecret(`${SLACK_SECRET_PREFIX}${teamId}`);
+    if (botToken && mentionTs) {
+      await slackFetch(botToken, 'reactions.remove', { channel: channelId, timestamp: mentionTs, name: 'eyes' });
+      await slackFetch(botToken, 'reactions.add', { channel: channelId, timestamp: mentionTs, name: 'x' });
+      await slackFetch(botToken, 'chat.postMessage', {
+        channel: channelId,
+        thread_ts: mentionTs,
+        text: ':x: Something went wrong forwarding your request. Please try again.',
+      });
+    }
   }
 }
+
 
 async function revokeInstallation(teamId: string): Promise<void> {
   const now = new Date().toISOString();
 
-  // Mark the installation as revoked.
+  // Mark the installation record as revoked FIRST. If this fails we must not
+  // delete the bot token, or the DB will still show status=active while the
+  // token is gone — every subsequent Slack call would then fail with "secret
+  // not found." Let Slack retry the revocation event in that case.
   try {
     await ddb.send(new UpdateCommand({
       TableName: TABLE_NAME,
@@ -258,13 +267,16 @@ async function revokeInstallation(teamId: string): Promise<void> {
       ExpressionAttributeValues: { ':revoked': 'revoked', ':now': now },
     }));
   } catch (err) {
-    logger.error('Failed to revoke Slack installation', {
+    logger.error('Failed to mark Slack installation revoked — bot token left in place for retry', {
       team_id: teamId,
       error: err instanceof Error ? err.message : String(err),
     });
+    throw err;
   }
 
-  // Schedule the bot token secret for deletion.
+  // Schedule the bot token secret for deletion. Failure here is recoverable
+  // on retry (the DDB row is already revoked, so the next delivery just re-tries
+  // this step).
   try {
     await sm.send(new DeleteSecretCommand({
       SecretId: `${SLACK_SECRET_PREFIX}${teamId}`,
@@ -276,6 +288,7 @@ async function revokeInstallation(teamId: string): Promise<void> {
       team_id: teamId,
       error: err instanceof Error ? err.message : String(err),
     });
+    throw err;
   }
 }
 

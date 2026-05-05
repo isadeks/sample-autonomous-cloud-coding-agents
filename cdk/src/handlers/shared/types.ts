@@ -23,6 +23,9 @@ import type { TaskStatusType } from '../../constructs/task-status';
 /** Valid task types for task creation. */
 export type TaskType = 'new_task' | 'pr_iteration' | 'pr_review';
 
+/** Where a task was submitted from. Shared across inbound adapters. */
+export type ChannelSource = 'api' | 'webhook' | 'slack';
+
 /** Task types that operate on an existing pull request. */
 export function isPrTaskType(taskType: TaskType): boolean {
   return taskType === 'pr_iteration' || taskType === 'pr_review';
@@ -50,7 +53,7 @@ export interface TaskRecord {
   readonly pr_url?: string;
   readonly error_message?: string;
   readonly idempotency_key?: string;
-  readonly channel_source: string;
+  readonly channel_source: ChannelSource;
   readonly channel_metadata?: Record<string, string>;
   readonly status_created_at: string;
   readonly created_at: string;
