@@ -24,7 +24,7 @@ import type { TaskStatusType } from '../../constructs/task-status';
 export type TaskType = 'new_task' | 'pr_iteration' | 'pr_review';
 
 /** Where a task was submitted from. Shared across inbound adapters. */
-export type ChannelSource = 'api' | 'webhook' | 'slack';
+export type ChannelSource = 'api' | 'webhook' | 'slack' | 'linear';
 
 /** Task types that operate on an existing pull request. */
 export function isPrTaskType(taskType: TaskType): boolean {
