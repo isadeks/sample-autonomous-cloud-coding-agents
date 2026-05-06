@@ -92,16 +92,9 @@ ABCA needs to know which platform user a Linear actor maps to so tasks are attri
 
 **The token owner is linked automatically.** `bgagent linear setup` calls Linear's `viewer` query with the token you just pasted and writes the mapping for the Cognito user running the CLI. Look for `✓ Linked Linear user …` in the setup output — if you saw that, you're done. Skip to Step 7.
 
-**Linking additional Linear users** (anyone other than the API token owner) still needs the code-exchange flow:
+**Linking additional Linear users** (anyone other than the API-token owner) isn't supported in v1. A comment-triggered flow (`bgagent link` in a Linear comment → receive code → `bgagent linear link <code>`) is a planned follow-up; the `bgagent linear link <code>` CLI command exists today but no Linear-side code generator ships with it yet.
 
-1. In a comment on any Linear issue in a mapped project, type: `bgagent link`.
-2. Copy the link code.
-3. In your terminal:
-   ```bash
-   bgagent linear link <code>
-   ```
-
-> A comment-triggered link-code generator is a planned follow-up. Until then, additional-user linking is admin-assisted — an admin generates the code and shares it with the user.
+For v1, design the flow around the API-token owner: that person installs ABCA, runs `bgagent linear setup`, and submits tasks on their own behalf. Tasks triggered by other Linear users in the workspace will be dropped by the processor with `"Linear actor has no linked platform user — skipping task creation"`.
 
 ### Step 7: Test it
 
