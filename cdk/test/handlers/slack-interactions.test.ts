@@ -100,9 +100,15 @@ describe('slack-interactions handler', () => {
       body,
       headers: { 'X-Slack-Signature': 'v0=000', 'X-Slack-Request-Timestamp': ts },
       multiValueHeaders: {},
-      httpMethod: 'POST', isBase64Encoded: false, path: '/v1/slack/interactions',
-      pathParameters: null, queryStringParameters: null, multiValueQueryStringParameters: null,
-      stageVariables: null, requestContext: {} as APIGatewayProxyEvent['requestContext'], resource: '',
+      httpMethod: 'POST',
+      isBase64Encoded: false,
+      path: '/v1/slack/interactions',
+      pathParameters: null,
+      queryStringParameters: null,
+      multiValueQueryStringParameters: null,
+      stageVariables: null,
+      requestContext: {} as APIGatewayProxyEvent['requestContext'],
+      resource: '',
     };
     const result = await handler(event);
     expect(result.statusCode).toBe(401);

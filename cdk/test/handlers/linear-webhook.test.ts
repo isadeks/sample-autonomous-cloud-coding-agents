@@ -55,8 +55,8 @@ process.env.LINEAR_WEBHOOK_SECRET_ARN = 'arn:aws:secretsmanager:us-east-1:123:se
 process.env.LINEAR_WEBHOOK_DEDUP_TABLE_NAME = 'LinearDedup';
 process.env.LINEAR_WEBHOOK_PROCESSOR_FUNCTION_NAME = 'linear-processor';
 
-import { invalidateLinearSecretCache } from '../../src/handlers/shared/linear-verify';
 import { handler } from '../../src/handlers/linear-webhook';
+import { invalidateLinearSecretCache } from '../../src/handlers/shared/linear-verify';
 
 const WEBHOOK_SECRET = 'test-linear-webhook-secret';
 

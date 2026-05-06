@@ -4,8 +4,6 @@ from __future__ import annotations
 
 from unittest.mock import MagicMock, patch
 
-import pytest
-
 from linear_reactions import (
     EMOJI_FAILURE,
     EMOJI_STARTED,
@@ -97,10 +95,7 @@ class TestLinearPath:
             assert post.call_args_list[0].kwargs["json"]["variables"] == {"id": "react-42"}
             # Second call: create ✅
             assert post.call_args_list[1].kwargs["json"]["variables"]["emoji"] == EMOJI_SUCCESS
-            assert (
-                post.call_args_list[1].kwargs["json"]["variables"]["issueId"]
-                == "issue-abc"
-            )
+            assert post.call_args_list[1].kwargs["json"]["variables"]["issueId"] == "issue-abc"
 
     def test_finish_failure_deletes_eyes_then_posts_x(self, monkeypatch):
         monkeypatch.setenv("LINEAR_API_TOKEN", "lin_api_test")

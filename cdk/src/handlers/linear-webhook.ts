@@ -21,8 +21,8 @@ import { ConditionalCheckFailedException, DynamoDBClient } from '@aws-sdk/client
 import { InvokeCommand, LambdaClient } from '@aws-sdk/client-lambda';
 import { DynamoDBDocumentClient, PutCommand } from '@aws-sdk/lib-dynamodb';
 import type { APIGatewayProxyEvent, APIGatewayProxyResult } from 'aws-lambda';
-import { logger } from './shared/logger';
 import { isWebhookTimestampFresh, verifyLinearRequest } from './shared/linear-verify';
+import { logger } from './shared/logger';
 
 const ddb = DynamoDBDocumentClient.from(new DynamoDBClient({}));
 const lambdaClient = new LambdaClient({});

@@ -30,7 +30,7 @@ LINEAR_MCP_SERVER_KEY = "linear-server"
 
 #: Env var name the MCP server entry reads via ``${LINEAR_API_TOKEN}``
 #: placeholder expansion. Populated from ``LinearApiTokenSecret`` by run.sh.
-LINEAR_API_TOKEN_ENV = "LINEAR_API_TOKEN"
+LINEAR_API_TOKEN_ENV = "LINEAR_API_TOKEN"  # noqa: S105 — env var *name*, not a secret value
 
 
 def _linear_server_entry() -> dict[str, Any]:

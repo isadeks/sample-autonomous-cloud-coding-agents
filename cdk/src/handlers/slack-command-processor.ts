@@ -291,8 +291,8 @@ async function getBotToken(teamId: string): Promise<string | null> {
 /** Slack error codes that definitively mean the bot cannot post in this channel. */
 const CHANNEL_ACCESS_HARD_FAILURES = new Set([
   'channel_not_found', // private channel the bot hasn't been invited to
-  'not_in_channel',    // public channel the bot isn't in (some workspaces require join)
-  'missing_scope',     // bot lacks the scope it needs — admin must reinstall
+  'not_in_channel', // public channel the bot isn't in (some workspaces require join)
+  'missing_scope', // bot lacks the scope it needs — admin must reinstall
 ]);
 
 async function checkChannelAccess(teamId: string, channelId: string): Promise<{ ok: boolean; error?: string }> {

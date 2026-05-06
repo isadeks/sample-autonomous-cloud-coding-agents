@@ -250,7 +250,6 @@ async function handleAppMention(
   }
 }
 
-
 async function revokeInstallation(teamId: string): Promise<void> {
   const now = new Date().toISOString();
 

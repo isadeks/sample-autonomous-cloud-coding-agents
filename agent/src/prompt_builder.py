@@ -101,7 +101,7 @@ def _channel_prompt_addendum(config: TaskConfig) -> str:
         "server is loaded. You MUST perform these three updates; they are part "
         "of the task contract, not optional:\n\n"
         "1. **At start** — call `mcp__linear-server__save_comment` with a short "
-        "\"🤖 Starting on this issue…\" message.\n"
+        '"🤖 Starting on this issue…" message.\n'
         "2. **When you open the PR** — call `mcp__linear-server__save_comment` "
         "with the PR URL, then call `mcp__linear-server__save_issue` to "
         "transition the issue state. Use `mcp__linear-server__list_issue_statuses` "

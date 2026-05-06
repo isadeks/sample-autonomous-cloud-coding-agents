@@ -5,8 +5,6 @@ from __future__ import annotations
 import json
 import os
 
-import pytest
-
 from channel_mcp import (
     LINEAR_API_TOKEN_ENV,
     LINEAR_MCP_SERVER_KEY,

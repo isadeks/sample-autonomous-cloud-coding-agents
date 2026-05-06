@@ -18,8 +18,7 @@
  */
 
 import { TaskStatus, type TaskStatusType } from '../../../src/constructs/task-status';
-import type { ActionsBlock, SlackBlock } from '../../../src/handlers/shared/slack-blocks';
-import { renderSlackBlocks } from '../../../src/handlers/shared/slack-blocks';
+import { type ActionsBlock, renderSlackBlocks, type SlackBlock } from '../../../src/handlers/shared/slack-blocks';
 
 /** Narrow to a section block and return its text; throws if block isn't a section. */
 function sectionText(block: SlackBlock): string {

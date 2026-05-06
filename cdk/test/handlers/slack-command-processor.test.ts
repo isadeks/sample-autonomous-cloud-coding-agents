@@ -42,8 +42,7 @@ const fetchMock = jest.fn();
 process.env.SLACK_USER_MAPPING_TABLE_NAME = 'SlackMap';
 process.env.SLACK_INSTALLATION_TABLE_NAME = 'SlackInstall';
 
-import type { MentionEvent, SlashCommandEvent } from '../../src/handlers/slack-command-processor';
-import { handler } from '../../src/handlers/slack-command-processor';
+import { handler, type MentionEvent, type SlashCommandEvent } from '../../src/handlers/slack-command-processor';
 
 function mention(overrides: Partial<MentionEvent> = {}): MentionEvent {
   return {
@@ -90,8 +89,15 @@ describe('slack-command-processor handler', () => {
   test('slash command without source flag defaults to slash and falls through to default branch', async () => {
     // Legacy shape: no source field — slash ack lambda forwards raw SlackCommandPayload
     const legacy = {
-      command: '/bgagent', text: 'unknown_sub', user_id: 'U1', team_id: 'T1', channel_id: 'C1',
-      user_name: '', team_domain: '', channel_name: '', trigger_id: '',
+      command: '/bgagent',
+      text: 'unknown_sub',
+      user_id: 'U1',
+      team_id: 'T1',
+      channel_id: 'C1',
+      user_name: '',
+      team_domain: '',
+      channel_name: '',
+      trigger_id: '',
       response_url: 'https://hooks.slack.com/cmd/X',
     };
     await handler(legacy);
