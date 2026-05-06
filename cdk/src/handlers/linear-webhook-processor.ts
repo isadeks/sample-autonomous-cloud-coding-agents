@@ -126,6 +126,10 @@ export async function handler(event: ProcessorEvent): Promise<void> {
       action: payload.action,
       issue_id: issue.id,
       label_filter: labelFilter,
+      current_labels: issue.labels?.map((l) => l?.name),
+      updated_from_keys: Object.keys(payload.updatedFrom ?? {}),
+      updated_from_label_ids: payload.updatedFrom?.labelIds,
+      current_label_ids: issue.labels?.map((l) => l?.id),
     });
     return;
   }
