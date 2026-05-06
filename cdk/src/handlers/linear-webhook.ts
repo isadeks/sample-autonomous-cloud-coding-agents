@@ -31,8 +31,16 @@ const WEBHOOK_SECRET_ARN = process.env.LINEAR_WEBHOOK_SECRET_ARN!;
 const DEDUP_TABLE_NAME = process.env.LINEAR_WEBHOOK_DEDUP_TABLE_NAME!;
 const PROCESSOR_FUNCTION_NAME = process.env.LINEAR_WEBHOOK_PROCESSOR_FUNCTION_NAME!;
 
-/** Dedup window for Linear webhook retries (seconds). Linear's first retry is +1m. */
-const DEDUP_TTL_SECONDS = 60;
+/**
+ * Dedup window (seconds). Must exceed Linear's full retry horizon: first
+ * retry is +1m, then +1h, then +6h (~7h total from the initial delivery).
+ * A window shorter than this lets the +1h / +6h retries land after the
+ * dedup row has TTL'd out, which would double-create the task when an
+ * ack was lost. 8h is comfortably over the horizon with slack for clock
+ * skew, without making stale rows live meaningfully longer (DDB TTL is
+ * async best-effort anyway).
+ */
+const DEDUP_TTL_SECONDS = 8 * 60 * 60;
 
 /**
  * Shape of the top-level Linear webhook payload we care about for dedup + routing.
@@ -108,9 +116,16 @@ export async function handler(event: APIGatewayProxyEvent): Promise<APIGatewayPr
       return jsonResponse(400, { error: 'Missing issue id' });
     }
 
-    // Dedup via conditional PutItem. If the key already exists we silently
-    // acknowledge the retry without re-dispatching the processor.
-    const dedupKey = `${issueId}#${action}`;
+    // Dedup via conditional PutItem.
+    //
+    // Linear's `webhookId` in the payload body is the *webhook configuration*
+    // ID — reused on every delivery, not per-delivery. `webhookTimestamp`
+    // (UNIX ms) is unique per delivery; Linear reuses it for retries of a
+    // single delivery. Compose `${issueId}#${action}#${webhookTimestamp}` so
+    // retries of the same event collapse (same timestamp) while distinct
+    // events do not. A missing timestamp would have already failed the replay
+    // check above, so treat its presence as a precondition.
+    const dedupKey = `${issueId}#${action}#${payload.webhookTimestamp}`;
     const nowSeconds = Math.floor(Date.now() / 1000);
     try {
       await ddb.send(new PutCommand({

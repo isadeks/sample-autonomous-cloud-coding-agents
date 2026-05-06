@@ -165,7 +165,8 @@ describe('linear-webhook handler', () => {
   });
 
   test('verified Issue event dedups and invokes processor', async () => {
-    const body = issueCreatePayload();
+    const FRESH_TS = Date.now();
+    const body = issueCreatePayload({ webhookTimestamp: FRESH_TS });
     ddbSend.mockResolvedValueOnce({}); // conditional Put succeeds
     lambdaSend.mockResolvedValueOnce({});
 
@@ -174,8 +175,15 @@ describe('linear-webhook handler', () => {
     expect(result.statusCode).toBe(200);
     const putCall = ddbSend.mock.calls.find(([cmd]) => cmd._type === 'Put');
     expect(putCall).toBeTruthy();
-    expect(putCall![0].input.Item.dedup_key).toBe('issue-1#create');
+    expect(putCall![0].input.Item.dedup_key).toBe(`issue-1#create#${FRESH_TS}`);
     expect(putCall![0].input.ConditionExpression).toContain('attribute_not_exists');
+
+    // The TTL must outlast Linear's full retry horizon (first at +1m, then
+    // +1h, then +6h — ~7h total). Anything shorter lets the +1h/+6h retries
+    // land after the dedup row expires and double-dispatch the task.
+    const nowSeconds = Math.floor(Date.now() / 1000);
+    const ttl = putCall![0].input.Item.ttl as number;
+    expect(ttl - nowSeconds).toBeGreaterThanOrEqual(7 * 60 * 60);
 
     expect(lambdaSend).toHaveBeenCalledTimes(1);
     const invokeCall = lambdaSend.mock.calls[0][0];
@@ -184,6 +192,28 @@ describe('linear-webhook handler', () => {
     expect(invokeCall.input.InvocationType).toBe('Event');
     const decoded = JSON.parse(new TextDecoder().decode(invokeCall.input.Payload));
     expect(decoded.raw_body).toBe(body);
+  });
+
+  test('distinct deliveries for the same issue both dispatch', async () => {
+    // Linear reuses `webhookId` across deliveries from the same webhook
+    // config, so two separate events (label-off-then-on) share the webhookId
+    // but differ in webhookTimestamp. The dedup primitive must include
+    // timestamp so distinct events are not collapsed.
+    const FRESH_TS = Date.now();
+    const FRESH_TS_2 = FRESH_TS + 1000;
+    const body1 = issueCreatePayload({ webhookTimestamp: FRESH_TS });
+    const body2 = issueCreatePayload({ webhookTimestamp: FRESH_TS_2 });
+    ddbSend.mockResolvedValue({});
+    lambdaSend.mockResolvedValue({});
+
+    await handler(makeEvent(body1, sign(body1)));
+    await handler(makeEvent(body2, sign(body2)));
+
+    const putCalls = ddbSend.mock.calls.filter(([cmd]) => cmd._type === 'Put');
+    expect(putCalls).toHaveLength(2);
+    expect(putCalls[0][0].input.Item.dedup_key).toBe(`issue-1#create#${FRESH_TS}`);
+    expect(putCalls[1][0].input.Item.dedup_key).toBe(`issue-1#create#${FRESH_TS_2}`);
+    expect(lambdaSend).toHaveBeenCalledTimes(2);
   });
 
   test('dedup hit returns 200 without re-invoking processor', async () => {
