@@ -45,6 +45,7 @@ function rewriteDocsLinkTarget(target) {
     CONTRIBUTING: '/developer-guide/contributing',
     SLACK_SETUP_GUIDE: '/using/slack-setup-guide',
     LINEAR_SETUP_GUIDE: '/using/linear-setup-guide',
+    DEPLOYMENT_GUIDE: '/getting-started/deployment-guide',
   };
 
   /** `splitGuide` emits each `##` from DEVELOPER_GUIDE as its own page — map #anchors to those routes. */
@@ -210,6 +211,12 @@ for (const page of orphanedPages) {
 mirrorMarkdownFile(
   path.join(docsRoot, 'guides', 'QUICK_START.md'),
   path.join('src', 'content', 'docs', 'getting-started', 'Quick-start.md'),
+);
+
+// --- Deployment Guide: mirror to getting-started/ ---
+mirrorMarkdownFile(
+  path.join(docsRoot, 'guides', 'DEPLOYMENT_GUIDE.md'),
+  path.join('src', 'content', 'docs', 'getting-started', 'Deployment-guide.md'),
 );
 
 // --- Prompt Guide: mirror to customizing/ ---
