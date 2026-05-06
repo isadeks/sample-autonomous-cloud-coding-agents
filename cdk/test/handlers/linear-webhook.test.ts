@@ -37,6 +37,7 @@ jest.mock('@aws-sdk/client-dynamodb', () => {
 jest.mock('@aws-sdk/lib-dynamodb', () => ({
   DynamoDBDocumentClient: { from: jest.fn(() => ({ send: ddbSend })) },
   PutCommand: jest.fn((input: unknown) => ({ _type: 'Put', input })),
+  DeleteCommand: jest.fn((input: unknown) => ({ _type: 'Delete', input })),
 }));
 
 const lambdaSend = jest.fn();
@@ -230,9 +231,30 @@ describe('linear-webhook handler', () => {
     expect(lambdaSend).not.toHaveBeenCalled();
   });
 
-  test('returns 500 if processor invoke fails', async () => {
+  test('returns 500 and rolls back dedup row if processor invoke fails', async () => {
+    const FRESH_TS = Date.now();
+    const body = issueCreatePayload({ webhookTimestamp: FRESH_TS });
+    // 1st ddbSend: PutCommand (dedup reservation) succeeds
+    // 2nd ddbSend: DeleteCommand (rollback after invoke failure) succeeds
+    ddbSend.mockResolvedValueOnce({}).mockResolvedValueOnce({});
+    lambdaSend.mockRejectedValueOnce(new Error('Lambda throttle'));
+
+    const result = await handler(makeEvent(body, sign(body)));
+    expect(result.statusCode).toBe(500);
+
+    // Dedup row must be deleted so Linear's +1m/+1h/+6h retries can try again —
+    // otherwise a transient Lambda failure silently drops the task for 8h.
+    const deleteCalls = ddbSend.mock.calls.filter((c) => c[0]._type === 'Delete');
+    expect(deleteCalls).toHaveLength(1);
+    expect(deleteCalls[0][0].input.TableName).toBe('LinearDedup');
+    expect(deleteCalls[0][0].input.Key.dedup_key).toBe(`issue-1#create#${FRESH_TS}`);
+  });
+
+  test('returns 500 even if dedup rollback also fails (does not mask invoke error)', async () => {
     const body = issueCreatePayload();
-    ddbSend.mockResolvedValueOnce({});
+    ddbSend
+      .mockResolvedValueOnce({})
+      .mockRejectedValueOnce(new Error('DDB unavailable'));
     lambdaSend.mockRejectedValueOnce(new Error('Lambda throttle'));
 
     const result = await handler(makeEvent(body, sign(body)));

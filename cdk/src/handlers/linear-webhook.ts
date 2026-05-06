@@ -19,7 +19,7 @@
 
 import { ConditionalCheckFailedException, DynamoDBClient } from '@aws-sdk/client-dynamodb';
 import { InvokeCommand, LambdaClient } from '@aws-sdk/client-lambda';
-import { DynamoDBDocumentClient, PutCommand } from '@aws-sdk/lib-dynamodb';
+import { DeleteCommand, DynamoDBDocumentClient, PutCommand } from '@aws-sdk/lib-dynamodb';
 import type { APIGatewayProxyEvent, APIGatewayProxyResult } from 'aws-lambda';
 import { isWebhookTimestampFresh, verifyLinearRequest } from './shared/linear-verify';
 import { logger } from './shared/logger';
@@ -161,9 +161,20 @@ export async function handler(event: APIGatewayProxyEvent): Promise<APIGatewayPr
         issue_id: issueId,
         action,
       });
-      // Return 500 so Linear retries — the dedup row will block a double-dispatch
-      // within the 60s window; after that the processor was already invoked or
-      // genuinely failed and a retry is correct.
+      // Roll back the dedup row so Linear's next retry (+1m / +1h / +6h) can
+      // try dispatch again. Without this, all retries would hit the dedup TTL
+      // (8h) and silently drop the task forever.
+      try {
+        await ddb.send(new DeleteCommand({
+          TableName: DEDUP_TABLE_NAME,
+          Key: { dedup_key: dedupKey },
+        }));
+      } catch (cleanupErr) {
+        logger.warn('Failed to roll back Linear webhook dedup row after invoke failure', {
+          error: cleanupErr instanceof Error ? cleanupErr.message : String(cleanupErr),
+          dedup_key: dedupKey,
+        });
+      }
       return jsonResponse(500, { error: 'Dispatch failed' });
     }
 
