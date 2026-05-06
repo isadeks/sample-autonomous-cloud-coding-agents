@@ -20,15 +20,18 @@
 import * as readline from 'readline';
 import { CloudFormationClient, DescribeStacksCommand } from '@aws-sdk/client-cloudformation';
 import { DynamoDBClient } from '@aws-sdk/client-dynamodb';
+import { GetSecretValueCommand, PutSecretValueCommand, SecretsManagerClient } from '@aws-sdk/client-secrets-manager';
 import { DynamoDBDocumentClient, PutCommand } from '@aws-sdk/lib-dynamodb';
-import { PutSecretValueCommand, SecretsManagerClient } from '@aws-sdk/client-secrets-manager';
 import { Command } from 'commander';
 import { ApiClient } from '../api-client';
-import { loadConfig } from '../config';
+import { loadConfig, loadCredentials } from '../config';
 import { formatJson } from '../format';
 
 /** Default label that triggers an ABCA task when applied to a Linear issue. */
 const DEFAULT_LABEL_FILTER = 'bgagent';
+
+/** Standard RFC 4122 UUID — Linear's `projects.nodes[].id` matches this shape. */
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 export function makeLinearCommand(): Command {
   const linear = new Command('linear')
@@ -95,14 +98,20 @@ export function makeLinearCommand(): Command {
         await sm.send(new PutSecretValueCommand({ SecretId: webhookSecretArn, SecretString: webhookSecret }));
         console.log('  ✓ Stored webhook signing secret');
         await sm.send(new PutSecretValueCommand({ SecretId: apiTokenSecretArn, SecretString: apiToken }));
-        console.log('  ✓ Stored personal API token\n');
+        console.log('  ✓ Stored personal API token');
 
-        console.log('Next steps:');
+        const userMappingTable = await getStackOutput(region, opts.stackName, 'LinearUserMappingTableName');
+        if (!userMappingTable) {
+          console.error('\n✗ Could not find LinearUserMappingTableName in stack outputs. Deploy the stack first.');
+          process.exit(1);
+        }
+        await autoLinkTokenOwner({ region, apiToken, userMappingTable });
+
+        console.log('\nNext steps:');
         console.log('  1. Onboard a Linear project:');
         console.log('       bgagent linear onboard-project <linear-project-id> --repo owner/repo');
-        console.log('  2. In Linear, comment on an issue with "bgagent link" to receive a link code, then run:');
-        console.log('       bgagent linear link <code>');
-        console.log('  3. Add the "bgagent" label to a Linear issue in a mapped project — ABCA will pick it up.');
+        console.log('  2. Add the "bgagent" label to a Linear issue in a mapped project — ABCA will pick it up.');
+        console.log('     (To link additional Linear users, run `bgagent linear link <code>` after they generate a code.)');
       }),
   );
 
@@ -130,6 +139,18 @@ export function makeLinearCommand(): Command {
           process.exit(1);
         }
 
+        if (!UUID_RE.test(projectId)) {
+          console.error(`Invalid Linear project UUID: ${projectId}`);
+          console.error('');
+          console.error('Linear project URLs contain a *truncated* UUID. The real UUID is a full 36-character');
+          console.error('UUID (e.g. a680cae8-704c-4e64-92ac-0c80346d1aad). Run:');
+          console.error('');
+          console.error('  bgagent linear list-projects');
+          console.error('');
+          console.error('to see the full UUID for each project in your workspace.');
+          process.exit(1);
+        }
+
         const now = new Date().toISOString();
         const ddb = DynamoDBDocumentClient.from(new DynamoDBClient({ region }));
         await ddb.send(new PutCommand({
@@ -150,6 +171,77 @@ export function makeLinearCommand(): Command {
         if (opts.teamId) {
           console.log(`  Team: ${opts.teamId}`);
         }
+      }),
+  );
+
+  linear.addCommand(
+    new Command('list-projects')
+      .description('List Linear projects visible to the stored API token (with full UUIDs)')
+      .option('--region <region>', 'AWS region (defaults to configured region)')
+      .option('--stack-name <name>', 'CloudFormation stack name', 'backgroundagent-dev')
+      .option('--output <format>', 'Output format (text or json)', 'text')
+      .action(async (opts) => {
+        const config = loadConfig();
+        const region = opts.region || config.region;
+
+        const apiTokenSecretArn = await getStackOutput(region, opts.stackName, 'LinearApiTokenSecretArn');
+        if (!apiTokenSecretArn) {
+          console.error('Could not find LinearApiTokenSecretArn in stack outputs. Deploy the stack first.');
+          process.exit(1);
+        }
+
+        const sm = new SecretsManagerClient({ region });
+        const secret = await sm.send(new GetSecretValueCommand({ SecretId: apiTokenSecretArn }));
+        const apiToken = secret.SecretString;
+        if (!apiToken || apiToken === ' ') {
+          console.error('Linear API token is not populated. Run `bgagent linear setup` first.');
+          process.exit(1);
+        }
+
+        let projects: Array<{ id: string; name: string; teams?: { nodes?: Array<{ id: string; name: string }> } }>;
+        try {
+          const res = await fetch('https://api.linear.app/graphql', {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+              'Authorization': apiToken,
+            },
+            body: JSON.stringify({
+              query: '{ projects { nodes { id name teams { nodes { id name } } } } }',
+            }),
+          });
+          if (!res.ok) {
+            throw new Error(`Linear API returned ${res.status}`);
+          }
+          const body = await res.json() as { data?: { projects?: { nodes?: typeof projects } } };
+          projects = body.data?.projects?.nodes ?? [];
+        } catch (err) {
+          console.error(`Failed to fetch Linear projects: ${err instanceof Error ? err.message : String(err)}`);
+          process.exit(1);
+        }
+
+        if (opts.output === 'json') {
+          console.log(formatJson(projects));
+          return;
+        }
+
+        if (projects.length === 0) {
+          console.log('No Linear projects visible to the stored API token.');
+          return;
+        }
+
+        console.log(`Found ${projects.length} Linear project(s):\n`);
+        for (const p of projects) {
+          const team = p.teams?.nodes?.[0];
+          console.log(`  ${p.name}`);
+          console.log(`    id:   ${p.id}`);
+          if (team) {
+            console.log(`    team: ${team.name} (${team.id})`);
+          }
+          console.log('');
+        }
+        console.log('Onboard with:');
+        console.log('  bgagent linear onboard-project <id> --repo owner/repo [--label abca]');
       }),
   );
 
@@ -215,6 +307,102 @@ function promptSecret(label: string): Promise<string> {
       rl.once('close', () => reject(new Error('No input provided.')));
     }
   });
+}
+
+// ─── Auto-link ───────────────────────────────────────────────────────────────
+
+interface LinearViewer {
+  readonly id: string;
+  readonly name?: string;
+  readonly email?: string;
+}
+
+interface LinearOrganization {
+  readonly id: string;
+  readonly name?: string;
+}
+
+/**
+ * Query `viewer` + `organization` on the Linear API and write an active
+ * LinearUserMapping row binding the token owner to the Cognito user running
+ * the CLI. Skips gracefully on any failure — the admin can still link manually.
+ *
+ * Exported for test. Not part of the public CLI surface.
+ */
+export async function autoLinkTokenOwner(args: {
+  region: string;
+  apiToken: string;
+  userMappingTable: string;
+}): Promise<void> {
+  let viewer: LinearViewer;
+  let organization: LinearOrganization;
+  try {
+    const res = await fetch('https://api.linear.app/graphql', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': args.apiToken,
+      },
+      body: JSON.stringify({
+        query: '{ viewer { id name email } organization { id name } }',
+      }),
+    });
+    if (!res.ok) {
+      throw new Error(`Linear API returned ${res.status}`);
+    }
+    const body = await res.json() as { data?: { viewer?: LinearViewer; organization?: LinearOrganization } };
+    if (!body.data?.viewer?.id || !body.data.organization?.id) {
+      throw new Error('Linear API response missing viewer.id or organization.id');
+    }
+    viewer = body.data.viewer;
+    organization = body.data.organization;
+  } catch (err) {
+    console.log(`  ⚠ Could not auto-link token owner: ${err instanceof Error ? err.message : String(err)}`);
+    console.log('    Run `bgagent linear link <code>` manually after generating a code.');
+    return;
+  }
+
+  let cognitoSub: string;
+  try {
+    cognitoSub = extractCognitoSub();
+  } catch (err) {
+    console.log(`  ⚠ Could not resolve your platform user (${err instanceof Error ? err.message : String(err)}).`);
+    console.log('    Run `bgagent login`, then re-run `bgagent linear setup` to finish auto-linking.');
+    return;
+  }
+
+  const ddb = DynamoDBDocumentClient.from(new DynamoDBClient({ region: args.region }));
+  await ddb.send(new PutCommand({
+    TableName: args.userMappingTable,
+    Item: {
+      linear_identity: `${organization.id}#${viewer.id}`,
+      platform_user_id: cognitoSub,
+      linear_workspace_id: organization.id,
+      linear_user_id: viewer.id,
+      linked_at: new Date().toISOString(),
+      status: 'active',
+      link_method: 'auto_setup',
+    },
+  }));
+
+  const label = viewer.name ?? viewer.email ?? viewer.id;
+  console.log(`  ✓ Linked Linear user ${label} (${organization.name ?? organization.id}) → platform user ${cognitoSub}`);
+}
+
+function extractCognitoSub(): string {
+  const creds = loadCredentials();
+  if (!creds?.id_token) {
+    throw new Error('not authenticated — run `bgagent login`');
+  }
+  const parts = creds.id_token.split('.');
+  if (parts.length !== 3) {
+    throw new Error('malformed id_token in ~/.bgagent/credentials.json');
+  }
+  const payload = JSON.parse(Buffer.from(parts[1], 'base64url').toString('utf-8')) as { sub?: string };
+  if (!payload.sub) {
+    throw new Error('id_token missing `sub` claim');
+  }
+  return payload.sub;
 }
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
