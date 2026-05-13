@@ -193,6 +193,24 @@ describe('dispatchSlackEvent', () => {
     ).rejects.toThrow('throttle');
   });
 
+  test('throws when TASK_TABLE_NAME env var is missing (PR #79 review #3)', async () => {
+    // Pre-fix: missing env returned silently, so the router counted
+    // Slack as "dispatched" and a broken stack quietly dropped every
+    // Slack notification. Post-fix: throw so the rejection lands in
+    // ``infraRejections`` and Lambda retries / DLQs.
+    const original = process.env.TASK_TABLE_NAME;
+    delete process.env.TASK_TABLE_NAME;
+    try {
+      await expect(
+        dispatchSlackEvent(mkEvent('t1', 'task_created'), ddb),
+      ).rejects.toThrow(/TASK_TABLE_NAME env var not set/);
+      // No DDB call attempted — the env-var guard fires first.
+      expect(ddbSend).not.toHaveBeenCalled();
+    } finally {
+      process.env.TASK_TABLE_NAME = original;
+    }
+  });
+
   test('ignores event types not in the Slack render set', async () => {
     // Defence-in-depth: even if the fanout filter drifts and sends us
     // an event the renderer doesn't know how to format, we must

@@ -168,11 +168,23 @@ export async function dispatchSlackEvent(
 
   const tableName = process.env.TASK_TABLE_NAME;
   if (!tableName) {
-    logger.warn('[fanout/slack] TASK_TABLE_NAME not set — cannot dispatch', {
+    // Throw rather than return — a missing env var on a Slack-
+    // subscribed event is a deployment misconfiguration, not a per-
+    // record problem. Returning silently used to count as "successful
+    // dispatch" in batch telemetry, so a broken stack would drop
+    // every Slack notification indefinitely with only a warn line.
+    // Throwing routes the rejection through the router's
+    // ``infraRejections`` path so Lambda retries (until DLQ) and the
+    // ``fanout.dispatcher.rejected`` metric alarms operators
+    // (PR #79 review #3).
+    logger.error('[fanout/slack] TASK_TABLE_NAME not set — cannot dispatch', {
       event: 'fanout.slack.missing_env',
+      error_id: 'FANOUT_SLACK_MISSING_TASK_TABLE',
       task_id: taskId,
     });
-    return;
+    throw new Error(
+      `[fanout/slack] TASK_TABLE_NAME env var not set; Slack dispatcher cannot run (task_id=${taskId})`,
+    );
   }
 
   const taskResult = await ddb.send(new GetCommand({
