@@ -193,6 +193,7 @@ describe('dispatchSlackEvent', () => {
     });
     fetchMock.mockResolvedValueOnce({
       ok: true,
+      headers: { get: () => null },
       json: () => Promise.resolve({ ok: false, error: slackErrorCode }),
     });
 
@@ -205,6 +206,43 @@ describe('dispatchSlackEvent', () => {
     expect(caught).toBeInstanceOf(Error);
     expect(caught).not.toBeInstanceOf(SlackApiError);
     expect((caught as Error).message).toContain(slackErrorCode);
+  });
+
+  test('logs Retry-After header on rate-limited Slack responses (PR #79 review #4)', async () => {
+    // Slack returns the Retry-After header (in seconds) on
+    // ``ratelimited`` so callers know when to retry. Surfacing it in
+    // the warn log means operators reading CloudWatch can see the
+    // expected recovery time instead of guessing from sustained warn
+    // rate.
+    ddbSend.mockResolvedValueOnce({
+      Item: {
+        task_id: 't1',
+        channel_source: 'slack',
+        channel_metadata: { slack_team_id: 'T1', slack_channel_id: 'C1' },
+      },
+    });
+    fetchMock.mockResolvedValueOnce({
+      ok: true,
+      headers: { get: (name: string) => (name.toLowerCase() === 'retry-after' ? '30' : null) },
+      json: () => Promise.resolve({ ok: false, error: 'ratelimited' }),
+    });
+
+    const loggerModule = await import('../../src/handlers/shared/logger');
+    const warnSpy = jest.spyOn(loggerModule.logger, 'warn').mockImplementation(() => undefined);
+    try {
+      await expect(
+        dispatchSlackEvent(mkEvent('t1', 'task_created'), ddb),
+      ).rejects.toThrow(/ratelimited/);
+
+      const retryWarn = warnSpy.mock.calls.find(
+        c => (c[1] as Record<string, unknown> | undefined)?.event === 'fanout.slack.retryable_api_error',
+      );
+      expect(retryWarn).toBeDefined();
+      expect((retryWarn?.[1] as Record<string, unknown>).retry_after_seconds).toBe('30');
+      expect((retryWarn?.[1] as Record<string, unknown>).slack_error_code).toBe('ratelimited');
+    } finally {
+      warnSpy.mockRestore();
+    }
   });
 
   test('rethrows infra errors so the router records a dispatcher-rejected warn', async () => {
