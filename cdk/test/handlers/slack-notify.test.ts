@@ -653,6 +653,96 @@ describe('dispatchSlackEvent', () => {
     expect(postBody.text).toContain('Task stranded');
   });
 
+  test('terminal cleanup re-reads TaskRecord so it sees msg_ts attrs persisted on earlier stream batches (orphan-message fix)', async () => {
+    // Fast-task orphan scenario observed live during PR #79 review:
+    //   1. task_created stream batch posts the rocket message and
+    //      writes ``slack_created_msg_ts``.
+    //   2. task_completed stream batch runs ~30s later. Its initial
+    //      GetItem races the prior UpdateItem and sees stale
+    //      channel_metadata WITHOUT slack_created_msg_ts.
+    //   3. Without the re-read, the terminal cleanup branch sees
+    //      ``channelMeta.slack_created_msg_ts === undefined`` and
+    //      silently skips. The rocket message stays in the thread.
+    // Fix: a fresh GetItem inside the terminal-cleanup branch
+    // (after the dedup UpdateItem has linearized our view) sees the
+    // newly-written attribute and triggers the chat.delete.
+    ddbSend
+      .mockResolvedValueOnce({ // dispatch-entry GetItem — STALE (no msg_ts)
+        Item: {
+          task_id: 't1',
+          channel_source: 'slack',
+          channel_metadata: { slack_team_id: 'T1', slack_channel_id: 'C1' },
+          repo: 'org/repo',
+        },
+      })
+      .mockResolvedValueOnce({}) // dedup UpdateItem succeeds
+      .mockResolvedValueOnce({ // terminal cleanup re-read — FRESH
+        Item: {
+          task_id: 't1',
+          channel_source: 'slack',
+          channel_metadata: {
+            slack_team_id: 'T1',
+            slack_channel_id: 'C1',
+            slack_created_msg_ts: '1234.0001', // landed via the prior batch
+          },
+          repo: 'org/repo',
+        },
+      });
+
+    await dispatchSlackEvent(mkEvent('t1', 'task_completed'), ddb);
+
+    // The chat.delete fires against the freshly-read msg_ts.
+    const deleteCall = fetchMock.mock.calls.find(
+      ([url]) => url === 'https://slack.com/api/chat.delete',
+    );
+    expect(deleteCall).toBeDefined();
+    const deleteBody = JSON.parse((deleteCall![1] as { body: string }).body);
+    expect(deleteBody.ts).toBe('1234.0001');
+  });
+
+  test('terminal cleanup falls back to dispatch-entry snapshot when re-read fails', async () => {
+    // Defense-in-depth: a transient DDB failure on the re-read GetItem
+    // must NOT break terminal delivery. Falls back to the snapshot we
+    // already had, logs a warn, and continues.
+    ddbSend
+      .mockResolvedValueOnce({ // dispatch-entry GetItem — has msg_ts
+        Item: {
+          task_id: 't1',
+          channel_source: 'slack',
+          channel_metadata: {
+            slack_team_id: 'T1',
+            slack_channel_id: 'C1',
+            slack_created_msg_ts: '9999.0001',
+          },
+          repo: 'org/repo',
+        },
+      })
+      .mockResolvedValueOnce({}) // dedup
+      .mockRejectedValueOnce(new Error('throttled')); // re-read fails
+
+    const loggerModule = await import('../../src/handlers/shared/logger');
+    const warnSpy = jest.spyOn(loggerModule.logger, 'warn').mockImplementation(() => undefined);
+    try {
+      await dispatchSlackEvent(mkEvent('t1', 'task_completed'), ddb);
+
+      // Cleanup still ran with the original snapshot's msg_ts.
+      const deleteCall = fetchMock.mock.calls.find(
+        ([url]) => url === 'https://slack.com/api/chat.delete',
+      );
+      expect(deleteCall).toBeDefined();
+      const deleteBody = JSON.parse((deleteCall![1] as { body: string }).body);
+      expect(deleteBody.ts).toBe('9999.0001');
+
+      // The fallback was observable.
+      const fallbackWarn = warnSpy.mock.calls.find(
+        c => (c[1] as Record<string, unknown> | undefined)?.event === 'fanout.slack.cleanup_reread_failed',
+      );
+      expect(fallbackWarn).toBeDefined();
+    } finally {
+      warnSpy.mockRestore();
+    }
+  });
+
   test('task_stranded after a sibling task_failed dedups (no double-page on the reconciler twin)', async () => {
     // Real-world scenario: the reconciler writes BOTH task_stranded
     // and task_failed for a heartbeat-expired task (one for the

@@ -456,11 +456,44 @@ export async function dispatchSlackEvent(
   }
 
   if (TERMINAL_EVENTS.has(eventType)) {
-    if (channelMeta.slack_session_msg_ts) {
-      await deleteMessage(botToken, channel, channelMeta.slack_session_msg_ts);
+    // Re-read the task record before terminal cleanup. The
+    // ``channelMeta`` snapshot above was captured at dispatch entry —
+    // by the time we reach a terminal event, the orchestrator-emitted
+    // ``task_created`` and ``session_started`` events have run on
+    // earlier stream batches and persisted their ``slack_*_msg_ts``
+    // attributes through conditional UpdateItems. On fast tasks
+    // (~30s) the terminal event can land **before** those persists
+    // have propagated to a new GetItem, so the initial read sees a
+    // stale channel_metadata with no msg_ts attributes — and the
+    // cleanup below silently does nothing, leaving the 🚀 task_created
+    // message orphaned in the thread (observed in PR #79 dev-stack
+    // verification). The fresh read closes that window: by the time
+    // we get here, the dedup write above (which lands in the same
+    // table) has linearized our view, so any prior persists are now
+    // visible.
+    let latestChannelMeta: TaskRecord['channel_metadata'] = channelMeta;
+    try {
+      const refreshed = await ddb.send(new GetCommand({
+        TableName: tableName,
+        Key: { task_id: taskId },
+      }));
+      const refreshedTask = refreshed.Item as TaskRecord | undefined;
+      latestChannelMeta = refreshedTask?.channel_metadata ?? channelMeta;
+    } catch (err) {
+      // Best-effort: a GetItem failure here means we fall back to
+      // the original snapshot. Log so operators can see the
+      // refresh-rate vs cleanup-skip-rate gap.
+      logger.warn('[fanout/slack] terminal cleanup re-read failed — falling back to dispatch-entry snapshot', {
+        event: 'fanout.slack.cleanup_reread_failed',
+        task_id: taskId,
+        error: err instanceof Error ? err.message : String(err),
+      });
     }
-    if (channelMeta.slack_created_msg_ts) {
-      await deleteMessage(botToken, channel, channelMeta.slack_created_msg_ts);
+    if (latestChannelMeta?.slack_session_msg_ts) {
+      await deleteMessage(botToken, channel, latestChannelMeta.slack_session_msg_ts);
+    }
+    if (latestChannelMeta?.slack_created_msg_ts) {
+      await deleteMessage(botToken, channel, latestChannelMeta.slack_created_msg_ts);
     }
   }
 
