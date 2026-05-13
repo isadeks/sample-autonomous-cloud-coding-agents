@@ -347,14 +347,24 @@ async function dispatchToSlack(event: FanOutEvent): Promise<void> {
   try {
     await dispatchSlackEvent(effectiveEvent, ddb);
   } catch (err) {
-    if (err instanceof SlackApiError) {
+    // Match SlackApiError by class OR by ``name`` so a bundler that
+    // duplicates the slack-notify module (rare with NodejsFunction
+    // tree-shaking but possible if the module ever gets dual-bundled)
+    // can't make ``instanceof`` silently fail and turn a
+    // channel-terminal swallow into an infinite Lambda retry loop.
+    // Mirrors how ``GitHubCommentError`` is duck-typed by name in
+    // dispatchToGitHubComment (PR #79 review #7).
+    const isSlackApiErr =
+      err instanceof SlackApiError
+      || (err instanceof Error && err.name === 'SlackApiError');
+    if (isSlackApiErr) {
       logger.warn('[fanout/slack] Slack API error — swallowing per channel policy', {
         event: 'fanout.slack.api_error',
         task_id: event.task_id,
         event_id: event.event_id,
         event_type: event.event_type,
         effective_event_type: effectiveType,
-        error: err.message,
+        error: (err as Error).message,
       });
       return;
     }

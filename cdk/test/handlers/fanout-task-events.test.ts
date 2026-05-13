@@ -1185,6 +1185,28 @@ describe('fanout-task-events: Slack dispatcher (issue #64 migration)', () => {
     };
     await expect(handler(event)).resolves.toEqual({ batchItemFailures: [] });
   });
+
+  test('SlackApiError matched by name even when instanceof fails (PR #79 review #7)', async () => {
+    // Defense-in-depth: if a bundler ever duplicates the slack-notify
+    // module, two distinct SlackApiError classes coexist and
+    // ``instanceof`` against one fails for instances of the other.
+    // The dispatcher must fall back to ``err.name === 'SlackApiError'``
+    // so a duplicated-class scenario doesn't flip the channel-terminal
+    // swallow into an infinite retry loop. Synthesise that exact
+    // shape: a plain Error with name === 'SlackApiError', NOT an
+    // instance of the mock's SlackApiError class.
+    const fakeForeignSlackApiError = new Error(
+      'slack chat.postMessage failed: not_authed',
+    );
+    fakeForeignSlackApiError.name = 'SlackApiError';
+    mockDispatchSlackEvent.mockReset().mockRejectedValueOnce(fakeForeignSlackApiError);
+
+    const event: DynamoDBStreamEvent = {
+      Records: [mkEvent('task_completed', 't-slack-foreign-class')],
+    };
+    // Must still be caught — record advances, no batchItemFailures.
+    await expect(handler(event)).resolves.toEqual({ batchItemFailures: [] });
+  });
 });
 
 // ---------------------------------------------------------------------------
