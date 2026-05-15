@@ -95,10 +95,12 @@ _viewer_id_cache: str | None = None
 #: Linear's quota. After ``_AUTH_FAILURE_THRESHOLD`` consecutive 401/403
 #: responses, ``_auth_circuit_open`` flips to True and all later calls
 #: short-circuit (return None) without hitting the network. A successful
-#: 2xx response resets the counter.
+#: 2xx response resets the counter. The lock guards the read-modify-write
+#: against the daemon sweep thread.
 _AUTH_FAILURE_THRESHOLD = 3
 _consecutive_auth_failures = 0
 _auth_circuit_open = False
+_auth_state_lock = threading.Lock()
 
 
 def _enabled(channel_source: str, channel_metadata: dict[str, str] | None) -> str | None:
@@ -126,8 +128,9 @@ def _graphql(query: str, variables: dict[str, Any]) -> dict[str, Any] | None:
     """
     global _consecutive_auth_failures, _auth_circuit_open
 
-    if _auth_circuit_open:
-        return None
+    with _auth_state_lock:
+        if _auth_circuit_open:
+            return None
 
     token = os.environ.get("LINEAR_API_TOKEN", "")
     if not token:
@@ -149,13 +152,19 @@ def _graphql(query: str, variables: dict[str, Any]) -> dict[str, Any] | None:
         return None
 
     if resp.status_code in (401, 403):
-        _consecutive_auth_failures += 1
-        if _consecutive_auth_failures >= _AUTH_FAILURE_THRESHOLD and not _auth_circuit_open:
-            _auth_circuit_open = True
+        with _auth_state_lock:
+            _consecutive_auth_failures += 1
+            opened = (
+                _consecutive_auth_failures >= _AUTH_FAILURE_THRESHOLD and not _auth_circuit_open
+            )
+            if opened:
+                _auth_circuit_open = True
+                failures = _consecutive_auth_failures
+        if opened:
             log(
                 "ERROR",
                 "linear_reactions: auth circuit OPEN after "
-                f"{_consecutive_auth_failures} consecutive {resp.status_code}s — "
+                f"{failures} consecutive {resp.status_code}s — "
                 "API token likely revoked. Suppressing further Linear calls "
                 "for this container.",
             )
@@ -169,7 +178,8 @@ def _graphql(query: str, variables: dict[str, Any]) -> dict[str, Any] | None:
 
     # Successful 2xx — reset the auth failure counter so transient blips don't
     # accumulate toward the threshold.
-    _consecutive_auth_failures = 0
+    with _auth_state_lock:
+        _consecutive_auth_failures = 0
 
     body = resp.json() if resp.content else {}
     if body.get("errors"):
@@ -197,6 +207,23 @@ def _get_viewer_id() -> str | None:
         _viewer_id_cache = viewer_id
         return viewer_id
     return None
+
+
+def _sweep_stale_reactions_safe(issue_id: str, exclude_id: str | None = None) -> None:
+    """Top-level wrapper for the sweep daemon thread.
+
+    Catches everything so an unexpected ``TypeError`` / ``AttributeError``
+    inside ``_sweep_stale_reactions`` doesn't kill the thread silently —
+    stderr from a daemon thread may not reach CloudWatch in containerized
+    environments.
+    """
+    try:
+        _sweep_stale_reactions(issue_id, exclude_id=exclude_id)
+    except Exception as e:
+        log(
+            "ERROR",
+            f"linear_reactions: sweep thread crashed ({type(e).__name__}): {e}",
+        )
 
 
 def _sweep_stale_reactions(issue_id: str, exclude_id: str | None = None) -> None:
@@ -252,8 +279,8 @@ def _sweep_stale_reactions(issue_id: str, exclude_id: str | None = None) -> None
         if exclude_id is not None and rid == exclude_id:
             # The 👀 we just posted — skip, it's the new marker.
             continue
-        _graphql(_DELETE_MUTATION, {"id": rid})
-        deletes += 1
+        if _graphql(_DELETE_MUTATION, {"id": rid}) is not None:
+            deletes += 1
     deletes_ms = int((time.monotonic() - deletes_start) * 1000)
     total_ms = int((time.monotonic() - sweep_start) * 1000)
     log(
@@ -311,7 +338,7 @@ def react_task_started(
     # status. The sweep filters out the just-posted reaction id so it
     # never deletes itself.
     threading.Thread(
-        target=_sweep_stale_reactions,
+        target=_sweep_stale_reactions_safe,
         args=(issue_id,),
         kwargs={"exclude_id": rid},
         daemon=True,

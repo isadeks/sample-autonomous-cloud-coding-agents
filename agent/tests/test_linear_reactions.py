@@ -19,13 +19,17 @@ from linear_reactions import (
 
 
 @pytest.fixture(autouse=True)
-def _reset_viewer_cache():
-    """Reset the module-level viewer-id cache between tests so one test's
-    successful viewer fetch doesn't leak into another test that asserts the
-    sweep no-ops on viewer-fetch failure."""
+def _reset_module_state():
+    """Reset module-level caches and the auth circuit breaker between tests
+    so one test's state never leaks into another (viewer cache, consecutive
+    auth-failure counter, circuit-open flag)."""
     linear_reactions._viewer_id_cache = None
+    linear_reactions._consecutive_auth_failures = 0
+    linear_reactions._auth_circuit_open = False
     yield
     linear_reactions._viewer_id_cache = None
+    linear_reactions._consecutive_auth_failures = 0
+    linear_reactions._auth_circuit_open = False
 
 
 def _viewer_response(viewer_id: str = "viewer-bot") -> MagicMock:

@@ -60,7 +60,14 @@ def resolve_linear_api_token() -> str:
     try:
         import boto3
         from botocore.exceptions import BotoCoreError, ClientError
+    except ImportError as e:
+        # boto3 missing from the container image — degrade gracefully rather
+        # than hard-crashing the agent. The Linear MCP will fail on first
+        # call with a clear auth error.
+        log("WARN", f"resolve_linear_api_token: boto3 unavailable ({e}); skipping")
+        return ""
 
+    try:
         region = os.environ.get("AWS_REGION") or os.environ.get("AWS_DEFAULT_REGION")
         client = boto3.client("secretsmanager", region_name=region)
         resp = client.get_secret_value(SecretId=secret_arn)

@@ -128,4 +128,19 @@ describe('notifyLinearOnConcurrencyCap', () => {
       process.env.LINEAR_API_TOKEN_SECRET_ARN = saved;
     }
   });
+
+  test('reportIssueFailure rejection propagates (caller must catch)', async () => {
+    // The helper itself swallows network errors internally, but we contract
+    // for callers to wrap the call defensively because durable-execution
+    // retries the entire step on throw, producing duplicate failTask +
+    // emitTaskEvent. This test asserts the rejection actually propagates so
+    // the orchestrate-task try-catch is load-bearing, not redundant.
+    reportIssueFailureMock.mockRejectedValue(new Error('boom'));
+    await expect(
+      notifyLinearOnConcurrencyCap(task({
+        channel_source: 'linear',
+        channel_metadata: { linear_issue_id: 'lin-issue-1' },
+      })),
+    ).rejects.toThrow('boom');
+  });
 });

@@ -75,7 +75,16 @@ const durableHandler: DurableExecutionHandler<OrchestrateTaskEvent, void> = asyn
     if (!result) {
       await failTask(taskId, current.status, 'User concurrency limit reached', task.user_id, false);
       await emitTaskEvent(taskId, 'admission_rejected', { reason: 'concurrency_limit' });
-      await notifyLinearOnConcurrencyCap(task);
+      // Linear feedback is non-fatal: a throw here would re-run failTask +
+      // emitTaskEvent on the durable-execution retry, producing duplicate events.
+      try {
+        await notifyLinearOnConcurrencyCap(task);
+      } catch (err) {
+        logger.warn('Linear concurrency-cap feedback failed (non-fatal)', {
+          task_id: taskId,
+          error: err instanceof Error ? err.message : String(err),
+        });
+      }
     }
     return result;
   });

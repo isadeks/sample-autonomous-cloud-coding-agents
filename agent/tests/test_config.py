@@ -1,8 +1,11 @@
 """Unit tests for config.py — build_config and constants."""
 
+import sys
+from unittest.mock import patch
+
 import pytest
 
-from config import PR_TASK_TYPES, build_config
+from config import PR_TASK_TYPES, build_config, resolve_linear_api_token
 from models import TaskConfig
 
 
@@ -85,3 +88,35 @@ class TestBuildConfig:
         )
         assert config.task_id
         assert len(config.task_id) == 12
+
+
+class TestResolveLinearApiToken:
+    """Coverage for the secrets-manager + boto3 fallback paths."""
+
+    def test_returns_cached_env_var_without_calling_boto(self, monkeypatch):
+        monkeypatch.setenv("LINEAR_API_TOKEN", "lin_cached")
+        monkeypatch.setenv("LINEAR_API_TOKEN_SECRET_ARN", "arn:aws:sm:::secret/linear")
+        # boto3 must not be touched if the env var is already set.
+        with patch("config.log") as mock_log:
+            assert resolve_linear_api_token() == "lin_cached"
+        mock_log.assert_not_called()
+
+    def test_returns_empty_when_no_secret_arn(self, monkeypatch):
+        monkeypatch.delenv("LINEAR_API_TOKEN", raising=False)
+        monkeypatch.delenv("LINEAR_API_TOKEN_SECRET_ARN", raising=False)
+        assert resolve_linear_api_token() == ""
+
+    def test_import_error_degrades_gracefully(self, monkeypatch):
+        """If boto3 is missing from the container image, log WARN and return ''
+        rather than crashing the agent."""
+        monkeypatch.delenv("LINEAR_API_TOKEN", raising=False)
+        monkeypatch.setenv("LINEAR_API_TOKEN_SECRET_ARN", "arn:aws:sm:::secret/linear")
+        # Force `import boto3` (executed inside resolve_linear_api_token) to
+        # raise ImportError by removing it from sys.modules and shadowing it.
+        monkeypatch.setitem(sys.modules, "boto3", None)
+        with patch("config.log") as mock_log:
+            assert resolve_linear_api_token() == ""
+        # WARN logged, no exception escaped.
+        assert mock_log.call_count == 1
+        assert mock_log.call_args[0][0] == "WARN"
+        assert "boto3 unavailable" in mock_log.call_args[0][1]
