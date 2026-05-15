@@ -273,7 +273,7 @@ function shouldTrigger(payload: LinearIssueEvent, labelFilter: string): boolean 
  *
  * Falls back to a generic message if the body fails to parse — best-effort, never throws.
  */
-function buildCreateTaskFailureMessage(statusCode: number | undefined, rawBody: string | undefined): string {
+function buildCreateTaskFailureMessage(statusCode: number, rawBody: string): string {
   let detail = '';
   try {
     if (rawBody) {
@@ -296,9 +296,9 @@ function buildCreateTaskFailureMessage(statusCode: number | undefined, rawBody: 
     return `❌ ABCA is temporarily unavailable (status ${statusCode}). Please re-apply the trigger label in a few minutes.`;
   }
   if (detail) {
-    return `❌ ABCA couldn't create this task (status ${statusCode ?? 'unknown'}): ${detail}`;
+    return `❌ ABCA couldn't create this task (status ${statusCode}): ${detail}`;
   }
-  return `❌ ABCA couldn't create this task (status ${statusCode ?? 'unknown'}). Check the ABCA admin logs for details.`;
+  return `❌ ABCA couldn't create this task (status ${statusCode}). Check the ABCA admin logs for details.`;
 }
 
 function buildTaskDescription(issue: LinearIssueEvent['data']): string {

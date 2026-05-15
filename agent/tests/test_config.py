@@ -1,7 +1,7 @@
 """Unit tests for config.py — build_config and constants."""
 
 import sys
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -120,3 +120,39 @@ class TestResolveLinearApiToken:
         assert mock_log.call_count == 1
         assert mock_log.call_args[0][0] == "WARN"
         assert "boto3 unavailable" in mock_log.call_args[0][1]
+
+    def test_access_denied_logged_at_error(self, monkeypatch):
+        """Persistent IAM misconfig should page someone — escalate from WARN
+        to ERROR so alerts fire."""
+        monkeypatch.delenv("LINEAR_API_TOKEN", raising=False)
+        monkeypatch.setenv("LINEAR_API_TOKEN_SECRET_ARN", "arn:aws:sm:::secret/linear")
+
+        from botocore.exceptions import ClientError
+
+        err = ClientError(
+            {"Error": {"Code": "AccessDeniedException", "Message": "no access"}},
+            "GetSecretValue",
+        )
+        fake_client = MagicMock()
+        fake_client.get_secret_value.side_effect = err
+        with patch("boto3.client", return_value=fake_client), patch("config.log") as mock_log:
+            assert resolve_linear_api_token() == ""
+        assert mock_log.call_count == 1
+        assert mock_log.call_args[0][0] == "ERROR"
+
+    def test_other_client_error_logged_at_warn(self, monkeypatch):
+        monkeypatch.delenv("LINEAR_API_TOKEN", raising=False)
+        monkeypatch.setenv("LINEAR_API_TOKEN_SECRET_ARN", "arn:aws:sm:::secret/linear")
+
+        from botocore.exceptions import ClientError
+
+        err = ClientError(
+            {"Error": {"Code": "ResourceNotFoundException", "Message": "missing"}},
+            "GetSecretValue",
+        )
+        fake_client = MagicMock()
+        fake_client.get_secret_value.side_effect = err
+        with patch("boto3.client", return_value=fake_client), patch("config.log") as mock_log:
+            assert resolve_linear_api_token() == ""
+        assert mock_log.call_count == 1
+        assert mock_log.call_args[0][0] == "WARN"

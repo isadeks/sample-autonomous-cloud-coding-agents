@@ -75,11 +75,18 @@ def resolve_linear_api_token() -> str:
         if token:
             os.environ["LINEAR_API_TOKEN"] = token
         return token
-    except (BotoCoreError, ClientError) as e:
+    except ClientError as e:
+        # Narrowed from a broader `except` per #63 review — broader catches
+        # hid genuine bugs in the Secrets Manager call shape. AccessDenied
+        # is logged at ERROR because it's a persistent IAM misconfig that
+        # should page someone, not a transient blip.
+        code = e.response.get("Error", {}).get("Code", "")
+        severity = "ERROR" if code == "AccessDeniedException" else "WARN"
+        log(severity, f"resolve_linear_api_token failed: {type(e).__name__}: {e}")
+        return ""
+    except BotoCoreError as e:
         # Never let a Secrets Manager outage crash the agent. The Linear MCP
-        # will simply fail on first call with a clear auth error. Narrowed
-        # to botocore exceptions per Alain's #63 review — broader `except`
-        # hid genuine bugs in the Secrets Manager call shape.
+        # will simply fail on first call with a clear auth error.
         log("WARN", f"resolve_linear_api_token failed: {type(e).__name__}: {e}")
         return ""
 

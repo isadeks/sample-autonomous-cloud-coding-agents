@@ -129,8 +129,10 @@ def _graphql(query: str, variables: dict[str, Any]) -> dict[str, Any] | None:
     global _consecutive_auth_failures, _auth_circuit_open
 
     with _auth_state_lock:
-        if _auth_circuit_open:
-            return None
+        circuit_open = _auth_circuit_open
+    if circuit_open:
+        log("DEBUG", "linear_reactions: auth circuit still open; short-circuiting call")
+        return None
 
     token = os.environ.get("LINEAR_API_TOKEN", "")
     if not token:
