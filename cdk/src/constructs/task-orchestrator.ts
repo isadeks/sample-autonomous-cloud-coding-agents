@@ -245,11 +245,19 @@ export class TaskOrchestrator extends Construct {
     // AgentCore runtime invocation permissions
     // The InvokeAgentRuntime API targets a sub-resource (runtime-endpoint/DEFAULT),
     // so we need a wildcard after the runtime ARN.
+    //
+    // `InvokeAgentRuntimeForUser` is required when the call passes
+    // `runtimeUserId` (Phase 2.0a — needed for AgentCore Identity to
+    // inject a `WorkloadAccessToken` header into the agent container so
+    // `BedrockAgentCoreContext.get_workload_access_token()` returns
+    // non-None). Without this grant, `InvokeAgentRuntimeCommand` with
+    // `runtimeUserId` set fails with AccessDenied.
     const runtimeArns = [props.runtimeArn, ...(props.additionalRuntimeArns ?? [])];
     const runtimeResources = runtimeArns.flatMap(arn => [arn, `${arn}/*`]);
     this.fn.addToRolePolicy(new iam.PolicyStatement({
       actions: [
         'bedrock-agentcore:InvokeAgentRuntime',
+        'bedrock-agentcore:InvokeAgentRuntimeForUser',
         'bedrock-agentcore:StopRuntimeSession',
       ],
       resources: runtimeResources,
