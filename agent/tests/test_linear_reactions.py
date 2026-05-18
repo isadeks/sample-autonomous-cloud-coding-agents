@@ -377,3 +377,113 @@ class TestSweepStaleReactions:
             queries = [c.kwargs["json"]["query"] for c in post.call_args_list]
             # Only one viewer query across both calls.
             assert sum("Viewer" in q for q in queries) == 1
+
+
+class TestAuthCircuitBreaker:
+    """The circuit breaker in `_graphql` flips open after
+    ``_AUTH_FAILURE_THRESHOLD`` consecutive 401/403s and short-circuits all
+    subsequent calls until container restart. Auto-reset fixture clears
+    ``_consecutive_auth_failures`` and ``_auth_circuit_open`` between tests.
+
+    These tests target `_graphql` directly via the public `react_task_started`
+    entry point — by exhausting the auth-failure budget on early sweeps and
+    asserting later calls don't hit the network.
+    """
+
+    def _auth_response(self, status: int = 401) -> MagicMock:
+        resp = MagicMock()
+        resp.status_code = status
+        resp.content = b'{"errors":[{"message":"auth"}]}'
+        resp.json.return_value = {"errors": [{"message": "auth"}]}
+        return resp
+
+    def test_three_consecutive_401s_open_the_circuit(self, monkeypatch):
+        """Threshold is 3 — call `_graphql` directly via the private API to
+        exercise the increment + open logic without depending on the
+        public-API call shape."""
+        import linear_reactions
+
+        monkeypatch.setenv("LINEAR_API_TOKEN", "lin_api_test")
+        with patch(
+            "linear_reactions.requests.post",
+            side_effect=[self._auth_response(401)] * 3,
+        ) as post:
+            assert linear_reactions._graphql("query Q { x }", {}) is None
+            assert linear_reactions._graphql("query Q { x }", {}) is None
+            assert linear_reactions._graphql("query Q { x }", {}) is None
+            assert post.call_count == 3
+        assert linear_reactions._consecutive_auth_failures == 3
+        assert linear_reactions._auth_circuit_open is True
+
+    def test_open_circuit_short_circuits_subsequent_calls(self, monkeypatch):
+        """Once the circuit is open, no network calls — the function returns
+        None immediately."""
+        import linear_reactions
+
+        linear_reactions._auth_circuit_open = True
+        with patch("linear_reactions.requests.post") as post:
+            assert linear_reactions._graphql("query Q { x }", {}) is None
+            assert linear_reactions._graphql("query Q { x }", {}) is None
+            post.assert_not_called()
+
+    def test_2xx_response_resets_failure_counter(self, monkeypatch):
+        """A 200 between 401s clears the counter — the circuit only trips on
+        consecutive failures, not cumulative."""
+        import linear_reactions
+
+        monkeypatch.setenv("LINEAR_API_TOKEN", "lin_api_test")
+        ok = MagicMock()
+        ok.status_code = 200
+        ok.content = b'{"data":{"x":1}}'
+        ok.json.return_value = {"data": {"x": 1}}
+        with patch(
+            "linear_reactions.requests.post",
+            side_effect=[
+                self._auth_response(401),
+                self._auth_response(401),
+                ok,  # resets counter
+                self._auth_response(401),
+                self._auth_response(401),
+            ],
+        ):
+            for _ in range(5):
+                linear_reactions._graphql("query Q { x }", {})
+        # 2 failures after the reset, threshold=3 → circuit still closed.
+        assert linear_reactions._consecutive_auth_failures == 2
+        assert linear_reactions._auth_circuit_open is False
+
+    def test_non_auth_errors_do_not_increment_failure_counter(self, monkeypatch):
+        """A 500 is a server problem, not an auth problem — must not
+        contribute to the auth-failure budget."""
+        import linear_reactions
+
+        monkeypatch.setenv("LINEAR_API_TOKEN", "lin_api_test")
+        five_hundred = MagicMock()
+        five_hundred.status_code = 500
+        five_hundred.content = b"server error"
+        five_hundred.json.return_value = {}
+        with patch(
+            "linear_reactions.requests.post",
+            side_effect=[five_hundred] * 5,
+        ):
+            for _ in range(5):
+                linear_reactions._graphql("query Q { x }", {})
+        assert linear_reactions._consecutive_auth_failures == 0
+        assert linear_reactions._auth_circuit_open is False
+
+    def test_403_treated_same_as_401(self, monkeypatch):
+        """Both auth-failure status codes count toward the threshold."""
+        import linear_reactions
+
+        monkeypatch.setenv("LINEAR_API_TOKEN", "lin_api_test")
+        with patch(
+            "linear_reactions.requests.post",
+            side_effect=[
+                self._auth_response(401),
+                self._auth_response(403),
+                self._auth_response(401),
+            ],
+        ):
+            for _ in range(3):
+                linear_reactions._graphql("query Q { x }", {})
+        assert linear_reactions._auth_circuit_open is True

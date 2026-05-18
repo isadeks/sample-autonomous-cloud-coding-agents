@@ -28,8 +28,41 @@ const ddb = DynamoDBDocumentClient.from(new DynamoDBClient({}));
 
 const PROJECT_MAPPING_TABLE = process.env.LINEAR_PROJECT_MAPPING_TABLE_NAME!;
 const USER_MAPPING_TABLE = process.env.LINEAR_USER_MAPPING_TABLE_NAME!;
-const API_TOKEN_SECRET_ARN = process.env.LINEAR_API_TOKEN_SECRET_ARN!;
+const API_TOKEN_SECRET_ARN = process.env.LINEAR_API_TOKEN_SECRET_ARN;
 const DEFAULT_LABEL_FILTER = 'bgagent';
+
+/**
+ * Post a Linear comment + ❌ reaction without ever propagating an error.
+ *
+ * Wraps `reportIssueFailure` so each call site is one line and uniformly
+ * non-throwing. Two failure modes handled here:
+ *
+ * - `LINEAR_API_TOKEN_SECRET_ARN` env var unset (deploy misconfig) — log a
+ *   single clear diagnostic and skip, instead of letting `resolveToken` log
+ *   a cryptic "could not resolve API token" warning on every feedback call.
+ *   Mirrors the orchestrator's `notifyLinearOnConcurrencyCap` guard.
+ * - `reportIssueFailure` throws synchronously (today impossible thanks to the
+ *   helper's internal `Promise.allSettled`, but a future refactor could
+ *   break that contract). Catching here means a synchronous throw can't
+ *   bubble up and fail the Lambda — which would trigger SQS retries on a
+ *   poison message.
+ */
+async function safeReportIssueFailure(issueId: string, message: string): Promise<void> {
+  if (!API_TOKEN_SECRET_ARN) {
+    logger.warn('Skipping Linear feedback: LINEAR_API_TOKEN_SECRET_ARN not set', {
+      issue_id: issueId,
+    });
+    return;
+  }
+  try {
+    await reportIssueFailure(API_TOKEN_SECRET_ARN, issueId, message);
+  } catch (err) {
+    logger.warn('Linear feedback failed (non-fatal)', {
+      issue_id: issueId,
+      error: err instanceof Error ? err.message : String(err),
+    });
+  }
+}
 
 /** Shape of Linear `Issue` webhook payloads we care about. Undocumented fields are tolerated. */
 interface LinearIssueEvent {
@@ -102,8 +135,7 @@ export async function handler(event: ProcessorEvent): Promise<void> {
     logger.info('Linear Issue has no projectId — skipping (cannot route to a repo)', {
       issue_id: issue.id,
     });
-    await reportIssueFailure(
-      API_TOKEN_SECRET_ARN,
+    await safeReportIssueFailure(
       issue.id,
       "❌ This Linear issue isn't in a project — ABCA needs a Linear project to route the task to a repo. Move the issue into a project and re-apply the trigger label.",
     );
@@ -120,8 +152,7 @@ export async function handler(event: ProcessorEvent): Promise<void> {
       linear_project_id: projectId,
       issue_id: issue.id,
     });
-    await reportIssueFailure(
-      API_TOKEN_SECRET_ARN,
+    await safeReportIssueFailure(
       issue.id,
       "❌ This Linear project isn't onboarded to ABCA. An admin can onboard it with `bgagent linear onboard-project <project-uuid> --repo <owner>/<repo> --label <trigger>`.",
     );
@@ -157,8 +188,7 @@ export async function handler(event: ProcessorEvent): Promise<void> {
       organization_id: workspaceId,
       actor_id: actorId,
     });
-    await reportIssueFailure(
-      API_TOKEN_SECRET_ARN,
+    await safeReportIssueFailure(
       issue.id,
       "❌ Linear webhook is missing the organization or actor field — ABCA can't attribute this task to a user. This is unusual; please report it to your ABCA admin.",
     );
@@ -172,8 +202,7 @@ export async function handler(event: ProcessorEvent): Promise<void> {
       linear_user_id: actorId,
       issue_id: issue.id,
     });
-    await reportIssueFailure(
-      API_TOKEN_SECRET_ARN,
+    await safeReportIssueFailure(
       issue.id,
       "❌ This Linear user isn't linked to a platform user. In v1 only the API-token owner can submit tasks from Linear; multi-user OAuth support is on the v3 roadmap.",
     );
@@ -214,8 +243,7 @@ export async function handler(event: ProcessorEvent): Promise<void> {
       body: result.body,
       issue_id: issue.id,
     });
-    await reportIssueFailure(
-      API_TOKEN_SECRET_ARN,
+    await safeReportIssueFailure(
       issue.id,
       buildCreateTaskFailureMessage(result.statusCode, result.body),
     );

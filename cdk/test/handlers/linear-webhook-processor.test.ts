@@ -329,5 +329,37 @@ describe('linear-webhook-processor handler', () => {
       // dropping a comment/❌ here would be noisy and misleading.
       expect(reportIssueFailureMock).not.toHaveBeenCalled();
     });
+
+    test('safeReportIssueFailure: synchronous throw from reportIssueFailure does not propagate', async () => {
+      // Defends against a future signature refactor that breaks the helper's
+      // never-throw contract. Today `Promise.allSettled` guarantees this; if
+      // someone removes that, the surrounding catch keeps the Lambda from
+      // failing and triggering SQS retries on a poison message.
+      reportIssueFailureMock.mockImplementationOnce(() => {
+        throw new Error('synthetic synchronous throw');
+      });
+      const payload = issue();
+      const data = { ...(payload.data as Record<string, unknown>) };
+      delete data.projectId;
+      payload.data = data;
+
+      await expect(handler(eventWith(payload))).resolves.toBeUndefined();
+      expect(reportIssueFailureMock).toHaveBeenCalledTimes(1);
+    });
+
+    test('safeReportIssueFailure: async rejection from reportIssueFailure does not propagate', async () => {
+      // The helper's internal `Promise.allSettled` already guarantees this,
+      // but the orchestrator path's parallel catch motivated adding the same
+      // belt-and-suspenders here. This test locks in the contract so a
+      // refactor of either helper layer can't reintroduce the failure mode.
+      reportIssueFailureMock.mockRejectedValueOnce(new Error('async failure'));
+      const payload = issue();
+      const data = { ...(payload.data as Record<string, unknown>) };
+      delete data.projectId;
+      payload.data = data;
+
+      await expect(handler(eventWith(payload))).resolves.toBeUndefined();
+      expect(reportIssueFailureMock).toHaveBeenCalledTimes(1);
+    });
   });
 });
