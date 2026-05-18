@@ -137,7 +137,12 @@ const durableHandler: DurableExecutionHandler<OrchestrateTaskEvent, void> = asyn
   const sessionHandle = await context.step('start-session', async () => {
     try {
       const strategy = resolveComputeStrategy(blueprintConfig);
-      const handle = await strategy.startSession({ taskId, payload, blueprintConfig });
+      const handle = await strategy.startSession({
+        taskId,
+        userId: task.user_id,
+        payload,
+        blueprintConfig,
+      });
 
       // Build compute metadata for the task record so cancel-task can stop the right backend
       const computeMetadata: Record<string, string> = handle.strategyType === 'ecs'
