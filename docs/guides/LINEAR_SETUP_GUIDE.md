@@ -63,11 +63,13 @@ Phase 2.0a (May 2026) added a second consumer for the Linear token: the **agent 
 
 > **Why two stores?** Lambdas (the webhook processor and orchestrator) keep using Secrets Manager because the AgentCore Identity SDK doesn't ship a Node.js client yet. The agent container (Python) uses Identity. Phase 2.0b will migrate Lambdas to OAuth via Identity, retire Secrets Manager for Linear, and converge on a single store.
 
-After completing Step 4, register the **same** API token with AgentCore Identity (one-time, admin):
+After completing Step 4, register the **same** API token with AgentCore Identity (one-time, admin). Use the AWS CLI directly — no extra tooling required:
 
 ```bash
-agentcore add credential --type api-key --name linear-api-key
-# (paste the same lin_api_… token when prompted)
+aws bedrock-agentcore-control create-api-key-credential-provider \
+  --name linear-api-key \
+  --api-key "<paste your lin_api_… token here>" \
+  --region us-east-1
 ```
 
 The CDK stack hardcodes the provider name `linear-api-key`. If you use a different name, override `LINEAR_API_KEY_PROVIDER_NAME` on the AgentCore runtime in `cdk/src/stacks/agent.ts`.
@@ -75,11 +77,13 @@ The CDK stack hardcodes the provider name `linear-api-key`. If you use a differe
 To verify the credential was stored:
 
 ```bash
-agentcore list credentials
-# linear-api-key (api-key)  created: …
+aws bedrock-agentcore-control list-api-key-credential-providers --region us-east-1
+# Look for "name": "linear-api-key" in the output
 ```
 
 If you skip this step the agent's `resolve_linear_api_token()` returns an empty string, the Linear MCP fails with an auth error on the first call, and you'll see `WARN linear_reactions: HTTP 401 from Linear` in CloudWatch.
+
+> **Tooling note.** If you have the `bedrock-agentcore-starter-toolkit` Python CLI (`agentcore` command) installed for other reasons, it does **not** expose a credential-provider subcommand — that toolkit is for agent lifecycle (`agentcore configure agent`, `agentcore deploy`), not Identity vault management. The new npm `@aws/agentcore` CLI uses a declarative `agentcore.json` project model that doesn't fit ABCA's setup either. The `aws bedrock-agentcore-control` AWS CLI commands above are the cleanest path.
 
 **If auto-link fails persistently** (rare — usually transient Linear API hiccups, just re-run `bgagent linear setup`), an admin can insert the mapping directly into the `LinearUserMappingTable` DynamoDB table:
 
