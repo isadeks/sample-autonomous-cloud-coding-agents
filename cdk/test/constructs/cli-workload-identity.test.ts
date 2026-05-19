@@ -35,7 +35,7 @@ describe('CliWorkloadIdentity construct', () => {
     // and the localhost return URL — those are the contract with the CLI side.
     template.hasResourceProperties('Custom::AWS', {
       Create: Match.serializedJson(Match.objectLike({
-        service: 'BedrockAgentCoreControl',
+        service: '@aws-sdk/client-bedrock-agentcore-control',
         action: 'CreateWorkloadIdentity',
         parameters: Match.objectLike({
           name: 'bgagent-cli',

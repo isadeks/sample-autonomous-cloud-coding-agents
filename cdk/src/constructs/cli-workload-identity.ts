@@ -86,7 +86,7 @@ export class CliWorkloadIdentity extends Construct {
     const customResource = new cr.AwsCustomResource(this, 'WorkloadIdentityCR', {
       timeout: Duration.minutes(2),
       onCreate: {
-        service: 'BedrockAgentCoreControl',
+        service: '@aws-sdk/client-bedrock-agentcore-control',
         action: 'CreateWorkloadIdentity',
         parameters: {
           name: this.workloadName,
@@ -98,7 +98,7 @@ export class CliWorkloadIdentity extends Construct {
         ignoreErrorCodesMatching: 'ConflictException|ValidationException',
       },
       onUpdate: {
-        service: 'BedrockAgentCoreControl',
+        service: '@aws-sdk/client-bedrock-agentcore-control',
         action: 'UpdateWorkloadIdentity',
         parameters: {
           name: this.workloadName,
@@ -107,7 +107,7 @@ export class CliWorkloadIdentity extends Construct {
         physicalResourceId: cr.PhysicalResourceId.of(`workload-identity-${this.workloadName}`),
       },
       onDelete: {
-        service: 'BedrockAgentCoreControl',
+        service: '@aws-sdk/client-bedrock-agentcore-control',
         action: 'DeleteWorkloadIdentity',
         parameters: {
           name: this.workloadName,
