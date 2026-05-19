@@ -33,9 +33,97 @@ const DEFAULT_LABEL_FILTER = 'bgagent';
 /** Standard RFC 4122 UUID — Linear's `projects.nodes[].id` matches this shape. */
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
+/**
+ * Render the printable Linear OAuth app config. Standalone export so
+ * `bgagent linear setup` can call it inline (Phase 2.0b setup wizard
+ * Step 2 — show the user what to paste into Linear's app form).
+ */
+export interface LinearAppTemplateOptions {
+  readonly botName?: string;
+  readonly developerName?: string;
+  readonly developerUrl?: string;
+  readonly description?: string;
+  readonly awsCallbackUrl?: string;
+}
+
+export function renderLinearAppTemplate(opts: LinearAppTemplateOptions = {}): string {
+  // Defaults match the upstream sample so unmodified `bgagent linear app-template`
+  // produces a usable config without forcing every operator to invent strings.
+  // Operators with custom branding override via flags.
+  const botName = opts.botName ?? 'bgagent[bot]';
+  const developerName = opts.developerName ?? 'ABCA';
+  const developerUrl = opts.developerUrl ?? 'https://github.com/aws-samples/sample-autonomous-cloud-coding-agents';
+  const description = opts.description ?? 'Autonomous Background Coding Agent';
+  // The AWS-hosted callback is surfaced by `aws bedrock-agentcore-control
+  // create-oauth2-credential-provider` once per workspace. If unknown at
+  // template-render time, print a placeholder the operator must replace.
+  const awsCallback = opts.awsCallbackUrl
+    ?? '<paste callbackUrl from `aws bedrock-agentcore-control create-oauth2-credential-provider`>';
+
+  const bar = '═'.repeat(72);
+  return [
+    bar,
+    'Linear OAuth app template',
+    bar,
+    '',
+    'Open https://linear.app/settings/api/applications/new and paste:',
+    '',
+    `  Application name:    bgagent`,
+    `  Developer name:      ${developerName}`,
+    `  Developer URL:       ${developerUrl}`,
+    `  Description:         ${description}`,
+    '',
+    '  Callback URLs (one per line, NO line wrapping):',
+    `    ${awsCallback}`,
+    '',
+    `  GitHub username:     ${botName}      ← REQUIRED for actor=app`,
+    '  Public:              OFF',
+    '  Client credentials:  OFF',
+    '  Webhooks:            ON              ← REQUIRED for actor=app',
+    `    Webhook URL:       https://example.com/placeholder  ← any HTTPS URL`,
+    '    (You do NOT need to subscribe to any events for the OAuth flow itself)',
+    '',
+    'Click Save, copy the Client ID and Client Secret, then return here.',
+    '',
+    'Why these specific fields:',
+    '  • GitHub username with [bot] suffix gates the actor=app agent flow.',
+    '    Without it, Linear surfaces a misleading "Invalid redirect_uri" error.',
+    '  • Webhooks toggle must be ON for the same reason; the URL value is unused',
+    '    by the OAuth dance and can be a placeholder.',
+    '  • Wildcard callback URLs are not accepted by Linear; list each URL fully.',
+    bar,
+  ].join('\n');
+}
+
 export function makeLinearCommand(): Command {
   const linear = new Command('linear')
     .description('Manage Linear integration');
+
+  linear.addCommand(
+    new Command('app-template')
+      .description('Print the field values to paste into Linear\'s OAuth app form')
+      .option('--bot-name <name>', 'GitHub username for actor=app (must end with [bot])')
+      .option('--developer-name <name>', 'Developer name shown on Linear\'s consent screen')
+      .option('--developer-url <url>', 'Developer URL shown on Linear\'s consent screen')
+      .option('--description <text>', 'App description shown on Linear\'s consent screen')
+      .option('--aws-callback-url <url>', 'AWS-hosted callback URL from create-oauth2-credential-provider')
+      .action((opts) => {
+        if (opts.botName && !/\[bot\]$/.test(opts.botName)) {
+          console.error(
+            `Error: --bot-name must end with the literal "[bot]" suffix `
+            + `(Linear requires this for actor=app). Got: ${opts.botName}`,
+          );
+          process.exit(1);
+        }
+        console.log(renderLinearAppTemplate({
+          botName: opts.botName,
+          developerName: opts.developerName,
+          developerUrl: opts.developerUrl,
+          description: opts.description,
+          awsCallbackUrl: opts.awsCallbackUrl,
+        }));
+      }),
+  );
 
   linear.addCommand(
     new Command('link')

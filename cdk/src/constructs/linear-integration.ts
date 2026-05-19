@@ -30,6 +30,7 @@ import { NagSuppressions } from 'cdk-nag';
 import { Construct } from 'constructs';
 import { LinearProjectMappingTable } from './linear-project-mapping-table';
 import { LinearUserMappingTable } from './linear-user-mapping-table';
+import { LinearWorkspaceRegistryTable } from './linear-workspace-registry-table';
 
 /**
  * Properties for LinearIntegration construct.
@@ -76,6 +77,10 @@ export interface LinearIntegrationProps {
  * Creates:
  * - LinearProjectMappingTable (Linear project → GitHub repo mapping)
  * - LinearUserMappingTable (Linear user → platform user mapping)
+ * - LinearWorkspaceRegistryTable (Linear workspace → AgentCore credential
+ *   provider name; Phase 2.0b OAuth migration). Webhook processor and
+ *   orchestrator use this to look up which credential provider holds the
+ *   workspace's OAuth token.
  * - LinearWebhookDedupTable (60s TTL dedup for webhook retries)
  * - Lambda handlers for the webhook receiver, async processor, and account linking
  * - API Gateway routes under /linear/*
@@ -87,6 +92,13 @@ export class LinearIntegration extends Construct {
 
   /** Linear user → platform user mapping table. */
   public readonly userMappingTable: dynamodb.Table;
+
+  /**
+   * Registry of Linear workspaces that have completed OAuth onboarding.
+   * Lookup `provider_name` (AgentCore credential provider) by Linear
+   * `organizationId` from the inbound webhook.
+   */
+  public readonly workspaceRegistryTable: dynamodb.Table;
 
   /** Webhook dedup table — (issue_id, action) keys with 60s TTL. */
   public readonly webhookDedupTable: dynamodb.Table;
@@ -108,8 +120,10 @@ export class LinearIntegration extends Construct {
     // --- DynamoDB tables ---
     const projectMapping = new LinearProjectMappingTable(this, 'ProjectMappingTable', { removalPolicy });
     const userMapping = new LinearUserMappingTable(this, 'UserMappingTable', { removalPolicy });
+    const workspaceRegistry = new LinearWorkspaceRegistryTable(this, 'WorkspaceRegistryTable', { removalPolicy });
     this.projectMappingTable = projectMapping.table;
     this.userMappingTable = userMapping.table;
+    this.workspaceRegistryTable = workspaceRegistry.table;
 
     // Dedup table: linear webhook retries collapse to a single processor invoke
     // within the 60s TTL window. Keyed on `{issue_id}#{action}`.
@@ -181,12 +195,14 @@ export class LinearIntegration extends Construct {
         ...createTaskEnv,
         LINEAR_PROJECT_MAPPING_TABLE_NAME: this.projectMappingTable.tableName,
         LINEAR_USER_MAPPING_TABLE_NAME: this.userMappingTable.tableName,
+        LINEAR_WORKSPACE_REGISTRY_TABLE_NAME: this.workspaceRegistryTable.tableName,
         LINEAR_API_TOKEN_SECRET_ARN: this.apiTokenSecret.secretArn,
       },
       bundling: commonBundling,
     });
     this.projectMappingTable.grantReadData(webhookProcessorFn);
     this.userMappingTable.grantReadData(webhookProcessorFn);
+    this.workspaceRegistryTable.grantReadData(webhookProcessorFn);
     this.apiTokenSecret.grantRead(webhookProcessorFn);
     props.taskTable.grantReadWriteData(webhookProcessorFn);
     props.taskEventsTable.grantReadWriteData(webhookProcessorFn);

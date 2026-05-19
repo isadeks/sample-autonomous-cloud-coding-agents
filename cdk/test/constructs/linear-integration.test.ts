@@ -51,9 +51,16 @@ describe('LinearIntegration construct', () => {
     template = Template.fromStack(stack);
   });
 
-  test('creates three DynamoDB tables (project mapping + user mapping + dedup)', () => {
-    // TaskTable + TaskEventsTable + LinearProjectMapping + LinearUserMapping + LinearWebhookDedup = 5
-    template.resourceCountIs('AWS::DynamoDB::Table', 5);
+  test('creates four Linear DynamoDB tables (project mapping + user mapping + workspace registry + dedup)', () => {
+    // TaskTable + TaskEventsTable + LinearProjectMapping + LinearUserMapping
+    // + LinearWorkspaceRegistry + LinearWebhookDedup = 6
+    template.resourceCountIs('AWS::DynamoDB::Table', 6);
+  });
+
+  test('workspace registry table is keyed on linear_workspace_id', () => {
+    template.hasResourceProperties('AWS::DynamoDB::Table', {
+      KeySchema: [{ AttributeName: 'linear_workspace_id', KeyType: 'HASH' }],
+    });
   });
 
   test('creates three Lambda functions (webhook, processor, link)', () => {
@@ -92,12 +99,13 @@ describe('LinearIntegration construct', () => {
     });
   });
 
-  test('processor handler env wires both mapping tables + task table', () => {
+  test('processor handler env wires all mapping tables + task table + workspace registry', () => {
     template.hasResourceProperties('AWS::Lambda::Function', {
       Environment: {
         Variables: Match.objectLike({
           LINEAR_PROJECT_MAPPING_TABLE_NAME: Match.anyValue(),
           LINEAR_USER_MAPPING_TABLE_NAME: Match.anyValue(),
+          LINEAR_WORKSPACE_REGISTRY_TABLE_NAME: Match.anyValue(),
           TASK_TABLE_NAME: Match.anyValue(),
           TASK_EVENTS_TABLE_NAME: Match.anyValue(),
         }),

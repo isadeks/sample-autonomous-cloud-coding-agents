@@ -18,7 +18,7 @@
  */
 
 import { PutCommand } from '@aws-sdk/lib-dynamodb';
-import { autoLinkTokenOwner } from '../../src/commands/linear';
+import { autoLinkTokenOwner, renderLinearAppTemplate } from '../../src/commands/linear';
 import * as config from '../../src/config';
 
 jest.mock('@aws-sdk/lib-dynamodb', () => {
@@ -144,5 +144,48 @@ describe('autoLinkTokenOwner', () => {
     const msgs = consoleLogSpy.mock.calls.map(c => String(c[0]));
     expect(msgs.some(m => m.includes('Could not resolve your platform user'))).toBe(true);
     expect(msgs.some(m => m.includes('bgagent login'))).toBe(true);
+  });
+});
+
+describe('renderLinearAppTemplate', () => {
+  test('uses sane defaults when no options are passed', () => {
+    const out = renderLinearAppTemplate();
+    expect(out).toContain('bgagent[bot]');
+    expect(out).toContain('Webhooks:            ON');
+    expect(out).toContain('REQUIRED for actor=app');
+  });
+
+  test('includes the AWS callback URL placeholder when not provided', () => {
+    const out = renderLinearAppTemplate();
+    expect(out).toContain('<paste callbackUrl from `aws bedrock-agentcore-control create-oauth2-credential-provider`>');
+  });
+
+  test('substitutes the AWS callback URL when supplied', () => {
+    const url = 'https://bedrock-agentcore.us-east-1.amazonaws.com/identities/oauth2/callback/abc-123';
+    const out = renderLinearAppTemplate({ awsCallbackUrl: url });
+    expect(out).toContain(url);
+    expect(out).not.toContain('<paste callbackUrl');
+  });
+
+  test('overrides bot name, developer fields, description', () => {
+    const out = renderLinearAppTemplate({
+      botName: 'acme-bot[bot]',
+      developerName: 'Acme Corp',
+      developerUrl: 'https://acme.com',
+      description: 'Internal coding agent',
+    });
+    expect(out).toContain('acme-bot[bot]');
+    expect(out).toContain('Acme Corp');
+    expect(out).toContain('https://acme.com');
+    expect(out).toContain('Internal coding agent');
+  });
+
+  test('explains why each gating field matters (actor=app context)', () => {
+    const out = renderLinearAppTemplate();
+    // The "why" explainer is the core differentiator of this command vs. raw
+    // docs — without it operators paste blindly and hit the cryptic Linear
+    // "Invalid redirect_uri" error documented in the 2.0b spike.
+    expect(out).toContain('Invalid redirect_uri');
+    expect(out).toContain('Wildcard callback URLs are not accepted');
   });
 });
