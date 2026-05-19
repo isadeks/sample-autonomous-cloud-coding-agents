@@ -18,7 +18,13 @@
  */
 
 import { PutCommand } from '@aws-sdk/lib-dynamodb';
-import { autoLinkTokenOwner, renderLinearAppTemplate } from '../../src/commands/linear';
+import {
+  autoLinkTokenOwner,
+  buildLinearProviderInput,
+  providerNameForWorkspace,
+  registerLinearWorkspace,
+  renderLinearAppTemplate,
+} from '../../src/commands/linear';
 import * as config from '../../src/config';
 
 jest.mock('@aws-sdk/lib-dynamodb', () => {
@@ -187,5 +193,140 @@ describe('renderLinearAppTemplate', () => {
     // "Invalid redirect_uri" error documented in the 2.0b spike.
     expect(out).toContain('Invalid redirect_uri');
     expect(out).toContain('Wildcard callback URLs are not accepted');
+  });
+});
+
+describe('providerNameForWorkspace', () => {
+  test('prefixes workspace slug with linear-oauth-', () => {
+    expect(providerNameForWorkspace('acme')).toBe('linear-oauth-acme');
+    expect(providerNameForWorkspace('acme-corp')).toBe('linear-oauth-acme-corp');
+  });
+});
+
+describe('buildLinearProviderInput', () => {
+  test('uses CustomOauth2 vendor with explicit Linear endpoints', () => {
+    const input = buildLinearProviderInput({
+      slug: 'acme',
+      clientId: 'cid-1',
+      clientSecret: 'csecret-1',
+    });
+    // Linear is NOT a built-in vendor, so the helper must use CustomOauth2
+    // with explicit authorizationServerMetadata. Regression-locking that
+    // here so a refactor doesn't accidentally try to use a vendor enum.
+    expect(input.credentialProviderVendor).toBe('CustomOauth2');
+    expect(input.name).toBe('linear-oauth-acme');
+    const cfg = input.oauth2ProviderConfigInput.customOauth2ProviderConfig;
+    expect(cfg.clientId).toBe('cid-1');
+    expect(cfg.clientSecret).toBe('csecret-1');
+    expect(cfg.oauthDiscovery.authorizationServerMetadata).toEqual({
+      issuer: 'https://linear.app',
+      authorizationEndpoint: 'https://linear.app/oauth/authorize',
+      tokenEndpoint: 'https://api.linear.app/oauth/token',
+      responseTypes: ['code'],
+    });
+  });
+});
+
+describe('registerLinearWorkspace', () => {
+  // The control-plane client uses the standard send() shape, so we mock
+  // a minimal interface — same pattern as the autoLinkTokenOwner tests.
+  const mockSend = jest.fn();
+  const mockClient = { send: mockSend } as unknown as Parameters<typeof registerLinearWorkspace>[0];
+
+  beforeEach(() => {
+    mockSend.mockReset();
+  });
+
+  test('returns callbackUrl + created=true on first registration', async () => {
+    mockSend.mockResolvedValueOnce({
+      callbackUrl: 'https://bedrock-agentcore.us-east-1.amazonaws.com/identities/oauth2/callback/uuid',
+    });
+    const result = await registerLinearWorkspace(mockClient, {
+      slug: 'acme',
+      clientId: 'cid',
+      clientSecret: 'csec',
+    });
+    expect(result.created).toBe(true);
+    expect(result.providerName).toBe('linear-oauth-acme');
+    expect(result.callbackUrl).toContain('bedrock-agentcore.us-east-1.amazonaws.com');
+  });
+
+  test('on duplicate-name ValidationException, fetches existing provider and returns created=false', async () => {
+    // Verified-from-spike: AWS uses ValidationException (NOT ConflictException)
+    // for the duplicate-name case, with message "Credential provider with name:
+    // <name> already exists". We detect this via message-substring match.
+    const conflict = new Error('Credential provider with name: linear-oauth-acme already exists');
+    conflict.name = 'ValidationException';
+    mockSend.mockRejectedValueOnce(conflict);
+    mockSend.mockResolvedValueOnce({
+      callbackUrl: 'https://bedrock-agentcore.us-east-1.amazonaws.com/identities/oauth2/callback/existing-uuid',
+    });
+
+    const result = await registerLinearWorkspace(mockClient, {
+      slug: 'acme',
+      clientId: 'cid',
+      clientSecret: 'csec',
+    });
+    expect(result.created).toBe(false);
+    expect(result.providerName).toBe('linear-oauth-acme');
+    expect(result.callbackUrl).toContain('existing-uuid');
+    // Two calls: Create (failed) → Get (succeeded)
+    expect(mockSend).toHaveBeenCalledTimes(2);
+  });
+
+  test('rethrows non-duplicate ValidationException (e.g. bad input shape)', async () => {
+    // ValidationException is NOT only used for duplicates — also for invalid
+    // input shape. We must not swallow those and turn them into Get-attempts.
+    const validationFailure = new Error('Invalid OAuth2 endpoint URL');
+    validationFailure.name = 'ValidationException';
+    mockSend.mockRejectedValueOnce(validationFailure);
+    await expect(
+      registerLinearWorkspace(mockClient, { slug: 'acme', clientId: 'c', clientSecret: 's' }),
+    ).rejects.toThrow(/Invalid OAuth2 endpoint URL/);
+    // Only one call — the GetOauth2CredentialProviderCommand path is NOT taken.
+    expect(mockSend).toHaveBeenCalledTimes(1);
+  });
+
+  test('translates AccessDeniedException to a remediation hint', async () => {
+    const denied = new Error('User: ... is not authorized to perform: bedrock-agentcore:CreateOauth2CredentialProvider');
+    denied.name = 'AccessDeniedException';
+    mockSend.mockRejectedValueOnce(denied);
+    let captured: Error | undefined;
+    try {
+      await registerLinearWorkspace(mockClient, { slug: 'acme', clientId: 'c', clientSecret: 's' });
+    } catch (e) {
+      captured = e as Error;
+    }
+    expect(captured).toBeDefined();
+    expect(captured!.message).toMatch(/Cannot create OAuth2 credential provider/);
+    expect(captured!.message).toMatch(/bedrock-agentcore:CreateOauth2CredentialProvider/);
+  });
+
+  test('throws when create returns no callbackUrl', async () => {
+    // Defensive: if AWS ever returns a successful response without callbackUrl,
+    // we surface the corner case rather than silently returning undefined.
+    mockSend.mockResolvedValueOnce({});
+    await expect(
+      registerLinearWorkspace(mockClient, { slug: 'acme', clientId: 'c', clientSecret: 's' }),
+    ).rejects.toThrow(/no callbackUrl/);
+  });
+
+  test('throws when existing provider has no callbackUrl', async () => {
+    const conflict = new Error('Credential provider with name: linear-oauth-acme already exists');
+    conflict.name = 'ValidationException';
+    mockSend.mockRejectedValueOnce(conflict);
+    mockSend.mockResolvedValueOnce({});  // GetOauth2CredentialProvider returns no callbackUrl
+    await expect(
+      registerLinearWorkspace(mockClient, { slug: 'acme', clientId: 'c', clientSecret: 's' }),
+    ).rejects.toThrow(/exists but has no callbackUrl/);
+  });
+
+  test('rethrows unknown errors verbatim (no remediation hint)', async () => {
+    const oops = new Error('unexpected boom');
+    oops.name = 'InternalServerError';
+    mockSend.mockRejectedValueOnce(oops);
+    await expect(
+      registerLinearWorkspace(mockClient, { slug: 'acme', clientId: 'c', clientSecret: 's' }),
+    ).rejects.toThrow(/unexpected boom/);
   });
 });
