@@ -21,6 +21,10 @@ import { PutCommand } from '@aws-sdk/lib-dynamodb';
 import {
   autoLinkTokenOwner,
   buildLinearProviderInput,
+  initiateOauthDance,
+  isWebhookSecretConfigured,
+  LINEAR_OAUTH_SCOPES,
+  pollForOauthAccessToken,
   providerNameForWorkspace,
   registerLinearWorkspace,
   renderLinearAppTemplate,
@@ -328,5 +332,165 @@ describe('registerLinearWorkspace', () => {
     await expect(
       registerLinearWorkspace(mockClient, { slug: 'acme', clientId: 'c', clientSecret: 's' }),
     ).rejects.toThrow(/unexpected boom/);
+  });
+});
+
+describe('LINEAR_OAUTH_SCOPES', () => {
+  test('matches the actor=app-compatible scope set verified in the spike', () => {
+    // Locking the exact scope list: the spike confirmed `admin` is incompatible
+    // with `actor=app`, and `app:assignable` + `app:mentionable` are required
+    // for the agent install variant. Drift here is a silent OAuth failure.
+    expect(LINEAR_OAUTH_SCOPES).toEqual(['read', 'write', 'app:assignable', 'app:mentionable']);
+  });
+});
+
+describe('initiateOauthDance', () => {
+  const mockSend = jest.fn();
+  const mockClient = { send: mockSend } as unknown as Parameters<typeof initiateOauthDance>[0];
+
+  beforeEach(() => {
+    mockSend.mockReset();
+  });
+
+  test('returns authorizationUrl + sessionUri on first call', async () => {
+    mockSend.mockResolvedValueOnce({
+      authorizationUrl: 'https://bedrock-agentcore.us-east-1.amazonaws.com/identities/oauth2/authorize?request_uri=urn:...',
+      sessionUri: 'urn:ietf:params:oauth:request_uri:abc',
+    });
+    const result = await initiateOauthDance(mockClient, {
+      workloadAccessToken: 'wat',
+      providerName: 'linear-oauth-acme',
+    });
+    expect(result.authorizationUrl).toContain('bedrock-agentcore.us-east-1.amazonaws.com');
+    expect(result.sessionUri).toBe('urn:ietf:params:oauth:request_uri:abc');
+  });
+
+  test('passes customParameters: {actor:"app"} on the request', async () => {
+    mockSend.mockResolvedValueOnce({
+      authorizationUrl: 'https://bedrock-agentcore.us-east-1.amazonaws.com/identities/oauth2/authorize?request_uri=urn:...',
+      sessionUri: 'urn:x',
+    });
+    await initiateOauthDance(mockClient, {
+      workloadAccessToken: 'wat',
+      providerName: 'linear-oauth-acme',
+    });
+    // Inspect the command-input passed into client.send. The shape:
+    // mockSend.mock.calls[0][0] is the Command instance; its .input member
+    // is the raw request body the SDK sends.
+    const sentInput = (mockSend.mock.calls[0][0] as { input: Record<string, unknown> }).input;
+    expect(sentInput.customParameters).toEqual({ actor: 'app' });
+    expect(sentInput.oauth2Flow).toBe('USER_FEDERATION');
+    expect(sentInput.scopes).toEqual(['read', 'write', 'app:assignable', 'app:mentionable']);
+  });
+
+  test('throws when AgentCore returns a cached accessToken instead of authorizationUrl', async () => {
+    // Per the spike, this happens if the workspace is already authorized.
+    // Setup wizard would silently fall through; better to fail loudly.
+    mockSend.mockResolvedValueOnce({ accessToken: 'cached-token' });
+    await expect(
+      initiateOauthDance(mockClient, { workloadAccessToken: 'wat', providerName: 'p' }),
+    ).rejects.toThrow(/cached access token/);
+  });
+
+  test('throws when AgentCore response has neither authorizationUrl nor accessToken', async () => {
+    mockSend.mockResolvedValueOnce({});
+    await expect(
+      initiateOauthDance(mockClient, { workloadAccessToken: 'wat', providerName: 'p' }),
+    ).rejects.toThrow(/did not return an authorization URL/);
+  });
+});
+
+describe('pollForOauthAccessToken', () => {
+  const mockSend = jest.fn();
+  const mockClient = { send: mockSend } as unknown as Parameters<typeof pollForOauthAccessToken>[0];
+
+  beforeEach(() => {
+    mockSend.mockReset();
+  });
+
+  test('returns the access token on first successful poll', async () => {
+    mockSend.mockResolvedValueOnce({ accessToken: 'tok-1', sessionStatus: 'IN_PROGRESS' });
+    const token = await pollForOauthAccessToken(mockClient, {
+      workloadAccessToken: 'wat',
+      providerName: 'p',
+      sessionUri: 'urn:x',
+      timeoutMs: 1_000,
+      intervalMs: 50,
+    });
+    expect(token).toBe('tok-1');
+  });
+
+  test('keeps polling while accessToken is missing, returns once it appears', async () => {
+    mockSend
+      .mockResolvedValueOnce({ sessionStatus: 'IN_PROGRESS' })
+      .mockResolvedValueOnce({ sessionStatus: 'IN_PROGRESS' })
+      .mockResolvedValueOnce({ accessToken: 'tok-eventual' });
+    const token = await pollForOauthAccessToken(mockClient, {
+      workloadAccessToken: 'wat',
+      providerName: 'p',
+      sessionUri: 'urn:x',
+      timeoutMs: 5_000,
+      intervalMs: 10,
+    });
+    expect(token).toBe('tok-eventual');
+    expect(mockSend).toHaveBeenCalledTimes(3);
+  });
+
+  test('throws on sessionStatus=FAILED with a remediation hint', async () => {
+    mockSend.mockResolvedValueOnce({ sessionStatus: 'FAILED' });
+    await expect(
+      pollForOauthAccessToken(mockClient, {
+        workloadAccessToken: 'wat',
+        providerName: 'p',
+        sessionUri: 'urn:x',
+        timeoutMs: 1_000,
+        intervalMs: 50,
+      }),
+    ).rejects.toThrow(/sessionStatus=FAILED/);
+  });
+
+  test('throws on timeout when accessToken never arrives', async () => {
+    mockSend.mockResolvedValue({ sessionStatus: 'IN_PROGRESS' });
+    await expect(
+      pollForOauthAccessToken(mockClient, {
+        workloadAccessToken: 'wat',
+        providerName: 'p',
+        sessionUri: 'urn:x',
+        timeoutMs: 100,
+        intervalMs: 25,
+      }),
+    ).rejects.toThrow(/Timed out/);
+  });
+});
+
+describe('isWebhookSecretConfigured', () => {
+  const mockSend = jest.fn();
+  const mockClient = { send: mockSend } as unknown as Parameters<typeof isWebhookSecretConfigured>[0];
+
+  beforeEach(() => {
+    mockSend.mockReset();
+  });
+
+  test('returns true for a Linear-shaped lin_wh_ secret', async () => {
+    mockSend.mockResolvedValueOnce({ SecretString: 'lin_wh_AbCdEfGhIjKlMnOpQrStUvWxYz' });
+    expect(await isWebhookSecretConfigured(mockClient, 'arn:secret')).toBe(true);
+  });
+
+  test('returns false for the CDK-autogenerated placeholder', async () => {
+    // CDK's default Secret value is a JSON-encoded random string — does
+    // NOT start with lin_wh_. The check is a heuristic, not authoritative,
+    // but good enough to avoid re-prompting on every setup re-run.
+    mockSend.mockResolvedValueOnce({ SecretString: '{"":"abcd"}' });
+    expect(await isWebhookSecretConfigured(mockClient, 'arn:secret')).toBe(false);
+  });
+
+  test('returns false on Secrets Manager error (best-effort: re-prompt is harmless)', async () => {
+    mockSend.mockRejectedValueOnce(new Error('AccessDenied'));
+    expect(await isWebhookSecretConfigured(mockClient, 'arn:secret')).toBe(false);
+  });
+
+  test('returns false when SecretString is missing', async () => {
+    mockSend.mockResolvedValueOnce({});
+    expect(await isWebhookSecretConfigured(mockClient, 'arn:secret')).toBe(false);
   });
 });

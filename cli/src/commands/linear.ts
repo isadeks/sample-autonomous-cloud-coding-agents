@@ -17,7 +17,12 @@
  *  SOFTWARE.
  */
 
+import { execFile } from 'child_process';
 import * as readline from 'readline';
+import {
+  BedrockAgentCoreClient,
+  GetResourceOauth2TokenCommand,
+} from '@aws-sdk/client-bedrock-agentcore';
 import {
   BedrockAgentCoreControlClient,
   CreateOauth2CredentialProviderCommand,
@@ -28,10 +33,12 @@ import { DynamoDBClient } from '@aws-sdk/client-dynamodb';
 import { GetSecretValueCommand, PutSecretValueCommand, SecretsManagerClient } from '@aws-sdk/client-secrets-manager';
 import { DynamoDBDocumentClient, PutCommand } from '@aws-sdk/lib-dynamodb';
 import { Command } from 'commander';
+import { getWorkloadAccessToken } from '../agentcore-identity';
 import { ApiClient } from '../api-client';
 import { loadConfig, loadCredentials } from '../config';
 import { CliError } from '../errors';
 import { formatJson } from '../format';
+import { awaitOauthCallback, CALLBACK_URL } from '../oauth-callback-server';
 
 /** Default label that triggers an ABCA task when applied to a Linear issue. */
 const DEFAULT_LABEL_FILTER = 'bgagent';
@@ -234,6 +241,185 @@ export async function registerLinearWorkspace(
   }
 }
 
+/**
+ * Linear OAuth scopes for the `actor=app` agent flow. Verified via the
+ * 2.0b spike — `admin` is incompatible with `actor=app`, so we deliberately
+ * exclude it. `app:assignable` + `app:mentionable` are required to surface
+ * as a Linear Agent in workspace settings.
+ */
+export const LINEAR_OAUTH_SCOPES = ['read', 'write', 'app:assignable', 'app:mentionable'] as const;
+
+/**
+ * Maximum time to poll for the OAuth access token after the browser
+ * callback fires. AgentCore's server-side ceiling is 600s; we add a
+ * small buffer to surface the timeout client-side first with a clearer
+ * remediation message.
+ */
+const OAUTH_POLL_TIMEOUT_MS = 600_000;
+const OAUTH_POLL_INTERVAL_MS = 5_000;
+
+export interface InitiateOauthDanceArgs {
+  readonly workloadAccessToken: string;
+  readonly providerName: string;
+  readonly returnUrl?: string;
+}
+
+export interface OauthDanceInitiateResult {
+  readonly authorizationUrl: string;
+  readonly sessionUri: string;
+}
+
+/**
+ * Kick off the OAuth dance: ask AgentCore for an authorization URL +
+ * sessionUri so we can drive the user's browser to Linear's consent
+ * screen. The returned `sessionUri` is opaque (urn:ietf:params:oauth:
+ * request_uri:...) — pass it back to `pollForOauthAccessToken` after
+ * the browser callback fires.
+ *
+ * `customParameters: { actor: 'app' }` is the magic that makes Linear
+ * present the Agent install variant of consent. Verified to propagate
+ * to Linear's authorize URL via the 2.0b spike.
+ */
+export async function initiateOauthDance(
+  client: BedrockAgentCoreClient,
+  args: InitiateOauthDanceArgs,
+): Promise<OauthDanceInitiateResult> {
+  const response = await client.send(new GetResourceOauth2TokenCommand({
+    workloadIdentityToken: args.workloadAccessToken,
+    resourceCredentialProviderName: args.providerName,
+    scopes: [...LINEAR_OAUTH_SCOPES],
+    oauth2Flow: 'USER_FEDERATION',
+    resourceOauth2ReturnUrl: args.returnUrl ?? CALLBACK_URL,
+    customParameters: { actor: 'app' },
+  }));
+  if (response.accessToken) {
+    // Cached token returned — caller should detect this via the missing
+    // authorizationUrl and skip the browser/poll dance.
+    throw new CliError(
+      `AgentCore returned a cached access token instead of an authorization URL. `
+      + `This usually means the workspace is already authorized; pass --force-reauth to re-run consent.`,
+    );
+  }
+  if (!response.authorizationUrl || !response.sessionUri) {
+    throw new CliError(
+      `AgentCore did not return an authorization URL. Response keys: `
+      + `${Object.keys(response).join(', ')}`,
+    );
+  }
+  return {
+    authorizationUrl: response.authorizationUrl,
+    sessionUri: response.sessionUri,
+  };
+}
+
+export interface PollForOauthTokenArgs {
+  readonly workloadAccessToken: string;
+  readonly providerName: string;
+  readonly sessionUri: string;
+  readonly returnUrl?: string;
+  /** Override the default poll timeout/interval — tests pass tight values. */
+  readonly timeoutMs?: number;
+  readonly intervalMs?: number;
+}
+
+/**
+ * Poll AgentCore until the OAuth access token is available. Repeatedly
+ * calls `getResourceOauth2Token` with the captured `sessionUri`; the
+ * response will switch from `{ authorizationUrl, sessionUri, sessionStatus:
+ * 'IN_PROGRESS' }` to `{ accessToken, ... }` once AWS finishes the
+ * code-exchange behind the browser callback.
+ *
+ * Returns the access token (raw, no `Bearer ` prefix). Throws on
+ * timeout or `sessionStatus: FAILED`.
+ */
+export async function pollForOauthAccessToken(
+  client: BedrockAgentCoreClient,
+  args: PollForOauthTokenArgs,
+): Promise<string> {
+  const timeoutMs = args.timeoutMs ?? OAUTH_POLL_TIMEOUT_MS;
+  const intervalMs = args.intervalMs ?? OAUTH_POLL_INTERVAL_MS;
+  const deadline = Date.now() + timeoutMs;
+
+  while (Date.now() < deadline) {
+    const response = await client.send(new GetResourceOauth2TokenCommand({
+      workloadIdentityToken: args.workloadAccessToken,
+      resourceCredentialProviderName: args.providerName,
+      scopes: [...LINEAR_OAUTH_SCOPES],
+      oauth2Flow: 'USER_FEDERATION',
+      sessionUri: args.sessionUri,
+      resourceOauth2ReturnUrl: args.returnUrl ?? CALLBACK_URL,
+    }));
+
+    if (response.accessToken) {
+      return response.accessToken;
+    }
+    if (response.sessionStatus === 'FAILED') {
+      throw new CliError(
+        `OAuth flow failed at the AgentCore Identity layer (sessionStatus=FAILED). `
+        + `Common causes: Linear rejected the consent (e.g. user clicked Cancel), `
+        + `or the OAuth app's clientId/clientSecret stored in AgentCore don't match `
+        + `the Linear app. Re-check via \`bgagent linear oauth-register-workspace\`.`,
+      );
+    }
+    await new Promise((resolve) => setTimeout(resolve, intervalMs));
+  }
+
+  throw new CliError(
+    `Timed out waiting ${Math.round(timeoutMs / 1000)}s for OAuth access token. `
+    + `If the browser callback fired but the poll never completed, check CloudWatch logs `
+    + `for the credential provider name '${args.providerName}'.`,
+  );
+}
+
+/**
+ * Open `url` in the user's default browser. Returns true on best-effort
+ * success, false if no opener is available (e.g. headless SSH session) so
+ * callers can fall back to printing the URL.
+ *
+ * Uses `child_process.execFile` directly rather than a dependency like
+ * `open` — no need for a 200-line module to spawn one shell command.
+ */
+export function openBrowser(url: string): Promise<boolean> {
+  return new Promise((resolve) => {
+    let opener: { cmd: string; args: string[] };
+    if (process.platform === 'darwin') {
+      opener = { cmd: 'open', args: [url] };
+    } else if (process.platform === 'win32') {
+      // `start` is a cmd.exe builtin; URLs need empty title arg + escaping.
+      opener = { cmd: 'cmd', args: ['/c', 'start', '""', url] };
+    } else {
+      opener = { cmd: 'xdg-open', args: [url] };
+    }
+    execFile(opener.cmd, opener.args, (err) => {
+      resolve(!err);
+    });
+  });
+}
+
+/**
+ * Check whether the LinearWebhookSecret already holds a real Linear
+ * signing secret (vs CDK's autogenerated placeholder). Used to decide
+ * whether to prompt for the webhook secret on subsequent setup runs.
+ *
+ * Linear's webhook signing secrets start with `lin_wh_` — the placeholder
+ * is a CDK-generated random JSON-encoded string that doesn't match.
+ *
+ * Returns true if a real secret is stored, false otherwise (including
+ * any error fetching — best-effort; a re-prompt is harmless).
+ */
+export async function isWebhookSecretConfigured(
+  client: SecretsManagerClient,
+  secretArn: string,
+): Promise<boolean> {
+  try {
+    const result = await client.send(new GetSecretValueCommand({ SecretId: secretArn }));
+    const value = result.SecretString;
+    return typeof value === 'string' && value.startsWith('lin_wh_');
+  } catch {
+    return false;
+  }
+}
+
 export function makeLinearCommand(): Command {
   const linear = new Command('linear')
     .description('Manage Linear integration');
@@ -331,59 +517,214 @@ export function makeLinearCommand(): Command {
 
   linear.addCommand(
     new Command('setup')
-      .description('Populate Linear webhook secret + personal API token in Secrets Manager')
+      .description('Authorize a Linear workspace via OAuth (Phase 2.0b)')
+      .argument('<slug>', 'Linear workspace urlKey (must already be registered with `bgagent linear oauth-register-workspace`)')
       .option('--region <region>', 'AWS region (defaults to configured region)')
       .option('--stack-name <name>', 'CloudFormation stack name', 'backgroundagent-dev')
-      .action(async (opts) => {
+      .option('--no-browser', 'Print the authorization URL instead of opening a browser (for SSH/headless)')
+      .option('--rotate-webhook-secret', 'Re-prompt for the webhook signing secret even if one is already configured')
+      .action(async (slug: string, opts) => {
+        if (!SLUG_RE.test(slug)) {
+          throw new CliError(
+            `Invalid workspace slug '${slug}'. Must be 4-50 chars matching [a-zA-Z0-9_-]. `
+            + `Run \`bgagent linear oauth-register-workspace\` first.`,
+          );
+        }
         const config = loadConfig();
         const region = opts.region || config.region;
+        const stackName = opts.stackName;
 
-        const webhookSecretArn = await getStackOutput(region, opts.stackName, 'LinearWebhookSecretArn');
-        const apiTokenSecretArn = await getStackOutput(region, opts.stackName, 'LinearApiTokenSecretArn');
+        // ─── Stack outputs ─────────────────────────────────────────────
+        const [
+          workloadName,
+          workspaceRegistryTable,
+          userMappingTable,
+          webhookSecretArn,
+        ] = await Promise.all([
+          getStackOutput(region, stackName, 'CliWorkloadIdentityName'),
+          getStackOutput(region, stackName, 'LinearWorkspaceRegistryTableName'),
+          getStackOutput(region, stackName, 'LinearUserMappingTableName'),
+          getStackOutput(region, stackName, 'LinearWebhookSecretArn'),
+        ]);
 
-        if (!webhookSecretArn || !apiTokenSecretArn) {
-          console.error('Could not find Linear secret ARNs in stack outputs. Deploy the stack first.');
-          process.exit(1);
+        const missing: string[] = [];
+        if (!workloadName) missing.push('CliWorkloadIdentityName');
+        if (!workspaceRegistryTable) missing.push('LinearWorkspaceRegistryTableName');
+        if (!userMappingTable) missing.push('LinearUserMappingTableName');
+        if (!webhookSecretArn) missing.push('LinearWebhookSecretArn');
+        if (missing.length > 0) {
+          throw new CliError(
+            `Stack '${stackName}' is missing outputs ${missing.join(', ')}. `
+            + `Re-deploy with the 2.0b CDK changes (mise //cdk:deploy).`,
+          );
         }
 
-        const apiBaseUrl = config.api_url.replace(/\/+$/, '');
-        console.log('Linear setup — see docs/guides/LINEAR_SETUP_GUIDE.md for the full walkthrough.\n');
-        console.log('Required Linear config:');
-        console.log('  1. Create a personal API key at https://linear.app/settings/account/security');
-        console.log(`  2. Create a webhook at https://linear.app/settings/api — point it at: ${apiBaseUrl}/linear/webhook`);
-        console.log('     - Subscribe to: Issues');
-        console.log('     - Copy the signing secret from the webhook detail page\n');
-
-        const webhookSecret = await promptSecret('Webhook signing secret: ');
-        const apiToken = await promptSecret('Personal API key (lin_api_…): ');
-
-        if (!webhookSecret || !apiToken) {
-          console.error('\n✗ Both values are required. Try again.');
-          process.exit(1);
+        // ─── Resolve caller identity ──────────────────────────────────
+        const creds = loadCredentials();
+        if (!creds?.id_token) {
+          throw new CliError('Not authenticated — run `bgagent login` first.');
         }
-        if (!apiToken.startsWith('lin_api_')) {
-          console.error('\n✗ Personal API keys start with "lin_api_". Check https://linear.app/settings/account/security.');
-          process.exit(1);
+        let cognitoSub: string;
+        try {
+          cognitoSub = extractCognitoSub();
+        } catch (err) {
+          throw new CliError(
+            `Could not read Cognito sub from cached id_token: ${err instanceof Error ? err.message : String(err)}. `
+            + `Run \`bgagent login\` to refresh credentials.`,
+          );
         }
 
+        const providerName = providerNameForWorkspace(slug);
+
+        console.log(`bgagent linear setup — workspace '${slug}'`);
+        console.log(`  provider: ${providerName}`);
+        console.log(`  region:   ${region}`);
+        console.log();
+
+        // ─── Step 1: Workload access token ─────────────────────────────
+        process.stdout.write('  → Minting workload access token...');
+        const wat = await getWorkloadAccessToken({
+          region,
+          workloadName: workloadName!,
+          userId: cognitoSub,
+        });
+        console.log(' ✓');
+
+        // ─── Step 2: Initiate OAuth dance ──────────────────────────────
+        process.stdout.write('  → Requesting Linear authorization URL...');
+        const acClient = new BedrockAgentCoreClient({ region });
+        const initiated = await initiateOauthDance(acClient, {
+          workloadAccessToken: wat,
+          providerName,
+        });
+        console.log(' ✓');
+
+        // ─── Step 3: Run callback server + open browser in parallel ────
+        // Server starts listening BEFORE we open the browser so we don't
+        // miss the redirect. The dance: (a) start server; (b) open URL;
+        // (c) await server; (d) poll for token.
+        const callbackPromise = awaitOauthCallback();
+
+        if (opts.browser !== false) {
+          const opened = await openBrowser(initiated.authorizationUrl);
+          if (opened) {
+            console.log('  → Opened your browser to the Linear consent screen.');
+            console.log('    (Your browser will warn about a self-signed cert on the localhost callback — click through.)');
+          } else {
+            console.log('  → Could not open browser automatically. Open this URL manually:');
+            console.log(`    ${initiated.authorizationUrl}`);
+          }
+        } else {
+          console.log('  → --no-browser: open this URL manually:');
+          console.log(`    ${initiated.authorizationUrl}`);
+        }
+
+        process.stdout.write('  → Waiting for browser callback...');
+        const callback = await callbackPromise;
+        console.log(' ✓');
+
+        // ─── Step 4: Poll for access token ─────────────────────────────
+        process.stdout.write('  → Exchanging session for access token...');
+        const accessToken = await pollForOauthAccessToken(acClient, {
+          workloadAccessToken: wat,
+          providerName,
+          sessionUri: callback.sessionId,
+        });
+        console.log(' ✓');
+
+        // ─── Step 5: Fetch workspace identity ──────────────────────────
+        // Bearer-prefixed for OAuth tokens; PAK flow used the bare
+        // `lin_api_…` value (which Linear also accepts as Authorization).
+        process.stdout.write('  → Querying Linear viewer + organization...');
+        const identity = await queryLinearIdentity(`Bearer ${accessToken}`);
+        if (!identity) {
+          throw new CliError(
+            `OAuth token works against AgentCore but Linear's viewer query rejected it. `
+            + `This is unexpected — re-run setup with \`--force-reauth\` (planned) or check `
+            + `Linear app's GitHub username has [bot] suffix.`,
+          );
+        }
+        console.log(` ✓ (${identity.organization.name ?? identity.organization.urlKey ?? identity.organization.id})`);
+
+        if (identity.organization.urlKey && identity.organization.urlKey !== slug) {
+          console.log(
+            `  ⚠ Slug '${slug}' does not match Linear's urlKey '${identity.organization.urlKey}'. `
+            + `This still works but the registry row will store '${slug}' as the canonical key. `
+            + `If you intended a different workspace, delete the credential provider and start over.`,
+          );
+        }
+
+        // ─── Step 6: Persist registry + user-mapping rows ──────────────
+        const ddb = DynamoDBDocumentClient.from(new DynamoDBClient({ region }));
+        const now = new Date().toISOString();
+
+        await ddb.send(new PutCommand({
+          TableName: workspaceRegistryTable!,
+          Item: {
+            linear_workspace_id: identity.organization.id,
+            workspace_slug: slug,
+            provider_name: providerName,
+            installed_by_platform_user_id: cognitoSub,
+            installed_at: now,
+            updated_at: now,
+            status: 'active',
+          },
+        }));
+        console.log(`  ✓ Recorded workspace in registry`);
+
+        await ddb.send(new PutCommand({
+          TableName: userMappingTable!,
+          Item: {
+            linear_identity: `${identity.organization.id}#${identity.viewer.id}`,
+            platform_user_id: cognitoSub,
+            linear_workspace_id: identity.organization.id,
+            linear_user_id: identity.viewer.id,
+            linked_at: now,
+            status: 'active',
+            link_method: 'auto_setup_oauth',
+          },
+        }));
+        const adminLabel = identity.viewer.name ?? identity.viewer.email ?? identity.viewer.id;
+        console.log(`  ✓ Linked Linear user ${adminLabel} → platform user`);
+
+        // ─── Step 7: Webhook signing secret (workspace-independent) ────
         const sm = new SecretsManagerClient({ region });
-        await sm.send(new PutSecretValueCommand({ SecretId: webhookSecretArn, SecretString: webhookSecret }));
-        console.log('  ✓ Stored webhook signing secret');
-        await sm.send(new PutSecretValueCommand({ SecretId: apiTokenSecretArn, SecretString: apiToken }));
-        console.log('  ✓ Stored personal API token');
+        const alreadyConfigured = await isWebhookSecretConfigured(sm, webhookSecretArn!);
 
-        const userMappingTable = await getStackOutput(region, opts.stackName, 'LinearUserMappingTableName');
-        if (!userMappingTable) {
-          console.error('\n✗ Could not find LinearUserMappingTableName in stack outputs. Deploy the stack first.');
-          process.exit(1);
+        if (alreadyConfigured && !opts.rotateWebhookSecret) {
+          console.log('  ✓ Webhook signing secret already configured (use --rotate-webhook-secret to update)');
+        } else {
+          const apiBaseUrl = config.api_url.replace(/\/+$/, '');
+          console.log();
+          console.log('  Webhook signing secret needed.');
+          console.log('  In Linear → Settings → API → Webhooks, create a webhook pointing at:');
+          console.log(`    ${apiBaseUrl}/linear/webhook`);
+          console.log('  Subscribe to: Issues. Copy the signing secret from the webhook detail page.');
+          console.log();
+          const webhookSecret = await promptSecret('Webhook signing secret (lin_wh_…): ');
+          if (!webhookSecret) {
+            throw new CliError('Webhook signing secret is required.');
+          }
+          if (!webhookSecret.startsWith('lin_wh_')) {
+            throw new CliError(
+              `Webhook signing secrets start with 'lin_wh_'. Got something different — re-check the Linear webhook detail page.`,
+            );
+          }
+          await sm.send(new PutSecretValueCommand({
+            SecretId: webhookSecretArn!,
+            SecretString: webhookSecret,
+          }));
+          console.log('  ✓ Stored webhook signing secret');
         }
-        await autoLinkTokenOwner({ region, apiToken, userMappingTable });
 
-        console.log('\nNext steps:');
-        console.log('  1. Onboard a Linear project:');
+        // ─── Done ──────────────────────────────────────────────────────
+        console.log();
+        console.log('✅ Setup complete.');
+        console.log();
+        console.log('Next steps:');
+        console.log('  1. Onboard a Linear project to a GitHub repo:');
         console.log('       bgagent linear onboard-project <linear-project-id> --repo owner/repo');
-        console.log('  2. Add the "bgagent" label to a Linear issue in a mapped project — ABCA will pick it up.');
-        console.log('     (To link additional Linear users, run `bgagent linear link <code>` after they generate a code.)');
+        console.log('  2. Add the `bgagent` label to a Linear issue in a mapped project.');
       }),
   );
 
@@ -592,6 +933,45 @@ interface LinearViewer {
 interface LinearOrganization {
   readonly id: string;
   readonly name?: string;
+  /** Linear urlKey, e.g. "acme" — Phase 2.0b: used as the workspace slug. */
+  readonly urlKey?: string;
+}
+
+/**
+ * Query the Linear `viewer` + `organization` GraphQL fields with whatever
+ * Authorization header the caller hands us. Used both by the legacy
+ * PAK-era auto-link (header value = bare `lin_api_…` token) and the
+ * Phase 2.0b OAuth dance (header value = `Bearer <oauth-token>`).
+ *
+ * Returns null on any failure so callers can fall back to a warning
+ * without blowing up the higher-level flow.
+ */
+async function queryLinearIdentity(
+  authorizationHeader: string,
+): Promise<{ viewer: LinearViewer; organization: LinearOrganization } | null> {
+  try {
+    const res = await fetch('https://api.linear.app/graphql', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': authorizationHeader,
+      },
+      body: JSON.stringify({
+        query: '{ viewer { id name email } organization { id name urlKey } }',
+      }),
+    });
+    if (!res.ok) {
+      throw new Error(`Linear API returned ${res.status}`);
+    }
+    const body = await res.json() as { data?: { viewer?: LinearViewer; organization?: LinearOrganization } };
+    if (!body.data?.viewer?.id || !body.data.organization?.id) {
+      throw new Error('Linear API response missing viewer.id or organization.id');
+    }
+    return { viewer: body.data.viewer, organization: body.data.organization };
+  } catch (err) {
+    console.log(`  ⚠ Could not query Linear identity: ${err instanceof Error ? err.message : String(err)}`);
+    return null;
+  }
 }
 
 /**
