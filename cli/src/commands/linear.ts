@@ -21,6 +21,7 @@ import { execFile } from 'child_process';
 import * as readline from 'readline';
 import {
   BedrockAgentCoreClient,
+  CompleteResourceTokenAuthCommand,
   GetResourceOauth2TokenCommand,
 } from '@aws-sdk/client-bedrock-agentcore';
 import {
@@ -151,6 +152,7 @@ export function buildLinearProviderInput(opts: {
           authorizationEndpoint: string;
           tokenEndpoint: string;
           responseTypes: string[];
+          tokenEndpointAuthMethods: string[];
         };
       };
       clientId: string;
@@ -169,6 +171,13 @@ export function buildLinearProviderInput(opts: {
             authorizationEndpoint: LINEAR_AUTH_ENDPOINT,
             tokenEndpoint: LINEAR_TOKEN_ENDPOINT,
             responseTypes: ['code'],
+            // Linear's `/oauth/token` expects credentials in the POST body
+            // (`client_secret_post`), not as HTTP Basic Auth. Without this
+            // hint, AgentCore defaults to `client_secret_basic` and Linear
+            // rejects the token-exchange call — surfacing as the
+            // "stuck on IN_PROGRESS" symptom because AgentCore swallows
+            // the upstream 401 and never transitions to FAILED.
+            tokenEndpointAuthMethods: ['client_secret_post'],
           },
         },
         clientId: opts.clientId,
@@ -262,6 +271,21 @@ export interface InitiateOauthDanceArgs {
   readonly workloadAccessToken: string;
   readonly providerName: string;
   readonly returnUrl?: string;
+  /**
+   * When true, drop `customParameters: { actor: 'app' }` and the
+   * `app:assignable` / `app:mentionable` scopes. Used for diagnosis:
+   * isolates whether a stuck token-exchange is due to the agent-install
+   * variant or to something more fundamental.
+   */
+  readonly skipActorApp?: boolean;
+  /**
+   * When true, set `forceAuthentication: true` on the AgentCore call so
+   * the cached access token in the vault is bypassed and a fresh consent
+   * flow is initiated. Use after revoking the Linear install — Linear-side
+   * revoke does NOT invalidate AgentCore's vault entry, so the next
+   * `setup` would otherwise short-circuit to the cached (now-invalid) token.
+   */
+  readonly forceReauth?: boolean;
 }
 
 export interface OauthDanceInitiateResult {
@@ -291,6 +315,7 @@ export async function initiateOauthDance(
     oauth2Flow: 'USER_FEDERATION',
     resourceOauth2ReturnUrl: args.returnUrl ?? CALLBACK_URL,
     customParameters: { actor: 'app' },
+    forceAuthentication: args.forceReauth,
   }));
   if (response.accessToken) {
     // Cached token returned — caller should detect this via the missing
@@ -312,6 +337,32 @@ export async function initiateOauthDance(
   };
 }
 
+/**
+ * Bind a captured OAuth session to a user identifier on the AgentCore
+ * Identity side. Without this call, AgentCore leaves the session in
+ * `IN_PROGRESS` indefinitely — the upstream code-to-token exchange has
+ * already happened on AWS's side, but the token sits unbound in the vault
+ * until the workload says "this token is for user X".
+ *
+ * Mirrors the 09-Outbound_Auth_Self_Hosted sample's callback handler
+ * (sample 07's session-binding service is the same call wrapped in a
+ * Fargate ALB, but the call itself is two lines).
+ *
+ * Sample 07 uses `userIdentifier={userId: <cognito-sub>}`, sample 09
+ * uses a stable string — we use the Cognito sub of the admin running
+ * setup so the bound identity is stable across reboots and tied to
+ * who actually authorised.
+ */
+export async function completeResourceTokenAuth(
+  client: BedrockAgentCoreClient,
+  args: { sessionUri: string; userId: string },
+): Promise<void> {
+  await client.send(new CompleteResourceTokenAuthCommand({
+    sessionUri: args.sessionUri,
+    userIdentifier: { userId: args.userId },
+  }));
+}
+
 export interface PollForOauthTokenArgs {
   readonly workloadAccessToken: string;
   readonly providerName: string;
@@ -320,6 +371,13 @@ export interface PollForOauthTokenArgs {
   /** Override the default poll timeout/interval — tests pass tight values. */
   readonly timeoutMs?: number;
   readonly intervalMs?: number;
+  /**
+   * When true, log each poll's response keys and sessionStatus so a
+   * stuck IN_PROGRESS state is visible from the terminal. Off by
+   * default to keep the happy-path output quiet; flipped on by the
+   * `bgagent linear setup --verbose` flag.
+   */
+  readonly verbose?: boolean;
 }
 
 /**
@@ -340,7 +398,9 @@ export async function pollForOauthAccessToken(
   const intervalMs = args.intervalMs ?? OAUTH_POLL_INTERVAL_MS;
   const deadline = Date.now() + timeoutMs;
 
+  let attempt = 0;
   while (Date.now() < deadline) {
+    attempt += 1;
     const response = await client.send(new GetResourceOauth2TokenCommand({
       workloadIdentityToken: args.workloadAccessToken,
       resourceCredentialProviderName: args.providerName,
@@ -349,6 +409,15 @@ export async function pollForOauthAccessToken(
       sessionUri: args.sessionUri,
       resourceOauth2ReturnUrl: args.returnUrl ?? CALLBACK_URL,
     }));
+
+    if (args.verbose) {
+      const elapsedSec = Math.round((Date.now() - (deadline - timeoutMs)) / 1000);
+      const keys = Object.keys(response).filter((k) => k !== 'ResponseMetadata');
+      // eslint-disable-next-line no-console
+      console.log(
+        `    [poll #${attempt} t+${elapsedSec}s] sessionStatus=${response.sessionStatus ?? 'undefined'} keys=[${keys.join(',')}]`,
+      );
+    }
 
     if (response.accessToken) {
       return response.accessToken;
@@ -523,6 +592,8 @@ export function makeLinearCommand(): Command {
       .option('--stack-name <name>', 'CloudFormation stack name', 'backgroundagent-dev')
       .option('--no-browser', 'Print the authorization URL instead of opening a browser (for SSH/headless)')
       .option('--rotate-webhook-secret', 'Re-prompt for the webhook signing secret even if one is already configured')
+      .option('--force-reauth', 'Bypass AgentCore Identity\'s cached token and force a fresh OAuth consent (use after revoking the Linear install)')
+      .option('--verbose-poll', 'Print per-poll debug output during the OAuth token-exchange wait')
       .action(async (slug: string, opts) => {
         if (!SLUG_RE.test(slug)) {
           throw new CliError(
@@ -596,6 +667,7 @@ export function makeLinearCommand(): Command {
         const initiated = await initiateOauthDance(acClient, {
           workloadAccessToken: wat,
           providerName,
+          forceReauth: opts.forceReauth,
         });
         console.log(' ✓');
 
@@ -623,16 +695,40 @@ export function makeLinearCommand(): Command {
         const callback = await callbackPromise;
         console.log(' ✓');
 
-        // ─── Step 4: Poll for access token ─────────────────────────────
-        process.stdout.write('  → Exchanging session for access token...');
+        // ─── Step 4: Bind the captured session to the caller's identity ──
+        // AgentCore Identity stores the OAuth token unbound in its vault
+        // when AWS receives the code from Linear. CompleteResourceTokenAuth
+        // is what tells AgentCore "this token is for user X" — without it,
+        // sessionStatus stays IN_PROGRESS forever and polling spins until
+        // the 600s timeout. Documented in samples 07 (session-binding
+        // service) and 09 (inline localhost callback). NOT optional.
+        process.stdout.write('  → Binding session to user identity...');
+        await completeResourceTokenAuth(acClient, {
+          sessionUri: callback.sessionId,
+          userId: cognitoSub,
+        });
+        console.log(' ✓');
+
+        // ─── Step 5: Poll for access token ─────────────────────────────
+        if (opts.verbosePoll) {
+          console.log('  → Exchanging session for access token (verbose poll output below):');
+          console.log(`    sessionUri = ${callback.sessionId}`);
+        } else {
+          process.stdout.write('  → Exchanging session for access token...');
+        }
         const accessToken = await pollForOauthAccessToken(acClient, {
           workloadAccessToken: wat,
           providerName,
           sessionUri: callback.sessionId,
+          verbose: opts.verbosePoll,
         });
-        console.log(' ✓');
+        if (!opts.verbosePoll) {
+          console.log(' ✓');
+        } else {
+          console.log('  → Exchanging session for access token... ✓');
+        }
 
-        // ─── Step 5: Fetch workspace identity ──────────────────────────
+        // ─── Step 6: Fetch workspace identity ──────────────────────────
         // Bearer-prefixed for OAuth tokens; PAK flow used the bare
         // `lin_api_…` value (which Linear also accepts as Authorization).
         process.stdout.write('  → Querying Linear viewer + organization...');
@@ -654,7 +750,7 @@ export function makeLinearCommand(): Command {
           );
         }
 
-        // ─── Step 6: Persist registry + user-mapping rows ──────────────
+        // ─── Step 7: Persist registry + user-mapping rows ──────────────
         const ddb = DynamoDBDocumentClient.from(new DynamoDBClient({ region }));
         const now = new Date().toISOString();
 
@@ -687,7 +783,7 @@ export function makeLinearCommand(): Command {
         const adminLabel = identity.viewer.name ?? identity.viewer.email ?? identity.viewer.id;
         console.log(`  ✓ Linked Linear user ${adminLabel} → platform user`);
 
-        // ─── Step 7: Webhook signing secret (workspace-independent) ────
+        // ─── Step 8: Webhook signing secret (workspace-independent) ────
         const sm = new SecretsManagerClient({ region });
         const alreadyConfigured = await isWebhookSecretConfigured(sm, webhookSecretArn!);
 

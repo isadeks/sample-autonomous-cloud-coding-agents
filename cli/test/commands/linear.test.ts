@@ -227,6 +227,12 @@ describe('buildLinearProviderInput', () => {
       authorizationEndpoint: 'https://linear.app/oauth/authorize',
       tokenEndpoint: 'https://api.linear.app/oauth/token',
       responseTypes: ['code'],
+      // tokenEndpointAuthMethods locked here as a regression guard:
+      // Linear's /oauth/token expects credentials in the POST body, not
+      // HTTP Basic. Without this, AgentCore defaults to client_secret_basic
+      // and Linear silently rejects with 401, surfacing as stuck-on-IN_PROGRESS
+      // (caught during the 2.0b smoke test 2026-05-19).
+      tokenEndpointAuthMethods: ['client_secret_post'],
     });
   });
 });
