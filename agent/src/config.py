@@ -3,6 +3,7 @@
 import os
 import sys
 import uuid
+from datetime import UTC
 
 from models import TaskConfig, TaskType
 from shell import log
@@ -85,7 +86,7 @@ def resolve_linear_api_token(channel_metadata: dict[str, str] | None = None) -> 
 
     try:
         import json
-        from datetime import datetime, timezone
+        from datetime import datetime, timedelta
 
         import boto3
         from botocore.exceptions import BotoCoreError, ClientError
@@ -104,7 +105,7 @@ def resolve_linear_api_token(channel_metadata: dict[str, str] | None = None) -> 
             expiry = datetime.fromisoformat(expires_at_iso.replace("Z", "+00:00"))
         except ValueError:
             return True
-        return (expiry - datetime.now(timezone.utc)).total_seconds() < threshold_seconds
+        return (expiry - datetime.now(UTC)).total_seconds() < threshold_seconds
 
     def _refresh(current: dict) -> dict | None:
         try:
@@ -113,12 +114,14 @@ def resolve_linear_api_token(channel_metadata: dict[str, str] | None = None) -> 
         except ImportError:
             return None
 
-        body = urllib.parse.urlencode({
-            "grant_type": "refresh_token",
-            "refresh_token": current["refresh_token"],
-            "client_id": current["client_id"],
-            "client_secret": current["client_secret"],
-        }).encode("utf-8")
+        body = urllib.parse.urlencode(
+            {
+                "grant_type": "refresh_token",
+                "refresh_token": current["refresh_token"],
+                "client_id": current["client_id"],
+                "client_secret": current["client_secret"],
+            }
+        ).encode("utf-8")
         req = urllib.request.Request(
             "https://api.linear.app/oauth/token",
             data=body,
@@ -128,32 +131,30 @@ def resolve_linear_api_token(channel_metadata: dict[str, str] | None = None) -> 
         try:
             with urllib.request.urlopen(req, timeout=10) as resp:  # noqa: S310
                 payload = json.loads(resp.read().decode("utf-8"))
-        except Exception as e:  # noqa: BLE001
+        except Exception as e:
             log("WARN", f"resolve_linear_api_token refresh failed: {type(e).__name__}: {e}")
             return None
 
         if "access_token" not in payload:
             return None
 
-        now = datetime.now(timezone.utc)
+        now = datetime.now(UTC)
+        # Linear's `expires_in` is documented and reliably sent; if it's
+        # missing we assume the access token is already valid for as long
+        # as the refresh-token call took to round-trip — set expiry to now.
+        if "expires_in" in payload:
+            future = now + timedelta(seconds=int(payload["expires_in"]))
+            expires_at_iso = future.replace(microsecond=0).isoformat().replace("+00:00", "Z")
+        else:
+            expires_at_iso = now.replace(microsecond=0).isoformat().replace("+00:00", "Z")
         next_token = {
             **current,
             "access_token": payload["access_token"],
             "refresh_token": payload.get("refresh_token", current["refresh_token"]),
-            "expires_at": (
-                now.replace(microsecond=0).isoformat().replace("+00:00", "Z")
-                if "expires_in" not in payload
-                else (now.replace(microsecond=0)).isoformat().replace("+00:00", "Z")
-                # below replaces the simple form above with the real computation
-            ),
+            "expires_at": expires_at_iso,
             "scope": payload.get("scope", current["scope"]),
             "updated_at": now.isoformat().replace("+00:00", "Z"),
         }
-        # Recompute expires_at properly.
-        if "expires_in" in payload:
-            from datetime import timedelta
-            future = now + timedelta(seconds=int(payload["expires_in"]))
-            next_token["expires_at"] = future.replace(microsecond=0).isoformat().replace("+00:00", "Z")
 
         try:
             sm.put_secret_value(SecretId=secret_arn, SecretString=json.dumps(next_token))
@@ -168,7 +169,8 @@ def resolve_linear_api_token(channel_metadata: dict[str, str] | None = None) -> 
         code = ""
         if hasattr(e, "response"):
             code = getattr(e, "response", {}).get("Error", {}).get("Code", "") or ""
-        severity = "ERROR" if code in ("AccessDeniedException", "ResourceNotFoundException") else "WARN"
+        is_hard_failure = code in ("AccessDeniedException", "ResourceNotFoundException")
+        severity = "ERROR" if is_hard_failure else "WARN"
         log(severity, f"resolve_linear_api_token failed: {type(e).__name__}: {e}")
         return ""
 

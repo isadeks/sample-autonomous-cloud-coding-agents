@@ -1,6 +1,6 @@
 """Unit tests for config.py — build_config and constants."""
 
-import sys
+from datetime import UTC
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -125,11 +125,11 @@ class TestResolveLinearApiToken:
 
     def test_resolves_from_secrets_manager_and_caches_in_env(self, monkeypatch):
         """Happy path: channel_metadata carries the ARN, secret has access_token + future expiry."""
-        from datetime import datetime, timedelta, timezone
+        from datetime import datetime, timedelta
 
         monkeypatch.delenv("LINEAR_API_TOKEN", raising=False)
         monkeypatch.setenv("AWS_REGION", "us-east-1")
-        future = (datetime.now(timezone.utc) + timedelta(hours=12)).isoformat().replace("+00:00", "Z")
+        future = (datetime.now(UTC) + timedelta(hours=12)).isoformat().replace("+00:00", "Z")
         token_payload = {
             "access_token": "lin_oauth_fresh",
             "refresh_token": "lin_refresh_xyz",
@@ -148,10 +148,12 @@ class TestResolveLinearApiToken:
             "SecretString": __import__("json").dumps(token_payload),
         }
         with patch("boto3.client", return_value=mock_sm):
-            assert resolve_linear_api_token({"linear_oauth_secret_arn": "arn:test"}) == "lin_oauth_fresh"
+            resolved = resolve_linear_api_token({"linear_oauth_secret_arn": "arn:test"})
+            assert resolved == "lin_oauth_fresh"
 
         # Cached for subsequent reads.
         import os as _os
+
         assert _os.environ.get("LINEAR_API_TOKEN") == "lin_oauth_fresh"
         # Reset for other tests.
         monkeypatch.delenv("LINEAR_API_TOKEN", raising=False)
@@ -172,22 +174,29 @@ class TestResolveLinearApiToken:
 
     def test_falls_back_to_env_var_when_channel_metadata_omits_arn(self, monkeypatch):
         """LINEAR_OAUTH_SECRET_ARN env var is the back-compat fallback."""
-        from datetime import datetime, timedelta, timezone
+        from datetime import datetime, timedelta
 
         monkeypatch.delenv("LINEAR_API_TOKEN", raising=False)
         monkeypatch.setenv("AWS_REGION", "us-east-1")
         monkeypatch.setenv("LINEAR_OAUTH_SECRET_ARN", "arn:from-env")
-        future = (datetime.now(timezone.utc) + timedelta(hours=12)).isoformat().replace("+00:00", "Z")
+        future = (datetime.now(UTC) + timedelta(hours=12)).isoformat().replace("+00:00", "Z")
         mock_sm = MagicMock()
         mock_sm.get_secret_value.return_value = {
-            "SecretString": __import__("json").dumps({
-                "access_token": "lin_oauth_envpath",
-                "refresh_token": "rt", "expires_at": future, "scope": "read",
-                "client_id": "c", "client_secret": "s",
-                "workspace_id": "w", "workspace_slug": "s",
-                "installed_at": "x", "updated_at": "x",
-                "installed_by_platform_user_id": "u",
-            }),
+            "SecretString": __import__("json").dumps(
+                {
+                    "access_token": "lin_oauth_envpath",
+                    "refresh_token": "rt",
+                    "expires_at": future,
+                    "scope": "read",
+                    "client_id": "c",
+                    "client_secret": "s",
+                    "workspace_id": "w",
+                    "workspace_slug": "s",
+                    "installed_at": "x",
+                    "updated_at": "x",
+                    "installed_by_platform_user_id": "u",
+                }
+            ),
         }
         with patch("boto3.client", return_value=mock_sm):
             assert resolve_linear_api_token() == "lin_oauth_envpath"
