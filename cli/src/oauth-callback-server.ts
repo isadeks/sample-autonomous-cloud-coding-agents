@@ -100,8 +100,24 @@ export function generateSelfSignedCert(): { certPath: string; keyPath: string; c
 }
 
 export interface CallbackResult {
-  /** Value of the `session_id` query param on the OAuth callback URL. */
-  readonly sessionId: string;
+  /**
+   * Value of the `session_id` query param if present (AgentCore-style
+   * redirect). Null in direct-OAuth flows where Linear redirects with
+   * `code` + `state` instead.
+   */
+  readonly sessionId: string | null;
+  /**
+   * OAuth `code` from a direct-Linear redirect (Phase 2.0b Option 2).
+   * Null in AgentCore-style flows where AWS performs the code-to-token
+   * exchange itself.
+   */
+  readonly code: string | null;
+  /**
+   * OAuth `state` from a direct-Linear redirect — caller MUST verify
+   * against the value passed into `buildAuthorizationUrl` to prevent
+   * CSRF. Null in AgentCore-style flows.
+   */
+  readonly state: string | null;
 }
 
 export interface CallbackServerOptions {
@@ -174,13 +190,34 @@ export async function awaitOauthCallback(
           res.end();
           return;
         }
-        // We accept any path — AWS's redirect always goes to the configured
-        // resourceOauth2ReturnUrl, so the path matches CALLBACK_PATH, but
-        // matching loosely makes diagnosis easier (a misconfigured allowlist
-        // sends us to /something else and we capture the query anyway).
+        // We accept any path — Linear's redirect always goes to the configured
+        // redirect_uri (which matches CALLBACK_PATH), but matching loosely
+        // makes diagnosis easier when something is misconfigured.
         const url = new URL(req.url, CALLBACK_URL);
         const sessionId = url.searchParams.get('session_id');
-        if (!sessionId) {
+        const code = url.searchParams.get('code');
+        const state = url.searchParams.get('state');
+        const error = url.searchParams.get('error');
+
+        // Linear may redirect with `?error=access_denied` if the user clicks
+        // Cancel on the consent screen. Surface that explicitly rather than
+        // saying "no session_id / code".
+        if (error) {
+          res.statusCode = 400;
+          res.setHeader('content-type', 'text/html; charset=utf-8');
+          const errorDescription = url.searchParams.get('error_description') ?? '(no description)';
+          res.once('finish', () => {
+            settle(() => reject(new CliError(
+              `OAuth callback received error from Linear: ${error} — ${errorDescription}.`,
+            )));
+          });
+          res.end(FAILURE_HTML);
+          return;
+        }
+
+        // Need either session_id (AgentCore-style — legacy, parked path) or
+        // code+state (direct Linear OAuth — Phase 2.0b Option 2).
+        if (!sessionId && !(code && state)) {
           res.statusCode = 400;
           res.setHeader('content-type', 'text/html; charset=utf-8');
           // Settle on `finish` so the response body actually flushes before
@@ -188,7 +225,7 @@ export async function awaitOauthCallback(
           // bytes it never gets, leaving callers / tests deadlocked.
           res.once('finish', () => {
             settle(() => reject(new CliError(
-              `OAuth callback received without session_id. Got URL: ${req.url}. `
+              `OAuth callback received without session_id or code/state. Got URL: ${req.url}. `
               + `If you saw an error on Linear's consent screen, that's likely the root cause; `
               + `re-run \`bgagent linear setup\` after fixing the Linear app config.`,
             )));
@@ -199,7 +236,7 @@ export async function awaitOauthCallback(
         res.statusCode = 200;
         res.setHeader('content-type', 'text/html; charset=utf-8');
         res.once('finish', () => {
-          settle(() => resolve({ sessionId }));
+          settle(() => resolve({ sessionId, code, state }));
         });
         res.end(SUCCESS_HTML);
       },

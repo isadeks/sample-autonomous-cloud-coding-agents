@@ -83,13 +83,52 @@ describe('awaitOauthCallback', () => {
     expect(response.body).toContain('Linear authorized');
   });
 
-  test('rejects when the redirect arrives without session_id', async () => {
+  test('captures code+state from a direct Linear OAuth redirect', async () => {
+    // Phase 2.0b Option 2 path: Linear redirects with `code` + `state`
+    // (no AgentCore proxy in the middle).
+    const callbackPromise = awaitOauthCallback({ timeoutMs: 5_000 });
+    await new Promise((r) => setTimeout(r, 100));
+    const requestPromise = localGet(
+      '/oauth/callback?code=lin_authcode_abc&state=stateuuid',
+    );
+
+    const [callbackResult, response] = await Promise.all([callbackPromise, requestPromise]);
+    expect(callbackResult.code).toBe('lin_authcode_abc');
+    expect(callbackResult.state).toBe('stateuuid');
+    expect(callbackResult.sessionId).toBeNull();
+    expect(response.status).toBe(200);
+  });
+
+  test('rejects with Linear`s error_description when redirect has ?error=', async () => {
+    // Linear surfaces `?error=access_denied` if the user clicks Cancel on
+    // the consent screen. Distinguish that from a missing-params failure
+    // so the caller can present a clearer message.
+    const callbackPromise = awaitOauthCallback({ timeoutMs: 5_000 });
+    await new Promise((r) => setTimeout(r, 100));
+    const responsePromise = localGet(
+      '/oauth/callback?error=access_denied&error_description=user+cancelled',
+    );
+
+    const [callbackOutcome, responseOutcome] = await Promise.allSettled([
+      callbackPromise,
+      responsePromise,
+    ]);
+    expect(callbackOutcome.status).toBe('rejected');
+    if (callbackOutcome.status === 'rejected') {
+      expect(String(callbackOutcome.reason.message)).toMatch(/access_denied.*user cancelled/);
+    }
+    if (responseOutcome.status === 'fulfilled') {
+      expect(responseOutcome.value.status).toBe(400);
+    }
+  });
+
+  test('rejects when the redirect has neither session_id nor code+state', async () => {
     const callbackPromise = awaitOauthCallback({ timeoutMs: 5_000 });
     await new Promise((r) => setTimeout(r, 100));
     const responsePromise = localGet('/oauth/callback');
 
     // Both promises settle together: the response carries the 400 + failure
-    // page, the callback promise rejects with the no-session_id error.
+    // page, the callback promise rejects with the missing-params error.
     // Capture both outcomes via allSettled so neither hangs the other.
     const [callbackOutcome, responseOutcome] = await Promise.allSettled([
       callbackPromise,
@@ -98,7 +137,7 @@ describe('awaitOauthCallback', () => {
 
     expect(callbackOutcome.status).toBe('rejected');
     if (callbackOutcome.status === 'rejected') {
-      expect(String(callbackOutcome.reason.message)).toMatch(/without session_id/);
+      expect(String(callbackOutcome.reason.message)).toMatch(/without session_id or code\/state/);
     }
     expect(responseOutcome.status).toBe('fulfilled');
     if (responseOutcome.status === 'fulfilled') {
