@@ -258,22 +258,42 @@ export class TaskApi extends Construct {
               vendorName: 'AWS',
               name: 'AWSManagedRulesCommonRuleSet',
               // Inbound webhook payloads from mature SaaS tools (Linear ships
-              // full Issue payloads > 8 KB) trip SizeRestrictions_BODY in this
-              // ruleset. Exempt the Linear webhook path from CRS entirely:
-              // the route is HMAC-verified in the Lambda, parsed as strict
+              // full Issue payloads > 8 KB; GitHub deployment_status carries
+              // absolute deploy URLs flagged by GenericRFI_BODY) trip
+              // SizeRestrictions_BODY / GenericRFI_BODY in this ruleset.
+              // Exempt the Linear and GitHub webhook paths from CRS entirely:
+              // both routes are HMAC-verified in the Lambda, parsed as strict
               // JSON, never interpolated into SQL/HTML, and rate-limited by
               // the priority-3 rule below. CRS still applies to every other
               // route (user API, Slack, etc.).
               scopeDownStatement: {
-                notStatement: {
-                  statement: {
-                    byteMatchStatement: {
-                      fieldToMatch: { uriPath: {} },
-                      positionalConstraint: 'EXACTLY',
-                      searchString: '/v1/linear/webhook',
-                      textTransformations: [{ priority: 0, type: 'NONE' }],
+                andStatement: {
+                  statements: [
+                    {
+                      notStatement: {
+                        statement: {
+                          byteMatchStatement: {
+                            fieldToMatch: { uriPath: {} },
+                            positionalConstraint: 'EXACTLY',
+                            searchString: '/v1/linear/webhook',
+                            textTransformations: [{ priority: 0, type: 'NONE' }],
+                          },
+                        },
+                      },
                     },
-                  },
+                    {
+                      notStatement: {
+                        statement: {
+                          byteMatchStatement: {
+                            fieldToMatch: { uriPath: {} },
+                            positionalConstraint: 'EXACTLY',
+                            searchString: '/v1/github/webhook',
+                            textTransformations: [{ priority: 0, type: 'NONE' }],
+                          },
+                        },
+                      },
+                    },
+                  ],
                 },
               },
             },
