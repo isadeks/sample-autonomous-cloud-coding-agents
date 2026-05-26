@@ -215,9 +215,18 @@ describe('isWebhookSecretConfigured', () => {
     expect(await isWebhookSecretConfigured(mockClient, 'arn:secret')).toBe(false);
   });
 
-  test('returns false on Secrets Manager error (best-effort: re-prompt is harmless)', async () => {
-    mockSend.mockRejectedValueOnce(new Error('AccessDenied'));
+  test('returns false on ResourceNotFoundException (secret has not been created yet)', async () => {
+    const err = new Error('Secrets Manager cannot find the specified secret.');
+    err.name = 'ResourceNotFoundException';
+    mockSend.mockRejectedValueOnce(err);
     expect(await isWebhookSecretConfigured(mockClient, 'arn:secret')).toBe(false);
+  });
+
+  test('throws on AccessDenied so operators see the IAM gap instead of a confusing re-prompt', async () => {
+    const err = new Error('User is not authorized to perform: secretsmanager:GetSecretValue');
+    err.name = 'AccessDeniedException';
+    mockSend.mockRejectedValueOnce(err);
+    await expect(isWebhookSecretConfigured(mockClient, 'arn:secret')).rejects.toThrow(/IAM permission gap/);
   });
 
   test('returns false when SecretString is missing', async () => {

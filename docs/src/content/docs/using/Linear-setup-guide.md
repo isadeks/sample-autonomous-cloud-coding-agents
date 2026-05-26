@@ -230,16 +230,49 @@ The signing secret in Secrets Manager doesn't match the webhook. Re-run `bgagent
 
 ## Migration from 2.0a (PAK) to 2.0b (OAuth)
 
-If your deployment is on Phase 2.0a (personal API key), 2.0b is a **hard cutover** — there is no `--use-pak` fallback flag. Plan for a maintenance window:
+If your deployment is on Phase 2.0a (personal API key), 2.0b is a **hard cutover** — there is no `--use-pak` fallback flag. Plan for a short maintenance window (typically <30 min for a single workspace).
 
-1. **Drain the queue.** Wait for in-flight tasks to finish. In-flight tasks at upgrade time will fail their final Linear comment because the OAuth token isn't yet authorized when the agent looks for it.
-2. **Deploy 2.0b.** `mise //cdk:deploy`. This adds `LinearWorkspaceRegistryTable`, removes `LinearApiTokenSecret` IAM grants from the agent runtime + Lambdas, and removes the `linear-api-key` AgentCore credential provider's role in the runtime.
-3. **For each Linear workspace, run Steps 1–4 above.** Each workspace needs a new Linear OAuth app, a new AgentCore credential provider (`linear-oauth-<slug>`), and a fresh OAuth authorize via `bgagent linear setup`.
-4. **Verify with a test issue.** Apply the `bgagent` label in each onboarded workspace and confirm the agent posts as `bgagent[bot]` (not as the previous PAK owner's Linear identity).
-5. **Decommission the PAK.** Once 2.0b is verified working, revoke the personal API key in Linear settings ([Linear Settings → Security](https://linear.app/settings/account/security) → Personal API keys → revoke). The PAK is no longer used by any code path; revoking it is a clean break.
-6. **Clean up the old api-key credential provider:** `aws bedrock-agentcore-control delete-api-key-credential-provider --name linear-api-key`.
+> **What changes under the hood.** 2.0a stored a single `LinearApiTokenSecret` (one PAK shared by all teammates) and granted the agent runtime `secretsmanager:GetSecretValue` on that one ARN. 2.0b stores a per-workspace `bgagent-linear-oauth-<slug>` secret containing `{access_token, refresh_token, expires_at, client_id, client_secret, …}`, and replaces the single-ARN grant with a `bgagent-linear-oauth-*` prefix grant. The CDK stack drops the `LinearApiTokenSecret` resource entirely, so there's no automated rollback once 2.0b is deployed.
 
-User mappings in `LinearUserMappingTable` survive the migration — they're keyed on Linear identity, which is unchanged. Project mappings in `LinearProjectMappingTable` likewise survive.
+### Pre-deploy checklist
+
+Run these BEFORE deploying 2.0b so you have everything ready when the maintenance window starts:
+
+1. **List your in-flight tasks.** `bgagent list --status RUNNING --status PENDING` — the migration will not corrupt these, but their final Linear comment may fail because the OAuth token isn't yet authorized when the agent runs.
+2. **Pick one Linear workspace to migrate first.** Multi-workspace orgs should rehearse on the lowest-traffic workspace before doing the rest.
+3. **Note the workspace's `urlKey`** (the `<slug>` in `linear.app/<slug>/...`). You'll need it for `bgagent linear setup <slug>`.
+4. **Confirm CLI admin access.** You need an AWS principal with `secretsmanager:CreateSecret` on `bgagent-linear-oauth-*` AND `dynamodb:PutItem` on `LinearWorkspaceRegistryTable`. Without these, `bgagent linear setup` aborts mid-way (the OAuth dance succeeds, the secret write fails — your Linear OAuth app gets stuck with no usable token).
+
+### Migration steps
+
+1. **Drain the queue.** Wait for in-flight tasks to finish. In-flight tasks at deploy time will fail their final Linear comment because their token resolver short-circuits when neither `LinearApiTokenSecret` (gone) nor `bgagent-linear-oauth-<slug>` (not yet created) is present.
+2. **Deploy 2.0b.** `mise //cdk:deploy`. This adds `LinearWorkspaceRegistryTable`, removes the `LinearApiTokenSecret` resource and IAM grants, and adds the `bgagent-linear-oauth-*` prefix grant on the agent runtime + webhook processor + orchestrator.
+3. **For each Linear workspace, run [Steps 1–4 above](#step-by-step-setup).** Each workspace needs:
+   - A new Linear OAuth app (Settings → API → Applications → Create new app, scopes `read,write,app:assignable,app:mentionable`)
+   - `bgagent linear setup <slug>` to run the OAuth dance and write the per-workspace secret
+   - The webhook signing secret pasted into the Secrets Manager `LinearWebhookSecret` resource
+4. **Re-onboard projects.** If 2.0a had `LinearProjectMappingTable` rows, they survive — but verify with `bgagent linear list-projects` that the listed projects still match what's mapped. The mapping rows are keyed on `linear_project_id` UUID which is stable across the migration.
+5. **Verify with a test issue.** Apply the trigger label in each onboarded workspace and confirm the agent posts as `bgagent[bot]` (not as the previous PAK owner's Linear identity). The author byline change is the cleanest signal that OAuth — not the PAK — is on the wire.
+6. **Decommission the PAK.** Once 2.0b is verified working, revoke the personal API key in Linear settings ([Linear Settings → Security](https://linear.app/settings/account/security) → Personal API keys → revoke). The PAK is no longer used by any code path; revoking is a clean break with no rollback.
+
+### Rollback
+
+If 2.0b fails verification and you need to revert before doing the OAuth setup:
+
+- The `LinearApiTokenSecret` CFN resource has been deleted, so a `cdk deploy` of the previous commit will recreate it but **the secret value will be empty**. You'd need to re-paste the PAK value manually.
+- Recommend instead: **fix-forward**. The 2.0b OAuth dance is a 5-minute step per workspace; rolling back is rarely worth the time.
+
+### What survives the migration
+
+- **`LinearUserMappingTable`** — keyed on Linear identity (organization + user UUID), which is unchanged across PAK→OAuth.
+- **`LinearProjectMappingTable`** — keyed on `linear_project_id` UUID, also stable.
+- **`LinearWebhookDedupTable`** — TTL-bounded; rows from the maintenance window will TTL out within 8h.
+- **GitHub PR comments and Linear-issue mappings** in any in-flight task records.
+
+### What does NOT survive
+
+- `LinearApiTokenSecret` Secrets Manager value — gone with the CDK resource.
+- The 2.0a `linear-api-key` AgentCore credential provider (if 2.0a-with-Identity was deployed mid-Phase) — clean it up after with: `aws bedrock-agentcore-control delete-api-key-credential-provider --name linear-api-key`. Phase 2.0b-O2 does not use AgentCore Identity at all, so there's nothing to clean up if you skipped the parked 2.0a-Identity branch.
 
 ## Limits and budgets
 

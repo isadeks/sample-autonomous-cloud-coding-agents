@@ -169,12 +169,31 @@ export function makeAdminCommand(): Command {
           throw err;
         }
 
-        await cognito.send(new AdminSetUserPasswordCommand({
-          UserPoolId: config.user_pool_id,
-          Username: email,
-          Password: tempPassword,
-          Permanent: true,
-        }));
+        // The user has been created at this point. If `AdminSetUserPassword`
+        // fails (stricter password policy than the generator, partial IAM
+        // grant on the Set verb, throttling, etc.) the user is left in
+        // `FORCE_CHANGE_PASSWORD` state — they exist in the pool but
+        // can't actually log in. Surface a clear diagnostic so the
+        // admin knows to either retry the password set manually or
+        // delete the half-created user before re-running.
+        try {
+          await cognito.send(new AdminSetUserPasswordCommand({
+            UserPoolId: config.user_pool_id,
+            Username: email,
+            Password: tempPassword,
+            Permanent: true,
+          }));
+        } catch (err) {
+          const message = err instanceof Error ? err.message : String(err);
+          const errorName = err instanceof Error ? err.name : 'Error';
+          throw new CliError(
+            `User ${email} was created but the password could not be set `
+            + `(${errorName}: ${message}). The user is now stuck in FORCE_CHANGE_PASSWORD `
+            + 'state and cannot log in. Either:\n'
+            + `  1. Delete the user and re-run: aws cognito-idp admin-delete-user --user-pool-id ${config.user_pool_id} --username ${email}\n`
+            + '  2. Or set the password manually via the AWS console once the underlying issue is fixed.',
+          );
+        }
 
         const bundle = encodeBundle(config);
         printInviteSummary(email, tempPassword, bundle);

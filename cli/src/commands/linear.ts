@@ -164,8 +164,22 @@ export async function isWebhookSecretConfigured(
     const result = await client.send(new GetSecretValueCommand({ SecretId: secretArn }));
     const value = result.SecretString;
     return typeof value === 'string' && value.startsWith('lin_wh_');
-  } catch {
-    return false;
+  } catch (err) {
+    // Only treat "secret doesn't exist yet" as a clean false — any
+    // other error (AccessDenied, KMS decrypt failure, throttling) is
+    // actionable and we should surface it. A bare `catch { return
+    // false }` here makes setup re-prompt for a webhook secret when
+    // the real problem is IAM, which is a confusing UX for operators.
+    const errorName = (err as { name?: string }).name;
+    if (errorName === 'ResourceNotFoundException') {
+      return false;
+    }
+    const message = err instanceof Error ? err.message : String(err);
+    throw new CliError(
+      `Failed to read Linear webhook secret '${secretArn}': ${errorName ?? 'Error'}: ${message}. `
+      + 'Likely IAM permission gap — confirm your CLI principal has '
+      + '`secretsmanager:GetSecretValue` on this ARN.',
+    );
   }
 }
 
