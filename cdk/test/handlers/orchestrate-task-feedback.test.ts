@@ -138,12 +138,12 @@ describe('notifyLinearOnConcurrencyCap', () => {
     }
   });
 
-  test('reportIssueFailure rejection propagates (caller must catch)', async () => {
-    // The helper itself swallows network errors internally, but we contract
-    // for callers to wrap the call defensively because durable-execution
-    // retries the entire step on throw, producing duplicate failTask +
-    // emitTaskEvent. This test asserts the rejection actually propagates so
-    // the orchestrate-task try-catch is load-bearing, not redundant.
+  test('reportIssueFailure rejection is swallowed (best-effort, never blocks rejection path)', async () => {
+    // Round-3 review B2 moved the try/catch inside this function so a
+    // synchronous throw from `reportIssueFailure` (e.g., transient DDB
+    // throttle on the registry lookup) cannot crash the durable-execution
+    // step and trigger a retry that double-emits failTask events. Contract
+    // is now: this helper never rejects.
     reportIssueFailureMock.mockRejectedValue(new Error('boom'));
     await expect(
       notifyLinearOnConcurrencyCap(task({
@@ -153,6 +153,7 @@ describe('notifyLinearOnConcurrencyCap', () => {
           linear_workspace_id: 'lin-org-1',
         },
       })),
-    ).rejects.toThrow('boom');
+    ).resolves.toBeUndefined();
+    expect(reportIssueFailureMock).toHaveBeenCalledTimes(1);
   });
 });
