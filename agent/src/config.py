@@ -104,15 +104,32 @@ def resolve_linear_api_token(channel_metadata: dict[str, str] | None = None) -> 
         try:
             expiry = datetime.fromisoformat(expires_at_iso.replace("Z", "+00:00"))
         except ValueError:
+            # Malformed timestamp: treat as expiring so the refresh path runs.
+            # Log so a bad write earlier in the chain doesn't silently trigger
+            # a refresh on every single task with no diagnostic trace.
+            log(
+                "WARN",
+                f"_is_expiring: malformed expires_at '{expires_at_iso}'; treating as expiring",
+            )
             return True
         return (expiry - datetime.now(UTC)).total_seconds() < threshold_seconds
 
-    def _refresh(current: dict) -> dict | None:
+    def _try_refresh_once(current: dict) -> tuple[str, dict | None]:
+        """Single Linear /oauth/token POST.
+
+        Returns one of:
+          - ("success", new_token_dict)
+          - ("invalid_grant", None) — Linear rejected the refresh_token,
+            usually because another caller rotated it first
+          - ("failure", None) — any other error (network, 5xx, missing
+            fields). No retry; surface upward.
+        """
         try:
+            import urllib.error
             import urllib.parse
             import urllib.request
         except ImportError:
-            return None
+            return ("failure", None)
 
         body = urllib.parse.urlencode(
             {
@@ -131,12 +148,26 @@ def resolve_linear_api_token(channel_metadata: dict[str, str] | None = None) -> 
         try:
             with urllib.request.urlopen(req, timeout=10) as resp:  # noqa: S310
                 payload = json.loads(resp.read().decode("utf-8"))
+        except urllib.error.HTTPError as e:
+            # Body may carry `{"error": "invalid_grant", ...}` even on 400.
+            try:
+                err_payload = json.loads(e.read().decode("utf-8"))
+                err_code = err_payload.get("error")
+            except Exception:
+                err_code = None
+            log(
+                "WARN",
+                f"resolve_linear_api_token refresh rejected: status={e.code} error={err_code}",
+            )
+            if err_code == "invalid_grant":
+                return ("invalid_grant", None)
+            return ("failure", None)
         except Exception as e:
             log("WARN", f"resolve_linear_api_token refresh failed: {type(e).__name__}: {e}")
-            return None
+            return ("failure", None)
 
         if "access_token" not in payload:
-            return None
+            return ("failure", None)
 
         now = datetime.now(UTC)
         # Linear's `expires_in` is documented and reliably sent; if it's
@@ -161,7 +192,68 @@ def resolve_linear_api_token(channel_metadata: dict[str, str] | None = None) -> 
         except (ClientError, BotoCoreError) as e:
             log("WARN", f"resolve_linear_api_token: failed to persist refreshed token: {e}")
             # Even without persistence the in-memory token works for THIS run.
-        return next_token
+
+        # Positive-path log so operators diagnosing intermittent 401s have
+        # a breadcrumb showing which workspace refreshed and to what expiry.
+        ws_id = next_token.get("workspace_id", "?")
+        ws_slug = next_token.get("workspace_slug", "?")
+        log(
+            "INFO",
+            f"linear_oauth_refresh_ok workspace_id={ws_id} "
+            f"workspace_slug={ws_slug} new_expires_at={expires_at_iso}",
+        )
+        return ("success", next_token)
+
+    def _refresh(current: dict) -> dict | None:
+        """Refresh with one retry on invalid_grant after re-reading the secret.
+
+        Linear rotates refresh_tokens on every use. Concurrent callers
+        (Lambda + agent + CLI) racing the same secret will see one
+        succeed and the rest get `invalid_grant`. On invalid_grant,
+        re-read SM (bypassing the just-failed token) and retry once if
+        the refresh_token actually changed.
+        """
+        kind, refreshed = _try_refresh_once(current)
+        if kind == "success":
+            return refreshed
+        if kind == "failure":
+            return None
+
+        # invalid_grant: maybe a concurrent caller refreshed first.
+        log(
+            "WARN",
+            "resolve_linear_api_token: invalid_grant — re-reading secret to check "
+            "for concurrent refresh",
+        )
+        try:
+            fresh = _fetch_token()
+        except (ClientError, BotoCoreError) as e:
+            log("WARN", f"resolve_linear_api_token: re-read after invalid_grant failed: {e}")
+            return None
+
+        if fresh.get("refresh_token") == current.get("refresh_token"):
+            # No race — Linear truly rejected this refresh_token.
+            log(
+                "ERROR",
+                "resolve_linear_api_token: refresh_token permanently rejected; re-onboard required",
+            )
+            return None
+
+        # Concurrent caller rotated the token. If the freshly-read value
+        # is itself usable, just take it.
+        if not _is_expiring(fresh.get("expires_at", "")):
+            log(
+                "INFO",
+                "resolve_linear_api_token: concurrent refresh detected; using freshly-read token",
+            )
+            return fresh
+
+        # Concurrent refresh produced a token that's also already
+        # expiring (rare). Retry once with the new refresh_token.
+        kind2, refreshed2 = _try_refresh_once(fresh)
+        if kind2 == "success":
+            return refreshed2
+        return None
 
     try:
         token_obj = _fetch_token()

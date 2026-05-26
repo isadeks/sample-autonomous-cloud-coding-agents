@@ -237,17 +237,95 @@ async function getOauthSecret(
   }
 }
 
+/**
+ * Outcome of a single Linear /oauth/token POST. Three terminal states:
+ * - `success` — refreshed token (caller persists + caches)
+ * - `invalid_grant` — Linear rejected the refresh_token, likely
+ *    because another caller rotated it first. Caller can retry once
+ *    after re-reading the secret.
+ * - `failure` — any other error (network, 5xx, missing fields). No
+ *    retry; surface null upward.
+ */
+type RefreshOutcome =
+  | { kind: 'success'; token: StoredOauthToken }
+  | { kind: 'invalid_grant' }
+  | { kind: 'failure' };
+
 async function refreshLinearToken(
   current: StoredOauthToken,
   sm: SecretsManagerClient,
   secretArn: string,
   options: ResolverOptions,
 ): Promise<StoredOauthToken | null> {
+  // First attempt with whatever refresh_token we have.
+  const first = await tryRefreshOnce(current, sm, secretArn, options);
+  if (first.kind === 'success') return first.token;
+  if (first.kind === 'failure') return null;
+
+  // `invalid_grant`: Linear rotates refresh_tokens on every use, so a
+  // concurrent Lambda may have refreshed before us. Re-read the secret
+  // from SM (bypassing cache) and retry once if the refresh_token
+  // changed. This avoids permanently bricking the workspace's token
+  // chain when two Lambdas race the same refresh.
+  logger.warn('Linear token refresh got invalid_grant — re-reading secret to check for concurrent refresh', {
+    secret_arn: secretArn,
+    workspace_id: current.workspace_id,
+  });
+
+  const fresh = await getOauthSecret(sm, secretArn);
+  if (!fresh) {
+    invalidateLinearOauthCache(current.workspace_id, secretArn);
+    return null;
+  }
+  if (fresh.refresh_token === current.refresh_token) {
+    // No race — Linear truly rejected this refresh_token. Caller needs
+    // a fresh OAuth dance.
+    logger.error('Linear token refresh permanently rejected — workspace requires re-onboarding', {
+      secret_arn: secretArn,
+      workspace_id: current.workspace_id,
+    });
+    invalidateLinearOauthCache(current.workspace_id, secretArn);
+    return null;
+  }
+
+  // Another caller rotated the token. If the freshly-read token is
+  // itself not expiring, just use it — no second refresh needed.
+  if (!isTokenExpiring(fresh.expires_at)) {
+    logger.info('Linear OAuth token was refreshed by a concurrent caller; using freshly-read value', {
+      secret_arn: secretArn,
+      workspace_id: fresh.workspace_id,
+      new_expires_at: fresh.expires_at,
+    });
+    tokenCache.set(secretArn, { value: fresh, expiresAt: Date.now() + SECRET_CACHE_TTL_MS });
+    return fresh;
+  }
+
+  // Concurrent caller refreshed but the new token is also already
+  // expiring (rare but possible if both Lambdas raced and the second
+  // got a tiny TTL). Retry refresh once with the new refresh_token.
+  const second = await tryRefreshOnce(fresh, sm, secretArn, options);
+  if (second.kind === 'success') return second.token;
+  if (second.kind === 'invalid_grant') {
+    logger.error('Linear token refresh failed even after re-reading freshly-rotated secret', {
+      secret_arn: secretArn,
+      workspace_id: fresh.workspace_id,
+    });
+  }
+  invalidateLinearOauthCache(current.workspace_id, secretArn);
+  return null;
+}
+
+async function tryRefreshOnce(
+  current: StoredOauthToken,
+  sm: SecretsManagerClient,
+  secretArn: string,
+  options: ResolverOptions,
+): Promise<RefreshOutcome> {
   if (!current.client_id || !current.client_secret) {
     logger.error('Cannot refresh Linear OAuth token: stored secret is missing client_id/client_secret', {
       secret_arn: secretArn,
     });
-    return null;
+    return { kind: 'failure' };
   }
 
   const fetchImpl = options.fetchImpl ?? fetch;
@@ -269,7 +347,13 @@ async function refreshLinearToken(
     logger.error('Linear token refresh fetch failed', {
       error: err instanceof Error ? err.message : String(err),
     });
-    return null;
+    // Network-level failure: invalidate cache so the next call
+    // re-reads from Secrets Manager instead of looping on a stale
+    // expiring token. Without this the catch returned null without
+    // invalidating, hammering Linear in a tight loop until the cache
+    // TTL expires.
+    invalidateLinearOauthCache(current.workspace_id, secretArn);
+    return { kind: 'failure' };
   }
 
   let parsed: unknown;
@@ -277,7 +361,7 @@ async function refreshLinearToken(
     parsed = await resp.json();
   } catch {
     logger.error('Linear token refresh returned non-JSON', { status: resp.status });
-    return null;
+    return { kind: 'failure' };
   }
 
   if (!resp.ok) {
@@ -287,9 +371,11 @@ async function refreshLinearToken(
       error: errObj.error,
       error_description: errObj.error_description,
     });
-    // Caller can attempt a fresh OAuth dance; we don't recover automatically.
     invalidateLinearOauthCache(current.workspace_id, secretArn);
-    return null;
+    if (errObj.error === 'invalid_grant') {
+      return { kind: 'invalid_grant' };
+    }
+    return { kind: 'failure' };
   }
 
   const tokenResp = parsed as {
@@ -300,7 +386,7 @@ async function refreshLinearToken(
   };
   if (!tokenResp.access_token || !tokenResp.expires_in) {
     logger.error('Linear token refresh response missing required fields');
-    return null;
+    return { kind: 'failure' };
   }
 
   const now = new Date();
@@ -328,14 +414,22 @@ async function refreshLinearToken(
       error: err instanceof Error ? err.message : String(err),
     });
     // Even if persistence fails, the in-memory token still works for
-    // the rest of THIS Lambda invocation. Other concurrent Lambdas may
-    // race-refresh; Linear's idempotency-on-replay grace window
-    // (30 min documented) absorbs the duplicate.
+    // THIS Lambda invocation. Other concurrent Lambdas may race-refresh
+    // and one will get invalid_grant; the re-read-and-retry path above
+    // will recover.
   }
+
+  // Positive-path log so operators diagnosing intermittent 401s have
+  // a breadcrumb showing which workspace refreshed and to what expiry.
+  logger.info('Linear OAuth token refreshed', {
+    workspace_id: next.workspace_id,
+    workspace_slug: next.workspace_slug,
+    new_expires_at: next.expires_at,
+  });
 
   // Cache the freshest value.
   tokenCache.set(secretArn, { value: next, expiresAt: Date.now() + SECRET_CACHE_TTL_MS });
-  return next;
+  return { kind: 'success', token: next };
 }
 
 /** Test-only: clear all caches. */

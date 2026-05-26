@@ -398,9 +398,25 @@ def _run_task_background(
     # one. See aws/bedrock-agentcore-sdk-python#219 for the upstream design
     # constraint that motivates this manual propagation.
     if workload_access_token:
-        from bedrock_agentcore.runtime.context import BedrockAgentCoreContext
+        # Vestigial path from the parked AgentCore Identity flow. If the
+        # `bedrock-agentcore` SDK is missing or its module structure
+        # changes, fail open: the Linear token resolver falls back to
+        # reading per-workspace Secrets Manager directly, so the agent
+        # can still proceed without this ContextVar set. Catching
+        # (ImportError, AttributeError) here keeps the pipeline alive
+        # instead of bricking the entire task with no diagnostic when
+        # the upstream SDK rearranges modules.
+        try:
+            from bedrock_agentcore.runtime.context import BedrockAgentCoreContext
 
-        BedrockAgentCoreContext.set_workload_access_token(workload_access_token)
+            BedrockAgentCoreContext.set_workload_access_token(workload_access_token)
+        except (ImportError, AttributeError) as e:
+            _warn_cw(
+                f"bedrock_agentcore workload-token bridge unavailable "
+                f"({type(e).__name__}: {e}); Linear MCP will resolve via "
+                "Secrets Manager fallback",
+                task_id=task_id,
+            )
 
     _debug_cw(
         f"_run_task_background ENTERED task_id={task_id!r} "
