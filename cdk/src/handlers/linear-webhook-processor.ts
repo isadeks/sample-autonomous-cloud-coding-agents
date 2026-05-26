@@ -24,6 +24,7 @@ import { createTaskCore } from './shared/create-task-core';
 import { reportIssueFailure } from './shared/linear-feedback';
 import { resolveLinearOauthToken } from './shared/linear-oauth-resolver';
 import { logger } from './shared/logger';
+import type { Attachment } from './shared/types';
 
 const ddb = DynamoDBDocumentClient.from(new DynamoDBClient({}));
 
@@ -262,11 +263,16 @@ export async function handler(event: ProcessorEvent): Promise<void> {
     }
   }
 
+  // Extract embedded image URLs from the issue description markdown.
+  // These become URL attachments that are fetched and screened during context hydration.
+  const attachments = extractImageUrlAttachments(issue.description);
+
   const requestId = crypto.randomUUID();
   const result = await createTaskCore(
     {
       repo,
       task_description: taskDescription,
+      ...(attachments.length > 0 && { attachments }),
     },
     {
       userId: platformUserId,
@@ -381,6 +387,35 @@ function buildTaskDescription(issue: LinearIssueEvent['data']): string {
     parts.push(issue.description.trim());
   }
   return parts.join('\n') || 'Linear issue';
+}
+
+/**
+ * Extract image URL attachments from Linear issue description markdown.
+ *
+ * Scans for standard markdown image references: `![alt](url)`.
+ * Only HTTPS URLs are included (security: no HTTP, no data: URIs).
+ * Capped at 10 images per issue to stay within attachment limits.
+ */
+function extractImageUrlAttachments(description: string | undefined): Attachment[] {
+  if (!description) return [];
+
+  const imagePattern = /!\[[^\]]*\]\((https:\/\/[^)]+)\)/g;
+  const attachments: Attachment[] = [];
+  let match: RegExpExecArray | null;
+
+  while ((match = imagePattern.exec(description)) !== null) {
+    if (attachments.length >= 10) break;
+    const url = match[1];
+    attachments.push({ type: 'url', url });
+  }
+
+  if (attachments.length > 0) {
+    logger.info('Extracted image URL attachments from Linear issue description', {
+      count: attachments.length,
+    });
+  }
+
+  return attachments;
 }
 
 async function lookupPlatformUser(workspaceId: string, userId: string): Promise<string | null> {

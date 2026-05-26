@@ -385,6 +385,7 @@ def _run_task_background(
     trace: bool = False,
     user_id: str = "",
     workload_access_token: str = "",
+    attachments: list[dict] | None = None,
 ) -> None:
     """Run the agent task in a background thread."""
     global _background_pipeline_failed
@@ -467,6 +468,7 @@ def _run_task_background(
             channel_metadata=channel_metadata,
             trace=trace,
             user_id=user_id,
+            attachments=attachments,
         )
         _background_pipeline_failed = False
     except Exception as e:
@@ -554,6 +556,7 @@ def _extract_invocation_params(inp: dict, request: Request) -> dict:
             approval_gate_cap = None
     channel_source = inp.get("channel_source", "") or ""
     channel_metadata = inp.get("channel_metadata") or {}
+    attachments = inp.get("attachments") or []
     # ``trace`` is strictly opt-in (design §10.1). Accept only real
     # booleans from the orchestrator — a string "false" would otherwise
     # flip the flag on.
@@ -626,6 +629,7 @@ def _extract_invocation_params(inp: dict, request: Request) -> dict:
         "trace": trace,
         "user_id": user_id,
         "workload_access_token": workload_access_token,
+        "attachments": attachments,
     }
 
 
