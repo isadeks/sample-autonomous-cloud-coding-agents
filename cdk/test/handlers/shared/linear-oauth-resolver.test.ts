@@ -262,4 +262,145 @@ describe('resolveLinearOauthToken', () => {
     await resolveLinearOauthToken('ws-uuid-1', REGISTRY_TABLE, clients);
     expect(clients.ddbSend.mock.calls.length).toBe(2);
   });
+
+  test('concurrent-refresh recovery: re-read finds rotated token, skip second /oauth/token POST', async () => {
+    // Setup: stored token is expiring (10s from now). First /oauth/token
+    // call returns 400 invalid_grant (a concurrent caller already
+    // rotated). Re-read of SM finds the rotated, future-dated token.
+    // Resolver should return the freshly-read access_token without
+    // a second refresh POST.
+    const expiringSoon = new Date(Date.now() + 10 * 1000).toISOString();
+    const wellInFuture = new Date(Date.now() + 12 * 3600 * 1000).toISOString();
+
+    const stale = makeStoredToken({
+      access_token: 'lin_stale',
+      refresh_token: 'rt-stale',
+      expires_at: expiringSoon,
+    });
+    const rotated = makeStoredToken({
+      access_token: 'lin_concurrent_winner',
+      refresh_token: 'rt-rotated-by-other-lambda',
+      expires_at: wellInFuture,
+    });
+
+    // First GetSecretValue returns stale; second returns rotated.
+    const smSend = jest.fn().mockImplementation((command: { constructor: { name: string } }) => {
+      const name = command.constructor.name;
+      if (name === 'GetSecretValueCommand') {
+        const callIdx = smSend.mock.calls.filter((c) => c[0].constructor.name === 'GetSecretValueCommand').length - 1;
+        return { SecretString: JSON.stringify(callIdx === 0 ? stale : rotated) };
+      }
+      return {};
+    });
+    const ddbSend = jest.fn().mockImplementation(() => ({
+      Item: { workspace_slug: 'acme', oauth_secret_arn: 'arn:secret:acme', status: 'active' },
+    }));
+
+    const fetchImpl = jest.fn().mockResolvedValueOnce({
+      ok: false,
+      status: 400,
+      json: async () => ({ error: 'invalid_grant', error_description: 'token rotated' }),
+    });
+
+    type Opts = NonNullable<Parameters<typeof resolveLinearOauthToken>[2]>;
+    const result = await resolveLinearOauthToken('ws-uuid-1', REGISTRY_TABLE, {
+      dynamoDbClient: { send: ddbSend } as unknown as Opts['dynamoDbClient'],
+      secretsManagerClient: { send: smSend } as unknown as Opts['secretsManagerClient'],
+      fetchImpl: fetchImpl as unknown as typeof fetch,
+    });
+
+    expect(result?.accessToken).toBe('lin_concurrent_winner');
+    // Exactly ONE /oauth/token POST — no second refresh call.
+    expect(fetchImpl).toHaveBeenCalledTimes(1);
+    // Two GetSecretValue calls (initial + re-read).
+    const getSecretCalls = smSend.mock.calls.filter(
+      (c) => c[0].constructor.name === 'GetSecretValueCommand',
+    );
+    expect(getSecretCalls).toHaveLength(2);
+  });
+
+  test('concurrent-refresh: invalid_grant with same refresh_token on re-read returns null (permanent rejection)', async () => {
+    const expiringSoon = new Date(Date.now() + 10 * 1000).toISOString();
+    const sameStale = makeStoredToken({
+      access_token: 'lin_stale',
+      refresh_token: 'rt-shared',
+      expires_at: expiringSoon,
+    });
+
+    const smSend = jest.fn().mockImplementation((command: { constructor: { name: string } }) => {
+      if (command.constructor.name === 'GetSecretValueCommand') {
+        return { SecretString: JSON.stringify(sameStale) };
+      }
+      return {};
+    });
+    const ddbSend = jest.fn().mockImplementation(() => ({
+      Item: { workspace_slug: 'acme', oauth_secret_arn: 'arn:secret:acme', status: 'active' },
+    }));
+
+    const fetchImpl = jest.fn().mockResolvedValueOnce({
+      ok: false,
+      status: 400,
+      json: async () => ({ error: 'invalid_grant' }),
+    });
+
+    type Opts = NonNullable<Parameters<typeof resolveLinearOauthToken>[2]>;
+    const result = await resolveLinearOauthToken('ws-uuid-1', REGISTRY_TABLE, {
+      dynamoDbClient: { send: ddbSend } as unknown as Opts['dynamoDbClient'],
+      secretsManagerClient: { send: smSend } as unknown as Opts['secretsManagerClient'],
+      fetchImpl: fetchImpl as unknown as typeof fetch,
+    });
+
+    expect(result).toBeNull();
+    // No second /oauth/token POST — once we know the refresh_token
+    // is permanently rejected, we don't retry against the same token.
+    expect(fetchImpl).toHaveBeenCalledTimes(1);
+  });
+
+  test('cache invalidation on network failure: next call re-reads SM instead of looping on stale token', async () => {
+    const expiringSoon = new Date(Date.now() + 10 * 1000).toISOString();
+    const stale = makeStoredToken({ expires_at: expiringSoon });
+    const clients = makeFakeClients({
+      registryItem: {
+        workspace_slug: 'acme',
+        oauth_secret_arn: 'arn:secret:acme',
+        status: 'active',
+      },
+      storedToken: stale,
+    });
+
+    // First refresh: fetch throws (network failure).
+    const fetchImpl = jest.fn().mockRejectedValueOnce(new Error('ECONNRESET'));
+
+    const first = await resolveLinearOauthToken('ws-uuid-1', REGISTRY_TABLE, {
+      ...clients,
+      fetchImpl: fetchImpl as unknown as typeof fetch,
+    });
+    expect(first).toBeNull();
+
+    // After the failure the cache should be invalidated. Verify by
+    // checking the second call goes back to SM (not a cached stale
+    // token). We use a fresh fetchImpl on the retry so it can succeed.
+    const fetchImpl2 = jest.fn().mockResolvedValueOnce({
+      ok: true,
+      status: 200,
+      json: async () => ({
+        access_token: 'lin_after_retry',
+        refresh_token: 'rt-new',
+        expires_in: 86400,
+      }),
+    });
+
+    const second = await resolveLinearOauthToken('ws-uuid-1', REGISTRY_TABLE, {
+      ...clients,
+      fetchImpl: fetchImpl2 as unknown as typeof fetch,
+    });
+    expect(second?.accessToken).toBe('lin_after_retry');
+    // The second call had to re-fetch from SM (token cache was cleared
+    // by the previous failure). Counting GetSecretValueCommand calls:
+    // first call = 1, second call after invalidation = 1 more = 2 total.
+    const getSecretCalls = clients.smSend.mock.calls.filter(
+      (c) => c[0].constructor.name === 'GetSecretValueCommand',
+    );
+    expect(getSecretCalls.length).toBeGreaterThanOrEqual(2);
+  });
 });

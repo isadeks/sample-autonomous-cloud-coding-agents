@@ -706,12 +706,21 @@ export class AgentStack extends Stack {
     // token directly from Secrets Manager. The CLI (`bgagent linear setup`)
     // creates `bgagent-linear-oauth-<slug>` secrets at install time;
     // the secret JSON contains access_token, refresh_token, expires_at,
-    // and the OAuth client_id/client_secret needed for in-place refresh.
-    // The orchestrator passes `linear_oauth_secret_arn` to the agent via
-    // task.channel_metadata, so the agent looks up the exact ARN — no
-    // discovery needed at runtime.
+    // and the OAuth client_id/client_secret. The orchestrator passes
+    // `linear_oauth_secret_arn` to the agent via task.channel_metadata,
+    // so the agent looks up the exact ARN — no discovery needed.
+    //
+    // Agent has GetSecretValue ONLY — no Put. Review item S1: agent
+    // runtime executes untrusted repo code, so write access to all
+    // workspace tokens is too broad a blast radius (a compromised
+    // agent could overwrite any workspace's token). Lambdas (trusted
+    // code in this stack) handle the in-place refresh path; the agent
+    // proceeds with whatever token Lambdas have most-recently written.
+    // For a 24h Linear access-token TTL, the practical impact is that
+    // a stale token in the cache forces the agent's next call to fail
+    // closed — preferable to a trust gap.
     runtime.role.addToPrincipalPolicy(new iam.PolicyStatement({
-      actions: ['secretsmanager:GetSecretValue', 'secretsmanager:PutSecretValue'],
+      actions: ['secretsmanager:GetSecretValue'],
       resources: [
         Stack.of(this).formatArn({
           service: 'secretsmanager',

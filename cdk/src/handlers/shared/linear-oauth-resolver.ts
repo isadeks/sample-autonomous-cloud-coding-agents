@@ -54,11 +54,16 @@ const SECRET_CACHE_TTL_MS = 60_000;
 /** Refresh threshold: refresh tokens with <60s remaining. */
 const REFRESH_THRESHOLD_SECONDS = 60;
 
+/** Registry row status values. Anything else (missing, unknown
+ *  string) is treated as `revoked` so a corrupt or partially-written
+ *  row blocks resolution rather than silently granting access. */
+type RegistryRowStatus = 'active' | 'revoked';
+
 interface RegistryRow {
   readonly linear_workspace_id: string;
   readonly workspace_slug: string;
   readonly oauth_secret_arn: string;
-  readonly status: string;
+  readonly status: RegistryRowStatus;
 }
 
 export interface StoredOauthToken {
@@ -201,18 +206,49 @@ async function getRegistryRow(
   const cached = registryCache.get(linearWorkspaceId);
   if (cached && cached.expiresAt > Date.now()) return cached.value;
 
-  const result = await ddb.send(new GetCommand({
-    TableName: tableName,
-    Key: { linear_workspace_id: linearWorkspaceId },
-  }));
+  // Wrap the DDB call so a transient throttle during a webhook burst
+  // doesn't crash the Lambda invocation (which would trigger SQS
+  // retries on the upstream webhook). Returning null here lets the
+  // caller fall back cleanly — the resolver layer treats this as
+  // "workspace not in registry" which is the correct user-visible
+  // behaviour for a transient error.
+  let result;
+  try {
+    result = await ddb.send(new GetCommand({
+      TableName: tableName,
+      Key: { linear_workspace_id: linearWorkspaceId },
+    }));
+  } catch (err) {
+    logger.error('Failed to fetch Linear workspace registry row', {
+      table_name: tableName,
+      linear_workspace_id: linearWorkspaceId,
+      error: err instanceof Error ? err.message : String(err),
+    });
+    return null;
+  }
+
   const item = result.Item as Partial<RegistryRow> | undefined;
   if (!item || !item.oauth_secret_arn || !item.workspace_slug) return null;
+
+  // Fail-closed on the status field: missing or unknown values are
+  // treated as `revoked`, NOT `active`. A partially-written row
+  // (e.g. a half-finished `bgagent linear setup`) shouldn't grant
+  // access just because the status column is empty. Operators must
+  // explicitly write `status: active` to enable a workspace.
+  const rawStatus = item.status as string | undefined;
+  const status: RegistryRowStatus = rawStatus === 'active' ? 'active' : 'revoked';
+  if (rawStatus !== 'active' && rawStatus !== 'revoked' && rawStatus !== undefined) {
+    logger.warn('Linear workspace registry row has unknown status — treating as revoked', {
+      linear_workspace_id: linearWorkspaceId,
+      raw_status: rawStatus,
+    });
+  }
 
   const row: RegistryRow = {
     linear_workspace_id: linearWorkspaceId,
     workspace_slug: item.workspace_slug,
     oauth_secret_arn: item.oauth_secret_arn,
-    status: item.status ?? 'active',
+    status,
   };
   registryCache.set(linearWorkspaceId, { value: row, expiresAt: Date.now() + REGISTRY_CACHE_TTL_MS });
   return row;
