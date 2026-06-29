@@ -1,3 +1,5 @@
+> 🤖 This repository has been dogfood-tested via ABCA orchestration (autonomous background coding agent, June 2026).
+
 <div align="center">
   <h1>ABCA</h1>
   <img alt="ABCA" width="350" src="docs/imgs/ABCA.png" />
