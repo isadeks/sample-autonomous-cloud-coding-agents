@@ -140,6 +140,10 @@ A documentation site is available containing all design documents, roadmap and g
 
 The example provided in this repository is for experimental and educational purposes only. It demonstrates concepts and techniques but is not intended for direct use in production environments.
 
+## Dogfood
+
+This repository is continuously exercised by ABCA itself. Coding tasks are submitted against this repo, and the resulting pull requests serve as live validation that the platform works end-to-end. Changes to the agent runtime, orchestrator, and CDK infrastructure are regularly tested this way before wider rollout.
+
 ## License
 
 This library is licensed under the MIT-0 License. See the [LICENSE](./LICENSE) file.
