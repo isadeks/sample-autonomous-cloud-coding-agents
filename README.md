@@ -1,4 +1,5 @@
 > 🤖 This repository has been dogfood-tested via ABCA orchestration (autonomous background coding agent, June 2026).
+> Build verified via mise (compile + typecheck).
 
 <div align="center">
   <h1>ABCA</h1>
