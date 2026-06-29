@@ -35,6 +35,7 @@ Key characteristics:
 - **Outcome-measurable** — the PR is either merged, revised, or rejected
 - **Fire and forget** — submit, forget, review the outcome
 - **Learns over time** — the more you use it, the more it self-improves
+- **Dogfood-tested** — this repo was built and tested via ABCA orchestration
 
 ## How it works
 
