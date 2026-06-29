@@ -17,6 +17,8 @@
   <br />
 </div>
 
+> 🤖 This repository has been dogfood-tested via ABCA — tasks on this repo are submitted to and executed by ABCA itself.
+
 ## What is ABCA
 
 **ABCA (Autonomous Background Coding Agents on AWS)** is a sample of what a self-hosted background coding agents platform might look like on AWS. Users can create background coding agents, then submit coding tasks to them and the agents work autonomously in the cloud — cloning repos, writing code, running tests, and opening pull requests for review. No human interaction during execution.
