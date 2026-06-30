@@ -1,3 +1,4 @@
+<!-- Smoke test for #502 ECS payload fix -->
 <div align="center">
   <h1>ABCA</h1>
   <img alt="ABCA" width="350" src="docs/imgs/ABCA.png" />
