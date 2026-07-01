@@ -83,13 +83,14 @@ function workingLivenessSuffix(
  * ``@bgagent`` comment that EDITS IN PLACE through these states instead of
  * posting ~5 separate top-level comments per round. Mirrors the #247 epic panel.
  *
- *  - ``on_it``    — posted synchronously at trigger time (kills the silence).
- *  - ``working``  — the agent opened/updated the PR (pr_created milestone).
- *  - ``updated``  — terminal success WITH a commit → the ✅ + cost + total.
- *  - ``answered`` — terminal success, NO commit (a question) → 💬 + the answer.
- *  - ``failed``   — terminal failure.
+ *  - ``on_it``      — posted synchronously at trigger time (kills the silence).
+ *  - ``working``    — the agent opened/updated the PR (pr_created milestone).
+ *  - ``updated``    — terminal success WITH a commit → the ✅ + cost + total.
+ *  - ``answered``   — terminal success, NO commit (a question) → 💬 + the answer.
+ *  - ``failed``     — terminal failure.
+ *  - ``cancelled``  — user-cancelled while the task was in flight → 🚫.
  */
-export type IterationState = 'on_it' | 'working' | 'updated' | 'answered' | 'failed';
+export type IterationState = 'on_it' | 'working' | 'updated' | 'answered' | 'failed' | 'cancelled';
 
 export interface MaturingReplyInput {
   readonly state: IterationState;
@@ -130,6 +131,12 @@ export interface MaturingReplyInput {
    * working line when present. Caller MUST pre-sanitize (it's agent-derived).
    */
   readonly progressNote?: string;
+  /**
+   * Task id — surfaced in the ``working`` state's cancel hint so a user can
+   * issue ``bgagent cancel <taskId>`` directly from Linear without leaving the
+   * issue. Optional; when absent the hint is omitted.
+   */
+  readonly taskId?: string | null;
 }
 
 /**
@@ -189,7 +196,13 @@ export function renderMaturingReply(input: MaturingReplyInput): string {
       // first ack reads clean.
       const base = prRef ? `🔄 Working — updating ${prRef}…` : '🔄 Working…';
       const live = workingLivenessSuffix(input.elapsedS, input.progressNote);
-      return live ? `${base}\n${live}` : base;
+      // Cancel affordance: show how to cancel so the user doesn't feel stuck.
+      // Only shown when a task id is available (iteration tasks always carry one).
+      const cancelHint = input.taskId
+        ? `_To cancel: \`@bgagent cancel\` or \`bgagent cancel ${input.taskId}\`_`
+        : '';
+      const parts = [base, live, cancelHint].filter(Boolean);
+      return parts.length > 1 ? `${parts[0]}\n${parts.slice(1).join('\n')}` : parts[0];
     }
     case 'updated': {
       const head = prRef ? `✅ Updated — ${prRef}.` : '✅ Updated.';
@@ -208,6 +221,10 @@ export function renderMaturingReply(input: MaturingReplyInput): string {
     case 'failed': {
       const reason = (input.failureReason ?? '').trim();
       const head = reason ? `❌ ${truncate(reason, MAX_ANSWER_CHARS)}` : '❌ The iteration failed.';
+      return meta ? `${head}\n${meta}` : head;
+    }
+    case 'cancelled': {
+      const head = '🚫 Cancelled.';
       return meta ? `${head}\n${meta}` : head;
     }
   }

@@ -20,6 +20,7 @@
 import * as crypto from 'crypto';
 import { DynamoDBClient } from '@aws-sdk/client-dynamodb';
 import { DynamoDBDocumentClient, GetCommand } from '@aws-sdk/lib-dynamodb';
+import { cancelTaskCore } from './shared/cancel-task-core';
 import { createTaskCore } from './shared/create-task-core';
 import { renderMaturingReply } from './shared/iteration-reply';
 import {
@@ -40,7 +41,7 @@ import { resolveLinearOauthToken } from './shared/linear-oauth-resolver';
 import { fetchIssueParentId, type SubIssueNode } from './shared/linear-subissue-fetch';
 import { resolveTaskByLinearIssue, prNumberFromTask } from './shared/linear-task-by-issue';
 import { logger } from './shared/logger';
-import { buildIterationInstruction, parseCommentTrigger, parsePlanVerdict, type CommentTrigger } from './shared/orchestration-comment-trigger';
+import { buildIterationInstruction, isCancelIntent, parseCommentTrigger, parsePlanVerdict, type CommentTrigger } from './shared/orchestration-comment-trigger';
 import { readProjectCaps } from './shared/orchestration-decomposition-caps';
 import {
   runDecompositionProposal,
@@ -930,6 +931,24 @@ async function handleCommentTrigger(payload: LinearCommentEvent): Promise<void> 
   // actual comment the human wrote (reactions work at any thread depth).
   const replyTargetId = payload.data.parentId ?? commentId;
 
+  // Cancel affordance: ``@bgagent cancel`` (or ``stop``/``abort``) stops the
+  // currently-running task for this issue from Linear, without needing the CLI.
+  // Checked BEFORE the A6 / Mode-B routing so the intent is never misrouted as
+  // a normal edit instruction. The Linear comment author is used as the cancel
+  // actor (same workspace platform user). Best-effort; failures are logged and
+  // do not surface as error comments (the cancel attempt itself is a no-op if
+  // the task already finished).
+  if (isCancelIntent(trigger.instruction)) {
+    await handleCancelIntent({
+      commentedIssueId: commentedIssueId,
+      commentId,
+      replyTargetId,
+      workspaceId,
+      registryTableName: WORKSPACE_REGISTRY_TABLE,
+    });
+    return;
+  }
+
   // #299 Mode B: an ``@bgagent approve``/``reject`` on a parent that has a
   // PENDING plan (proposed but not yet executed). This is checked BEFORE the
   // A6 routing because at this point NO orchestration is seeded yet — the
@@ -1257,6 +1276,83 @@ async function iterateOrchestrationChild(args: {
       error: err instanceof Error ? err.message : String(err),
     });
   }
+}
+
+/**
+ * Handle ``@bgagent cancel`` (or ``stop``/``abort``) — the in-Linear cancel
+ * affordance. Resolves the issue's latest ABCA task via the GSI, cancels it
+ * via {@link cancelTaskCore}, and replies with a confirmation (or a brief
+ * explanation when the task was already terminal).
+ *
+ * Best-effort: any failure is logged without surfacing an error comment —
+ * a cancel intent that errors is less bad than a confusing ❌ comment.
+ */
+async function handleCancelIntent(args: {
+  commentedIssueId: string;
+  commentId: string;
+  replyTargetId: string;
+  workspaceId: string;
+  registryTableName: string | undefined;
+}): Promise<void> {
+  const { commentedIssueId, commentId, replyTargetId, workspaceId, registryTableName } = args;
+
+  if (!registryTableName) {
+    logger.info('@bgagent cancel: WORKSPACE_REGISTRY_TABLE not set — skipping', {
+      linear_issue_id: commentedIssueId,
+    });
+    return;
+  }
+
+  const feedbackCtx = { linearWorkspaceId: workspaceId, registryTableName };
+
+  // ACK immediately so the user sees we received the cancel request.
+  await reactToComment(feedbackCtx, commentId, EMOJI_STARTED);
+
+  const taskTableName = process.env.TASK_TABLE_NAME;
+  if (!taskTableName) {
+    logger.warn('@bgagent cancel: TASK_TABLE_NAME not set', { linear_issue_id: commentedIssueId });
+    return;
+  }
+
+  // Find the latest ABCA task for this issue.
+  const task = await resolveTaskByLinearIssue(ddb, taskTableName, commentedIssueId);
+  if (!task) {
+    logger.info('@bgagent cancel: issue has no ABCA task — ignoring', { linear_issue_id: commentedIssueId });
+    await replyToComment(
+      feedbackCtx, commentedIssueId, replyTargetId,
+      "🚫 I couldn't find an active ABCA task for this issue. Nothing to cancel.",
+    );
+    return;
+  }
+
+  const outcome = await cancelTaskCore(task.task_id, `linear:${workspaceId}`);
+
+  let replyBody: string;
+  switch (outcome.kind) {
+    case 'cancelled':
+      replyBody = `🚫 Cancelled task \`${task.task_id}\`. The running session has been stopped.`;
+      logger.info('@bgagent cancel: task cancelled', {
+        task_id: task.task_id,
+        linear_issue_id: commentedIssueId,
+      });
+      break;
+    case 'already_terminal':
+      replyBody = `🚫 Task \`${task.task_id}\` is already in a terminal state (\`${outcome.status}\`) — nothing to cancel.`;
+      break;
+    case 'not_found':
+      replyBody = `🚫 Task \`${task.task_id}\` not found — it may have been cleaned up already.`;
+      break;
+    case 'error':
+      logger.warn('@bgagent cancel: cancelTaskCore error', {
+        task_id: task.task_id,
+        linear_issue_id: commentedIssueId,
+        error: outcome.message,
+      });
+      // Don't surface the raw error to the user — just log and return.
+      return;
+  }
+
+  await replyToComment(feedbackCtx, commentedIssueId, replyTargetId, replyBody);
 }
 
 /**

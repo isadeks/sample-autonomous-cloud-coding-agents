@@ -1055,6 +1055,9 @@ async function dispatchToLinear(event: FanOutEvent): Promise<void> {
         renderMaturingReply({
           state: 'working',
           ...(typeof task.pr_number === 'number' && { prNumber: task.pr_number }),
+          // Cancel affordance: include task id so the Linear working reply shows
+          // how to cancel if the run takes too long.
+          taskId: task.task_id,
         }),
         iterationReplyId,
       );
@@ -1222,6 +1225,7 @@ async function replyToStandaloneTrigger(
   // whose build is red is NOT a clean ack — it gets the failure reply
   // (consistent with the reconciler's success gate).
   const completed = event.event_type === 'task_completed';
+  const cancelled = event.event_type === 'task_cancelled';
   const succeeded = completed && task.build_passed !== false;
   const prNumber = typeof task.pr_number === 'number'
     ? task.pr_number
@@ -1250,13 +1254,14 @@ async function replyToStandaloneTrigger(
 
   // Build the maturing-reply terminal state. A6/#299: code_changed===false (a
   // question) → 💬 answered; else ✅ updated. A failure → ❌ with the sanitized
-  // reason. Cost / running total / screenshot fold into the one reply.
-  let state: 'updated' | 'answered' | 'failed';
-  if (!succeeded) state = 'failed';
+  // reason. Cancelled → 🚫.
+  let state: 'updated' | 'answered' | 'failed' | 'cancelled';
+  if (cancelled) state = 'cancelled';
+  else if (!succeeded) state = 'failed';
   else if (task.code_changed === false) state = 'answered';
   else state = 'updated';
 
-  const body = state === 'failed'
+  const body = (state === 'failed')
     ? renderFailureReply({
       status: completed ? TaskStatus.COMPLETED : TaskStatus.FAILED,
       buildPassed: typeof task.build_passed === 'boolean' ? task.build_passed : null,
@@ -1287,12 +1292,15 @@ async function replyToStandaloneTrigger(
   // `[preview]` link onto the freshly-rendered terminal body so they converge.
   await upsertThreadedReply(replyCtx, issueId, triggerCommentId, body, existingReplyId, { preservePreview: true });
 
-  // Swap the TRIGGER comment's 👀 → ✅ / 💬 / ❌ so the human's comment reads
+  // Swap the TRIGGER comment's 👀 → ✅ / 💬 / ❌ / 🚫 so the human's comment reads
   // "done" at a glance, not just the threaded reply. The orchestration path does
   // this in the reconciler (UX.21); the standalone path was missing it, leaving a
   // stale 👀 on every plain-issue iteration forever. Best-effort + idempotent
   // (the ack_replied_at claim above gates this to once; the swap re-converges).
-  const reaction = state === 'failed' ? EMOJI_FAILURE : (state === 'answered' ? EMOJI_NEEDS_INPUT : EMOJI_SUCCESS);
+  const EMOJI_CANCELLED = '🚫';
+  const reaction = state === 'failed' ? EMOJI_FAILURE
+    : state === 'cancelled' ? EMOJI_CANCELLED
+      : (state === 'answered' ? EMOJI_NEEDS_INPUT : EMOJI_SUCCESS);
   await swapCommentReaction(replyCtx, triggerCommentId, reaction);
 }
 

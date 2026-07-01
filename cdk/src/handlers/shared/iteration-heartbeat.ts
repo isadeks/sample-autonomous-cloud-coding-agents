@@ -128,6 +128,9 @@ export function planHeartbeat(task: HeartbeatTaskView, nowMs: number): Heartbeat
     ...(task.prUrl != null && { prUrl: task.prUrl }),
     elapsedS,
     ...(task.latestProgressNote ? { progressNote: task.latestProgressNote } : {}),
+    // Cancel affordance: surface the task id so the user can @bgagent cancel
+    // or run `bgagent cancel <taskId>` directly from Linear.
+    taskId: task.taskId,
   });
 
   return {
