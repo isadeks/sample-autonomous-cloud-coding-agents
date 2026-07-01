@@ -79,6 +79,35 @@ export function parseCommentTrigger(body: string | undefined | null): CommentTri
 }
 
 /**
+ * Detect whether a parsed comment instruction is a cancel intent.
+ *
+ * A comment such as ``@bgagent cancel`` (or ``@bgagent stop``, ``@bgagent abort``)
+ * is the in-Linear affordance for stopping a running task. The instruction is
+ * the already-stripped-and-trimmed text from {@link parseCommentTrigger}.
+ *
+ * Deliberately narrow — only the first word is tested so a genuine edit request
+ * like ``@bgagent cancel the login button and replace it with a link`` is NOT
+ * treated as a cancellation. A single-word instruction is unambiguous.
+ */
+const CANCEL_WORDS = ['cancel', 'stop', 'abort'] as const;
+
+/**
+ * True when the already-parsed instruction (from {@link parseCommentTrigger})
+ * is a cancel intent (``cancel`` / ``stop`` / ``abort`` as the SOLE word, or the
+ * phrase starts with one of those words followed only by whitespace). Pure.
+ */
+export function isCancelIntent(instruction: string): boolean {
+  if (!instruction) return false;
+  const first = instruction.trim().toLowerCase().split(/\s+/)[0];
+  const rest = instruction.trim().slice(first.length).trim();
+  // Only treat it as a cancel if the remaining text (after the cancel word)
+  // is empty or looks like a task id (letters/digits/hyphens only) — so
+  // "cancel the login modal" stays a normal edit instruction.
+  const restIsIdOrEmpty = rest === '' || /^[A-Za-z0-9_-]+$/.test(rest);
+  return (CANCEL_WORDS as ReadonlyArray<string>).includes(first) && restIsIdOrEmpty;
+}
+
+/**
  * Markers that begin a comment the BOT itself rendered (panel, acks,
  * disambiguation reply, agent progress). A comment starting with any of these
  * is never a human instruction — used to break self-trigger loops (#247 UX.20).
@@ -95,6 +124,7 @@ const BOT_COMMENT_PREFIXES = [
   '🗂️', // #299 Mode B plan-proposal / decomposition notes (embed literal "@bgagent approve")
   '💬', // maturing-reply "answered" state (a no-change/question iteration)
   '👀', // instant "on it" ack reply (posted at trigger time)
+  '🚫', // cancel confirmation reply / cancelled maturing-reply state
 ] as const;
 
 /** True when ``body`` is one of the bot's own rendered comments (loop guard). */

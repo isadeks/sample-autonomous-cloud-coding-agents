@@ -20,6 +20,7 @@
 import {
   buildIterationInstruction,
   isBotAuthoredComment,
+  isCancelIntent,
   parseCommentTrigger,
 } from '../../../src/handlers/shared/orchestration-comment-trigger';
 
@@ -121,5 +122,49 @@ describe('buildIterationInstruction', () => {
   test('falls back to a generic directive for a bare mention', () => {
     expect(buildIterationInstruction({ triggered: true, instruction: '' }))
       .toMatch(/latest review feedback/i);
+  });
+});
+
+describe('isCancelIntent — cancel affordance (#488)', () => {
+  test('bare "cancel" → true', () => {
+    expect(isCancelIntent('cancel')).toBe(true);
+  });
+
+  test('"stop" → true', () => {
+    expect(isCancelIntent('stop')).toBe(true);
+  });
+
+  test('"abort" → true', () => {
+    expect(isCancelIntent('abort')).toBe(true);
+  });
+
+  test('case-insensitive', () => {
+    expect(isCancelIntent('Cancel')).toBe(true);
+    expect(isCancelIntent('STOP')).toBe(true);
+    expect(isCancelIntent('ABORT')).toBe(true);
+  });
+
+  test('"cancel" followed by a task id → true (cancel the task this user named)', () => {
+    expect(isCancelIntent('cancel 01KXYZ123ABC')).toBe(true);
+  });
+
+  test('empty string → false', () => {
+    expect(isCancelIntent('')).toBe(false);
+  });
+
+  test('"cancel the login button" → false (genuine edit instruction)', () => {
+    expect(isCancelIntent('cancel the login button')).toBe(false);
+  });
+
+  test('"stop the animation" → false', () => {
+    expect(isCancelIntent('stop the animation')).toBe(false);
+  });
+
+  test('"abort mission update the config" → false', () => {
+    expect(isCancelIntent('abort mission update the config')).toBe(false);
+  });
+
+  test('"please cancel" → false (leading word prevents single-word match)', () => {
+    expect(isCancelIntent('please cancel')).toBe(false);
   });
 });

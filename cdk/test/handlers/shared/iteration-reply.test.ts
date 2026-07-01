@@ -143,6 +143,48 @@ describe('renderMaturingReply — the edit-in-place states', () => {
     expect(renderMaturingReply({ state: 'on_it', costUsd: 1 })).not.toContain('$');
     expect(renderMaturingReply({ state: 'working', costUsd: 1, prNumber: 2 })).not.toContain('$');
   });
+
+  describe('cancel affordance on working state (#488)', () => {
+    test('working with taskId → includes cancel hint', () => {
+      const r = renderMaturingReply({ state: 'working', prNumber: 293, taskId: '01KXYZ123' });
+      expect(r).toContain('🔄 Working — updating PR #293…');
+      expect(r).toContain('`@bgagent cancel`');
+      expect(r).toContain('`bgagent cancel 01KXYZ123`');
+    });
+
+    test('working without taskId → no cancel hint', () => {
+      const r = renderMaturingReply({ state: 'working', prNumber: 293 });
+      expect(r).not.toContain('@bgagent cancel');
+      expect(r).not.toContain('bgagent cancel');
+    });
+
+    test('cancel hint appears with liveness suffix when both are present', () => {
+      const r = renderMaturingReply({
+        state: 'working', prNumber: 7, elapsedS: 300, taskId: '01KXYZ123',
+      });
+      expect(r).toContain('🔄 Working — updating PR #7…');
+      expect(r).toContain('_5m elapsed_');
+      expect(r).toContain('`@bgagent cancel`');
+    });
+
+    test('on_it state never includes cancel hint (no task id known yet)', () => {
+      expect(renderMaturingReply({ state: 'on_it', taskId: '01KXYZ123' }))
+        .toBe('👀 On it — reading the PR…');
+    });
+  });
+
+  describe('cancelled state (#488)', () => {
+    test('cancelled → 🚫 Cancelled.', () => {
+      expect(renderMaturingReply({ state: 'cancelled' })).toBe('🚫 Cancelled.');
+    });
+
+    test('cancelled with cost metadata → includes metadata line', () => {
+      const r = renderMaturingReply({ state: 'cancelled', costUsd: 0.12, durationS: 45 });
+      expect(r).toContain('🚫 Cancelled.');
+      expect(r).toContain('$0.12');
+      expect(r).toContain('45s');
+    });
+  });
 });
 
 describe('renderIterationSuccessReply — changed (a real edit)', () => {

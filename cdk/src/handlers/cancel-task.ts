@@ -17,27 +17,19 @@
  *  SOFTWARE.
  */
 
-import { BedrockAgentCoreClient, StopRuntimeSessionCommand } from '@aws-sdk/client-bedrock-agentcore';
 import { DynamoDBClient } from '@aws-sdk/client-dynamodb';
-import { ECSClient, StopTaskCommand } from '@aws-sdk/client-ecs';
-import { DynamoDBDocumentClient, GetCommand, PutCommand, UpdateCommand } from '@aws-sdk/lib-dynamodb';
+import { DynamoDBDocumentClient, GetCommand } from '@aws-sdk/lib-dynamodb';
 import type { APIGatewayProxyEvent, APIGatewayProxyResult } from 'aws-lambda';
 import { ulid } from 'ulid';
-import { TaskStatus, TERMINAL_STATUSES } from '../constructs/task-status';
+import { TERMINAL_STATUSES } from '../constructs/task-status';
+import { cancelTaskCore } from './shared/cancel-task-core';
 import { extractUserId } from './shared/gateway';
 import { logger } from './shared/logger';
 import { ErrorCode, errorResponse, successResponse } from './shared/response';
 import type { TaskRecord } from './shared/types';
-import { computeTtlEpoch } from './shared/validation';
 
 const ddb = DynamoDBDocumentClient.from(new DynamoDBClient({}));
-const agentCoreClient = new BedrockAgentCoreClient({});
-const ecsClient = new ECSClient({});
 const TABLE_NAME = process.env.TASK_TABLE_NAME!;
-const EVENTS_TABLE_NAME = process.env.TASK_EVENTS_TABLE_NAME!;
-const TASK_RETENTION_DAYS = Number(process.env.TASK_RETENTION_DAYS ?? '90');
-const RUNTIME_ARN = process.env.RUNTIME_ARN;
-const ECS_CLUSTER_ARN = process.env.ECS_CLUSTER_ARN;
 
 /**
  * DELETE /v1/tasks/{task_id} — Cancel a task.
@@ -74,146 +66,32 @@ export async function handler(event: APIGatewayProxyEvent): Promise<APIGatewayPr
       return errorResponse(403, ErrorCode.FORBIDDEN, 'You do not have access to this task.', requestId);
     }
 
-    // 5. Check if already terminal
+    // 5. Check if already terminal (fast path — avoids the full cancelTaskCore load)
     if (TERMINAL_STATUSES.includes(record.status)) {
       return errorResponse(409, ErrorCode.TASK_ALREADY_TERMINAL, `Task ${taskId} is already in terminal state ${record.status}.`, requestId);
     }
 
-    const wasRunning = record.status === TaskStatus.RUNNING;
-    const runtimeSessionId = record.session_id;
-    // Prefer the ARN recorded on the task record (agent container writes
-    // this when the session starts). Fall back to the stack's single
-    // runtime ARN for the pre-session window — the task was admitted but
-    // the container hasn't written its session info yet.
-    const agentRuntimeArn = record.agent_runtime_arn ?? RUNTIME_ARN;
-
-    // 6. Update task to CANCELLED with condition to prevent race
-    const now = new Date().toISOString();
-    try {
-      await ddb.send(new UpdateCommand({
-        TableName: TABLE_NAME,
-        Key: { task_id: taskId },
-        UpdateExpression: 'SET #status = :cancelled, updated_at = :now, completed_at = :now, status_created_at = :sca, #ttl = :ttl',
-        ConditionExpression: 'attribute_exists(task_id) AND NOT #status IN (:s1, :s2, :s3, :s4)',
-        ExpressionAttributeNames: { '#status': 'status', '#ttl': 'ttl' },
-        ExpressionAttributeValues: {
-          ':cancelled': TaskStatus.CANCELLED,
-          ':now': now,
-          ':sca': `${TaskStatus.CANCELLED}#${now}`,
-          ':s1': TaskStatus.COMPLETED,
-          ':s2': TaskStatus.FAILED,
-          ':s3': TaskStatus.CANCELLED,
-          ':s4': TaskStatus.TIMED_OUT,
-          ':ttl': computeTtlEpoch(TASK_RETENTION_DAYS),
-        },
-      }));
-    } catch (condErr: any) {
-      if (condErr.name === 'ConditionalCheckFailedException') {
-        return errorResponse(409, ErrorCode.TASK_ALREADY_TERMINAL, `Task ${taskId} transitioned to a terminal state.`, requestId);
-      }
-      throw condErr;
+    // 6. Cancel via shared core (DDB flip + compute stop + event emit).
+    // Pass the pre-loaded record to avoid a redundant GetCommand.
+    const outcome = await cancelTaskCore(taskId, userId, record);
+    if (outcome.kind === 'not_found') {
+      // Race: task was evicted between step 3 and the cancel update.
+      return errorResponse(404, ErrorCode.TASK_NOT_FOUND, `Task ${taskId} not found.`, requestId);
     }
-
-    // 6b. Stop the compute session so the container winds down (best-effort)
-    if (wasRunning && runtimeSessionId) {
-      const computeType = record.compute_type;
-      if (computeType === 'ecs') {
-        // ECS-backed task — stop the Fargate task
-        const clusterArn = record.compute_metadata?.clusterArn ?? ECS_CLUSTER_ARN;
-        const taskArn = record.compute_metadata?.taskArn;
-        if (clusterArn && taskArn) {
-          try {
-            await ecsClient.send(new StopTaskCommand({
-              cluster: clusterArn,
-              task: taskArn,
-              reason: 'Cancelled by user',
-            }));
-            logger.info('ECS StopTask invoked after cancel', { task_id: taskId, ecs_task_arn: taskArn, request_id: requestId });
-          } catch (stopErr) {
-            logger.warn('ECS StopTask failed after cancel (task may already be stopped)', {
-              task_id: taskId,
-              request_id: requestId,
-              error: stopErr instanceof Error ? stopErr.message : String(stopErr),
-            });
-          }
-        } else {
-          logger.warn('ECS task cancel skipped: missing clusterArn or taskArn in compute_metadata', {
-            task_id: taskId,
-            request_id: requestId,
-            has_cluster: !!clusterArn,
-            has_task: !!taskArn,
-          });
-        }
-      } else if (agentRuntimeArn) {
-        // AgentCore-backed task (default)
-        try {
-          await agentCoreClient.send(new StopRuntimeSessionCommand({
-            runtimeSessionId: runtimeSessionId,
-            agentRuntimeArn: agentRuntimeArn,
-          }));
-          logger.info('StopRuntimeSession invoked after cancel', { task_id: taskId, request_id: requestId });
-        } catch (stopErr) {
-          logger.warn('StopRuntimeSession failed after cancel (session may already be gone)', {
-            task_id: taskId,
-            request_id: requestId,
-            error: stopErr instanceof Error ? stopErr.message : String(stopErr),
-          });
-        }
-      } else {
-        // Task status was flipped to CANCELLED in DDB but we have no
-        // compute handle to actually stop the container. This is a
-        // resource-leak risk: the container may still be running and
-        // consuming tokens/concurrency. Emit a dedicated event so ops
-        // dashboards / alarms can surface the orphan.
-        logger.error('Running task has no recognized compute backend to stop — possible orphan', {
-          task_id: taskId,
-          request_id: requestId,
-          compute_type: computeType,
-          has_runtime_arn: !!agentRuntimeArn,
-        });
-        try {
-          await ddb.send(new PutCommand({
-            TableName: EVENTS_TABLE_NAME,
-            Item: {
-              task_id: taskId,
-              event_id: ulid(),
-              event_type: 'task_cancel_compute_orphan',
-              timestamp: now,
-              ttl: computeTtlEpoch(TASK_RETENTION_DAYS),
-              metadata: {
-                compute_type: computeType,
-                reason: 'missing_runtime_handle',
-              },
-            },
-          }));
-        } catch (eventErr) {
-          logger.warn('Failed to write task_cancel_compute_orphan event', {
-            task_id: taskId,
-            error: eventErr instanceof Error ? eventErr.message : String(eventErr),
-          });
-        }
-      }
+    if (outcome.kind === 'already_terminal') {
+      return errorResponse(409, ErrorCode.TASK_ALREADY_TERMINAL, `Task ${taskId} transitioned to a terminal state.`, requestId);
     }
-
-    // 7. Write task_cancelled event
-    await ddb.send(new PutCommand({
-      TableName: EVENTS_TABLE_NAME,
-      Item: {
-        task_id: taskId,
-        event_id: ulid(),
-        event_type: 'task_cancelled',
-        timestamp: now,
-        ttl: computeTtlEpoch(TASK_RETENTION_DAYS),
-        metadata: { cancelled_by: userId },
-      },
-    }));
-
-    logger.info('Task cancelled', { task_id: taskId, user_id: userId, request_id: requestId });
+    if (outcome.kind === 'error') {
+      logger.error('cancelTaskCore returned error', { task_id: taskId, error: outcome.message, request_id: requestId });
+      return errorResponse(500, ErrorCode.INTERNAL_ERROR, 'Internal server error.', requestId);
+    }
+    // outcome.kind === 'cancelled'
+    logger.info('Task cancelled via REST handler', { task_id: taskId, user_id: userId, request_id: requestId });
 
     return successResponse(200, {
       task_id: taskId,
-      status: TaskStatus.CANCELLED,
-      cancelled_at: now,
+      status: 'CANCELLED',
+      cancelled_at: outcome.cancelledAt,
     }, requestId);
   } catch (err) {
     logger.error('Failed to cancel task', { error: String(err), request_id: requestId });
