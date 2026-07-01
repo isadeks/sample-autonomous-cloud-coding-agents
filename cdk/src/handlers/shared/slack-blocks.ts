@@ -21,6 +21,8 @@ import { formatDuration, truncate } from './slack-format';
 
 /** Max length for task-failure reason text in Slack blocks. */
 const TASK_FAILED_REASON_MAX_LEN = 300;
+/** Max length for approval reason / input preview text in Slack blocks. */
+const APPROVAL_REASON_MAX_LEN = 300;
 import type { TaskRecord } from './types';
 
 /** A Slack Block Kit mrkdwn text object. */
@@ -121,6 +123,15 @@ export function renderSlackBlocks(
       return taskStrandedMessage(task, eventMetadata);
     case 'agent_error':
       return agentErrorMessage(task, eventMetadata);
+    case 'approval_requested':
+      // Cedar HITL: agent paused at a policy gate waiting for the user
+      // to approve or deny the pending action. Surface Approve / Deny
+      // buttons so Slack users can respond without switching to the CLI.
+      return approvalRequestedMessage(task, eventMetadata);
+    case 'approval_stranded':
+      // Cedar HITL: the approval gate timed out (no response before the
+      // window closed). The task has been stranded; inform the user.
+      return approvalStrandedMessage(task, eventMetadata);
     default:
       return simpleStatusMessage(task, `Event: ${eventType}`);
   }
@@ -255,6 +266,102 @@ function simpleStatusMessage(
   const text = `${label} for \`${task.repo}\`\n_ID:_ \`${task.task_id}\``;
   return {
     text: `${label} for ${task.repo}`,
+    blocks: [section(text)],
+  };
+}
+
+/**
+ * Cedar HITL: agent paused waiting for approval.
+ *
+ * Renders the pending action details and interactive Approve / Deny buttons
+ * so the user can respond directly from Slack without switching to the CLI.
+ * The action IDs embed the task_id and request_id so the interactions
+ * handler can route and authenticate the decision without additional lookups.
+ */
+function approvalRequestedMessage(
+  task: Pick<TaskRecord, 'task_id' | 'repo'>,
+  eventMetadata?: Record<string, unknown>,
+): SlackMessage {
+  const toolName = typeof eventMetadata?.tool_name === 'string' ? eventMetadata.tool_name : 'unknown tool';
+  const reason = typeof eventMetadata?.reason === 'string'
+    ? truncate(eventMetadata.reason, APPROVAL_REASON_MAX_LEN)
+    : undefined;
+  const inputPreview = typeof eventMetadata?.input_preview === 'string'
+    ? truncate(eventMetadata.input_preview, APPROVAL_REASON_MAX_LEN)
+    : undefined;
+  const severity = typeof eventMetadata?.severity === 'string' ? eventMetadata.severity : undefined;
+  const requestId = typeof eventMetadata?.request_id === 'string' ? eventMetadata.request_id : undefined;
+  const timeoutS = typeof eventMetadata?.timeout_s === 'number' ? eventMetadata.timeout_s : undefined;
+
+  const repoLabel = task.repo ? ` for \`${task.repo}\`` : '';
+  const severityLabel = severity ? ` _(${severity} severity)_` : '';
+  const timeoutLabel = timeoutS != null ? ` · window: ${formatDuration(timeoutS)}` : '';
+
+  let body = `:rotating_light: *Approval required*${repoLabel}${severityLabel}\n`;
+  body += `*Tool:* \`${toolName}\`${timeoutLabel}`;
+  if (inputPreview) {
+    body += `\n*Preview:* ${inputPreview}`;
+  }
+  if (reason) {
+    body += `\n*Reason:* ${reason}`;
+  }
+
+  const blocks: SlackBlock[] = [section(body)];
+
+  // Interactive Approve / Deny buttons — only rendered when we have a
+  // request_id to embed in the action IDs (required for the interactions
+  // handler to locate and submit the decision).
+  if (requestId) {
+    blocks.push(actions(`approval:${task.task_id}`, [
+      {
+        type: 'button',
+        text: { type: 'plain_text', text: '✅ Approve' },
+        action_id: `approve_task:${task.task_id}:${requestId}`,
+        style: 'primary',
+        confirm: {
+          title: { type: 'plain_text', text: 'Approve this action?' },
+          text: { type: 'mrkdwn', text: `Allow the agent to run \`${toolName}\`.` },
+          confirm: { type: 'plain_text', text: 'Approve' },
+          deny: { type: 'plain_text', text: 'Cancel' },
+        },
+      },
+      {
+        type: 'button',
+        text: { type: 'plain_text', text: '❌ Deny' },
+        action_id: `deny_task:${task.task_id}:${requestId}`,
+        style: 'danger',
+        confirm: {
+          title: { type: 'plain_text', text: 'Deny this action?' },
+          text: { type: 'mrkdwn', text: `Block the agent from running \`${toolName}\`.` },
+          confirm: { type: 'plain_text', text: 'Deny' },
+          deny: { type: 'plain_text', text: 'Cancel' },
+        },
+      },
+    ]));
+  }
+
+  return {
+    text: `Approval required for ${task.repo ?? task.task_id}`,
+    blocks,
+  };
+}
+
+/**
+ * Cedar HITL: approval gate timed out — task is stranded.
+ *
+ * No interactive buttons are shown (the window has closed); the user
+ * is informed that the task stopped waiting and has been stranded.
+ */
+function approvalStrandedMessage(
+  task: Pick<TaskRecord, 'task_id' | 'repo'>,
+  eventMetadata?: Record<string, unknown>,
+): SlackMessage {
+  const ageS = typeof eventMetadata?.age_s === 'number' ? eventMetadata.age_s : null;
+  const ageDuration = ageS != null ? ` after ${formatDuration(ageS)}` : '';
+  const repoLabel = task.repo ? ` for \`${task.repo}\`` : '';
+  const text = `:hourglass: *Approval window expired*${repoLabel}${ageDuration} — task stranded`;
+  return {
+    text: `Approval window expired for ${task.repo ?? task.task_id}`,
     blocks: [section(text)],
   };
 }

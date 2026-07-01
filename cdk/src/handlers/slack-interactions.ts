@@ -17,9 +17,10 @@
  *  SOFTWARE.
  */
 
-import { DynamoDBClient } from '@aws-sdk/client-dynamodb';
-import { DynamoDBDocumentClient, GetCommand, UpdateCommand } from '@aws-sdk/lib-dynamodb';
+import { DynamoDBClient, TransactionCanceledException } from '@aws-sdk/client-dynamodb';
+import { DynamoDBDocumentClient, GetCommand, PutCommand, TransactWriteCommand, UpdateCommand } from '@aws-sdk/lib-dynamodb';
 import type { APIGatewayProxyEvent, APIGatewayProxyResult } from 'aws-lambda';
+import { ulid } from 'ulid';
 import { logger } from './shared/logger';
 import { getSlackSecret, SLACK_SECRET_PREFIX, verifySlackRequest } from './shared/slack-verify';
 
@@ -28,6 +29,11 @@ const ddb = DynamoDBDocumentClient.from(new DynamoDBClient({}));
 const SIGNING_SECRET_ARN = process.env.SLACK_SIGNING_SECRET_ARN!;
 const TASK_TABLE = process.env.TASK_TABLE_NAME!;
 const USER_MAPPING_TABLE = process.env.SLACK_USER_MAPPING_TABLE_NAME!;
+const TASK_APPROVALS_TABLE = process.env.TASK_APPROVALS_TABLE_NAME;
+const TASK_EVENTS_TABLE = process.env.TASK_EVENTS_TABLE_NAME;
+
+/** Approval decision written by the Slack interactions handler. */
+type ApprovalDecision = 'approve' | 'deny';
 
 interface SlackInteractionPayload {
   readonly type: string;
@@ -83,6 +89,10 @@ export async function handler(event: APIGatewayProxyEvent): Promise<APIGatewayPr
       for (const action of payload.actions) {
         if (action.action_id.startsWith('cancel_task:')) {
           await handleCancelAction(payload, action.action_id);
+        } else if (action.action_id.startsWith('approve_task:')) {
+          await handleApprovalAction(payload, action.action_id, 'approve');
+        } else if (action.action_id.startsWith('deny_task:')) {
+          await handleApprovalAction(payload, action.action_id, 'deny');
         }
       }
     }
@@ -176,6 +186,201 @@ async function handleCancelAction(payload: SlackInteractionPayload, actionId: st
       throw err;
     }
   }
+}
+
+/**
+ * Handle an Approve or Deny button click on a Cedar HITL approval gate.
+ *
+ * Action ID format: ``approve_task:<task_id>:<request_id>`` or
+ * ``deny_task:<task_id>:<request_id>``.
+ *
+ * Flow:
+ *   1. Parse task_id and request_id from the action_id.
+ *   2. Verify the Slack user has a linked platform account.
+ *   3. Load the task and verify ownership (platform user matches task.user_id).
+ *   4. Apply the decision via a cross-table atomic TransactWriteItems:
+ *        - Update approval row: PENDING → APPROVED/DENIED (guarded by ownership + status).
+ *        - No-op update on TaskTable guarded by status = AWAITING_APPROVAL + request_id.
+ *   5. Write an ``approval_decision_recorded`` audit event to TaskEventsTable.
+ *   6. Reply to the response_url with the outcome (ephemeral message replaces the block).
+ */
+async function handleApprovalAction(
+  payload: SlackInteractionPayload,
+  actionId: string,
+  decision: ApprovalDecision,
+): Promise<void> {
+  // Parse action_id: "approve_task:<task_id>:<request_id>"
+  const prefix = decision === 'approve' ? 'approve_task:' : 'deny_task:';
+  const rest = actionId.slice(prefix.length);
+  const colonIdx = rest.indexOf(':');
+  if (colonIdx === -1) {
+    await postToResponseUrl(payload.response_url, ':warning: Malformed action — cannot process approval.');
+    return;
+  }
+  const taskId = rest.slice(0, colonIdx);
+  const requestId = rest.slice(colonIdx + 1);
+
+  if (!taskId || !requestId) {
+    await postToResponseUrl(payload.response_url, ':warning: Malformed action — missing task or request ID.');
+    return;
+  }
+
+  const teamId = payload.user.team_id;
+  const userId = payload.user.id;
+
+  // Verify the Slack user has a linked platform account.
+  const mappingResult = await ddb.send(new GetCommand({
+    TableName: USER_MAPPING_TABLE,
+    Key: { slack_identity: `${teamId}#${userId}` },
+  }));
+
+  if (!mappingResult.Item || mappingResult.Item.status === 'pending') {
+    await postToResponseUrl(payload.response_url, ':link: Your Slack account is not linked. Run `/bgagent link` first.');
+    return;
+  }
+
+  const platformUserId = mappingResult.Item.platform_user_id as string;
+
+  // Load the task and verify ownership.
+  const taskResult = await ddb.send(new GetCommand({
+    TableName: TASK_TABLE,
+    Key: { task_id: taskId },
+  }));
+
+  if (!taskResult.Item) {
+    await postToResponseUrl(payload.response_url, `:mag: Task \`${taskId}\` not found.`);
+    return;
+  }
+
+  if (taskResult.Item.user_id !== platformUserId) {
+    await postToResponseUrl(payload.response_url, ':no_entry: You can only approve or deny your own tasks.');
+    return;
+  }
+
+  if (!TASK_APPROVALS_TABLE) {
+    logger.warn('[slack/approval] TASK_APPROVALS_TABLE_NAME not set — cannot record decision', {
+      task_id: taskId, request_id: requestId,
+    });
+    await postToResponseUrl(payload.response_url, ':warning: Approval tables are not configured. Use the CLI to respond.');
+    return;
+  }
+
+  const nowIso = new Date().toISOString();
+  const decisionLabel = decision === 'approve' ? 'APPROVED' : 'DENIED';
+
+  // Cross-table atomic decision. Mirrors the approve-task / deny-task Lambda
+  // handlers (cdk/src/handlers/approve-task.ts and deny-task.ts).
+  try {
+    await ddb.send(new TransactWriteCommand({
+      TransactItems: [
+        {
+          Update: {
+            TableName: TASK_APPROVALS_TABLE,
+            Key: { task_id: taskId, request_id: requestId },
+            UpdateExpression: 'SET #status = :decided, decided_at = :now, #scope = :scope',
+            ConditionExpression:
+              'attribute_exists(request_id) AND #status = :pending AND user_id = :caller',
+            ExpressionAttributeNames: {
+              '#status': 'status',
+              '#scope': 'scope',
+            },
+            ExpressionAttributeValues: {
+              ':decided': decisionLabel,
+              ':pending': 'PENDING',
+              ':now': nowIso,
+              ':scope': 'this_call',
+              ':caller': platformUserId,
+            },
+          },
+        },
+        {
+          Update: {
+            TableName: TASK_TABLE,
+            Key: { task_id: taskId },
+            // No-op update — the condition is the real guard.
+            UpdateExpression: 'SET last_decision_at = :now',
+            ConditionExpression:
+              '#status = :awaiting AND awaiting_approval_request_id = :rid',
+            ExpressionAttributeNames: { '#status': 'status' },
+            ExpressionAttributeValues: {
+              ':awaiting': 'AWAITING_APPROVAL',
+              ':rid': requestId,
+              ':now': nowIso,
+            },
+          },
+        },
+      ],
+    }));
+  } catch (err) {
+    if (err instanceof TransactionCanceledException) {
+      const reasons = err.CancellationReasons ?? [];
+      const approvalsCode = reasons[0]?.Code;
+      const taskCode = reasons[1]?.Code;
+      if (approvalsCode === 'ConditionalCheckFailed') {
+        await postToResponseUrl(
+          payload.response_url,
+          ':mag: Approval request not found, already decided, or not owned by you.',
+        );
+      } else if (taskCode === 'ConditionalCheckFailed') {
+        await postToResponseUrl(
+          payload.response_url,
+          ':warning: Task is no longer awaiting approval for this request.',
+        );
+      } else {
+        logger.warn('[slack/approval] TransactWriteCommand cancelled for unknown reason', {
+          task_id: taskId,
+          request_id: requestId,
+          reasons: JSON.stringify(err.CancellationReasons ?? []),
+        });
+        await postToResponseUrl(payload.response_url, ':warning: Could not record decision. Please try again.');
+      }
+      return;
+    }
+    throw err;
+  }
+
+  // Write audit event (best-effort — decision already committed above).
+  if (TASK_EVENTS_TABLE) {
+    try {
+      await ddb.send(new PutCommand({
+        TableName: TASK_EVENTS_TABLE,
+        Item: {
+          task_id: taskId,
+          event_id: ulid(),
+          event_type: 'approval_decision_recorded',
+          timestamp: nowIso,
+          metadata: {
+            request_id: requestId,
+            status: decisionLabel,
+            scope: 'this_call',
+            decided_at: nowIso,
+            caller_user_id: platformUserId,
+            channel: 'slack',
+          },
+        },
+      }));
+    } catch (auditErr) {
+      logger.warn('[slack/approval] audit event write failed (decision already committed)', {
+        task_id: taskId,
+        request_id: requestId,
+        error: auditErr instanceof Error ? auditErr.message : String(auditErr),
+      });
+    }
+  }
+
+  const emoji = decision === 'approve' ? ':white_check_mark:' : ':no_entry_sign:';
+  const verb = decision === 'approve' ? 'approved' : 'denied';
+  logger.info('[slack/approval] decision recorded via Slack', {
+    task_id: taskId,
+    request_id: requestId,
+    decision,
+    team_id: teamId,
+    user_id: userId,
+  });
+  await postToResponseUrl(
+    payload.response_url,
+    `${emoji} *${decisionLabel}* — approval request ${verb} for task \`${taskId}\`.`,
+  );
 }
 
 async function updateSlackMessage(botToken: string, channel: string, ts: string, text: string, threadTs?: string): Promise<void> {

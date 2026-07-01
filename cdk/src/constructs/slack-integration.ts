@@ -66,6 +66,14 @@ export interface SlackIntegrationProps {
   /** The DynamoDB repo config table (optional — for repo onboarding checks). */
   readonly repoTable?: dynamodb.ITable;
 
+  /**
+   * The DynamoDB task approvals table (optional — for Cedar HITL approve/deny
+   * via Slack Block Kit buttons). When provided, the interactions handler can
+   * record approve/deny decisions directly; when absent, the button is still
+   * rendered but the handler replies with a "use the CLI" message.
+   */
+  readonly taskApprovalsTable?: dynamodb.ITable;
+
   /** Orchestrator Lambda function ARN for async task invocation. */
   readonly orchestratorFunctionArn?: string;
 
@@ -311,23 +319,32 @@ export class SlackIntegration extends Construct {
     commandProcessorFn.grantInvoke(slackEventsFn);
 
     // --- Slack Interactions (Block Kit button actions) ---
+    const interactionsEnv: Record<string, string> = {
+      SLACK_SIGNING_SECRET_ARN: this.signingSecret.secretArn,
+      TASK_TABLE_NAME: props.taskTable.tableName,
+      SLACK_USER_MAPPING_TABLE_NAME: this.userMappingTable.tableName,
+      TASK_EVENTS_TABLE_NAME: props.taskEventsTable.tableName,
+    };
+    if (props.taskApprovalsTable) {
+      interactionsEnv.TASK_APPROVALS_TABLE_NAME = props.taskApprovalsTable.tableName;
+    }
     const slackInteractionsFn = new lambda.NodejsFunction(this, 'SlackInteractionsFn', {
       entry: path.join(handlersDir, 'slack-interactions.ts'),
       handler: 'handler',
       runtime: Runtime.NODEJS_24_X,
       architecture: Architecture.ARM_64,
       timeout: Duration.seconds(10),
-      environment: {
-        SLACK_SIGNING_SECRET_ARN: this.signingSecret.secretArn,
-        TASK_TABLE_NAME: props.taskTable.tableName,
-        SLACK_USER_MAPPING_TABLE_NAME: this.userMappingTable.tableName,
-      },
+      environment: interactionsEnv,
       bundling: commonBundling,
     });
     this.signingSecret.grantRead(slackInteractionsFn);
     slackInteractionsFn.addToRolePolicy(readSlackSecretsPolicy);
     props.taskTable.grantReadWriteData(slackInteractionsFn);
     this.userMappingTable.grantReadData(slackInteractionsFn);
+    props.taskEventsTable.grantReadWriteData(slackInteractionsFn);
+    if (props.taskApprovalsTable) {
+      props.taskApprovalsTable.grantReadWriteData(slackInteractionsFn);
+    }
 
     // --- Slash Command Acknowledger ---
     const slackCommandsFn = new lambda.NodejsFunction(this, 'SlackCommandsFn', {

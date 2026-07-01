@@ -732,6 +732,10 @@ export class AgentStack extends Stack {
       taskTable: taskTable.table,
       taskEventsTable: taskEventsTable.table,
       repoTable: repoTable.table,
+      // Cedar HITL: pass the approvals table so the interactions Lambda
+      // can record approve/deny decisions submitted via Block Kit buttons
+      // (Slack parity with the CLI approve/deny path — ABCA-492).
+      taskApprovalsTable: taskApprovalsTable.table,
       orchestratorFunctionArn: orchestrator.alias.functionArn,
       guardrailId: inputGuardrail.guardrailId,
       guardrailVersion: inputGuardrail.guardrailVersion,
