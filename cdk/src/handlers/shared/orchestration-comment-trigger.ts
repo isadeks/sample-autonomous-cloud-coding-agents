@@ -124,6 +124,54 @@ export function buildIterationInstruction(trigger: CommentTrigger): string {
 export type PlanVerdict = 'approve' | 'reject' | 'none';
 
 /**
+ * Natural ways a reviewer signals "cancel this task" on a Linear comment.
+ * Matched conservatively — we require an explicit stop/cancel word so that
+ * instructions like "please fix the cancel button" do NOT trigger cancellation.
+ *
+ * Checked AFTER the comment is known to be an ``@bgagent`` trigger (i.e.
+ * ``parseCommentTrigger`` returned ``triggered: true``) and BEFORE the normal
+ * iteration/task-creation path. An explicit cancel intent short-circuits the
+ * iteration and cancels the running task instead.
+ */
+const CANCEL_PHRASES = [
+  'cancel', 'stop', 'abort', 'halt', 'terminate', 'kill',
+  'cancel task', 'stop task', 'cancel this', 'stop this',
+  'cancel the task', 'stop the task',
+] as const;
+
+/**
+ * Maximum word count for an instruction to be classified as a pure cancel
+ * intent. Instructions longer than this likely contain "cancel" as part of an
+ * edit request (e.g., "cancel the modal and add a toast instead") rather than
+ * a genuine stop command.
+ */
+const MAX_CANCEL_WORDS = 4;
+
+/**
+ * Returns ``true`` when the instruction (with the ``@bgagent`` token already
+ * stripped) explicitly requests task cancellation. Only short instructions
+ * (≤ {@link MAX_CANCEL_WORDS} words) are classified as cancel — a longer instruction that
+ * happens to contain "cancel" is more likely an edit request.
+ *
+ * Use this to gate the cancel-task path BEFORE the normal iteration path.
+ */
+export function parseCancelIntent(instruction: string): boolean {
+  // Normalize: drop markdown emphasis/backticks, lowercase, collapse whitespace.
+  const text = instruction.replace(/[*_`>]/g, ' ').trim().toLowerCase().replace(/\s+/g, ' ');
+  if (!text) return false;
+
+  const wordCount = text.split(' ').length;
+  // A longer comment might use "cancel" as part of an unrelated instruction.
+  // Only treat it as a cancel intent if the comment is at most MAX_CANCEL_WORDS words.
+  if (wordCount > MAX_CANCEL_WORDS) return false;
+
+  return CANCEL_PHRASES.some((phrase) => {
+    const esc = phrase.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    return new RegExp(`(^|[^a-z0-9])${esc}([^a-z0-9]|$)`, 'i').test(text); // nosemgrep: javascript.lang.security.audit.detect-non-literal-regexp.detect-non-literal-regexp -- esc is derived from CANCEL_PHRASES hardcoded constants only, never user input
+  });
+}
+
+/**
  * Natural ways a reviewer signals "go ahead" / "don't" on a pending plan. Real
  * people don't type the exact keyword — a strict ``approve``-only parser silently
  * swallowed "lgtm", "yes go ahead", "👍", "looks good" (live-confirmed). These
@@ -158,7 +206,7 @@ function hasPhrase(text: string, phrase: string): boolean {
   // Escape regex metachars (e.g. "+1", "don't"); match on non-word boundaries so
   // "approve" doesn't fire on "approval" and "no" doesn't fire on "notify".
   const esc = phrase.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-  return new RegExp(`(^|[^a-z0-9])${esc}([^a-z0-9]|$)`, 'i').test(text);
+  return new RegExp(`(^|[^a-z0-9])${esc}([^a-z0-9]|$)`, 'i').test(text); // nosemgrep: javascript.lang.security.audit.detect-non-literal-regexp.detect-non-literal-regexp -- esc is derived from APPROVE_PHRASES/REJECT_PHRASES hardcoded constants only, never user input
 }
 
 /**
