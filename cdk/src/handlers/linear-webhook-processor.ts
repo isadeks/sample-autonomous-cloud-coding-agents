@@ -22,6 +22,7 @@ import { DynamoDBClient } from '@aws-sdk/client-dynamodb';
 import { DynamoDBDocumentClient, GetCommand } from '@aws-sdk/lib-dynamodb';
 import { createTaskCore } from './shared/create-task-core';
 import { renderMaturingReply } from './shared/iteration-reply';
+import { cancelTaskForLinearIssue } from './shared/linear-cancel-task';
 import {
   reactToComment,
   replyToComment,
@@ -29,7 +30,9 @@ import {
   swapCommentReaction,
   upsertStatusComment,
   upsertThreadedReply,
+  EMOJI_FAILURE,
   EMOJI_STARTED,
+  EMOJI_SUCCESS,
   EMOJI_NEEDS_INPUT,
 } from './shared/linear-feedback';
 import {
@@ -40,7 +43,7 @@ import { resolveLinearOauthToken } from './shared/linear-oauth-resolver';
 import { fetchIssueParentId, type SubIssueNode } from './shared/linear-subissue-fetch';
 import { resolveTaskByLinearIssue, prNumberFromTask } from './shared/linear-task-by-issue';
 import { logger } from './shared/logger';
-import { buildIterationInstruction, parseCommentTrigger, parsePlanVerdict, type CommentTrigger } from './shared/orchestration-comment-trigger';
+import { buildIterationInstruction, parseCancelIntent, parseCommentTrigger, parsePlanVerdict, type CommentTrigger } from './shared/orchestration-comment-trigger';
 import { readProjectCaps } from './shared/orchestration-decomposition-caps';
 import {
   runDecompositionProposal,
@@ -1085,6 +1088,66 @@ async function handleParentEpicCommentTrigger(args: {
   // ACK immediately — a parent comment is never silently dropped again.
   await reactToComment(feedbackCtx, commentId, EMOJI_STARTED);
 
+  // --- Cancel intent (e.g. "@bgagent cancel") on the PARENT epic ---
+  // Cancel ALL active child tasks in this orchestration. This is the natural
+  // interpretation when a user posts "@bgagent cancel" on the epic — they want
+  // to stop everything in progress. Best-effort: we attempt every child and
+  // report the aggregate result in a single reply.
+  if (parseCancelIntent(trigger.instruction)) {
+    logger.info('A6 comment (parent epic): detected cancel intent — cancelling all active children', {
+      orchestration_id: orchestrationId,
+    });
+
+    // 'released' = task created and actively running;
+    // 'ready' / 'blocked' = not yet running but could have a queued task.
+    // Exclude terminal orchestration states ('succeeded', 'failed', 'skipped').
+    const activeChildren = snapshot.children.filter(
+      (c) => c.child_task_id && (c.child_status === 'released'),
+    );
+
+    let cancelledCount = 0;
+    let alreadyTerminalCount = 0;
+
+    for (const c of activeChildren) {
+      const cancelResult = await cancelTaskForLinearIssue(
+        process.env.TASK_TABLE_NAME!,
+        process.env.TASK_EVENTS_TABLE_NAME!,
+        c.sub_issue_id,
+        snapshot.meta.release_context.platform_user_id,
+      );
+      if (cancelResult.kind === 'cancelled') {
+        cancelledCount++;
+      } else if (cancelResult.kind === 'already_terminal') {
+        alreadyTerminalCount++;
+      }
+    }
+
+    let replyBody: string;
+    if (cancelledCount > 0) {
+      replyBody = cancelledCount === 1
+        ? '✅ 1 task cancelled.'
+        : `✅ ${cancelledCount} tasks cancelled.`;
+      if (alreadyTerminalCount > 0) {
+        replyBody += ` (${alreadyTerminalCount} had already finished.)`;
+      }
+      await swapCommentReaction(feedbackCtx, commentId, EMOJI_SUCCESS);
+    } else if (alreadyTerminalCount > 0) {
+      replyBody = '❌ All tasks had already finished before your cancel request arrived.';
+      await swapCommentReaction(feedbackCtx, commentId, EMOJI_FAILURE);
+    } else {
+      replyBody = 'ℹ️ No active tasks found to cancel.';
+      await swapCommentReaction(feedbackCtx, commentId, EMOJI_NEEDS_INPUT);
+    }
+
+    await replyToComment(feedbackCtx, snapshot.meta.parent_linear_issue_id, replyTargetId, replyBody);
+    logger.info('A6 comment (parent epic): cancel results', {
+      orchestration_id: orchestrationId,
+      cancelled: cancelledCount,
+      already_terminal: alreadyTerminalCount,
+    });
+    return;
+  }
+
   // Only STARTED children with a task are iterable candidates; match against all
   // real nodes for the disambiguation list, but iterate only a started one.
   const match = parseParentNodeReference(trigger.instruction, snapshot.children);
@@ -1185,6 +1248,62 @@ async function iterateOrchestrationChild(args: {
   const subIssueId = child.sub_issue_id;
   const triggerCommentIssueId = args.triggerCommentIssueId ?? subIssueId;
 
+  // Attribute to the orchestration's release user (the comment author may not
+  // be a linked platform user; the orchestration already ran under this id).
+  const platformUserId = snapshot.meta.release_context.platform_user_id;
+
+  const feedbackCtxOrch = { linearWorkspaceId: workspaceId, registryTableName };
+
+  // --- Cancel intent (e.g. "@bgagent cancel") ---
+  // Checked BEFORE iteration: a short cancel command cancels the child's task
+  // instead of spawning a new iteration. The child task id is resolved from the
+  // orchestration row (child.child_task_id). We use the sub-issue's direct
+  // LinearIssueIndex lookup path so the cancel helper can find the task record.
+  if (parseCancelIntent(trigger.instruction)) {
+    logger.info('A6 comment (orchestration): detected cancel intent for sub-issue', {
+      orchestration_id: orchestrationId,
+      sub_issue_id: subIssueId,
+      child_task_id: child.child_task_id,
+    });
+
+    // ACK immediately with 👀.
+    if (!args.skipAck) {
+      await reactToComment(feedbackCtxOrch, commentId, EMOJI_STARTED);
+    }
+
+    const cancelResult = await cancelTaskForLinearIssue(
+      process.env.TASK_TABLE_NAME!,
+      process.env.TASK_EVENTS_TABLE_NAME!,
+      subIssueId,
+      platformUserId,
+    );
+
+    switch (cancelResult.kind) {
+      case 'cancelled':
+        await swapCommentReaction(feedbackCtxOrch, commentId, EMOJI_SUCCESS);
+        await replyToComment(feedbackCtxOrch, triggerCommentIssueId, replyTargetId, '✅ Task cancelled.');
+        logger.info('A6 comment (orchestration): task cancelled', {
+          orchestration_id: orchestrationId,
+          sub_issue_id: subIssueId,
+          task_id: cancelResult.taskId,
+        });
+        break;
+      case 'already_terminal':
+        await swapCommentReaction(feedbackCtxOrch, commentId, EMOJI_FAILURE);
+        await replyToComment(feedbackCtxOrch, triggerCommentIssueId, replyTargetId,
+          '❌ The task already finished (or was cancelled) before your cancel request arrived.');
+        break;
+      case 'no_task':
+      case 'not_owner':
+      case 'error':
+        await swapCommentReaction(feedbackCtxOrch, commentId, EMOJI_FAILURE);
+        await replyToComment(feedbackCtxOrch, triggerCommentIssueId, replyTargetId,
+          '❌ Could not cancel the task. Check the ABCA admin logs for details.');
+        break;
+    }
+    return;
+  }
+
   const prNumber = args.prNumber ?? (child.child_task_id ? await resolveChildPrNumber(child.child_task_id) : null);
   if (prNumber === null || prNumber === undefined) {
     logger.warn('A6 comment: sub-issue has no resolvable PR — cannot iterate', {
@@ -1192,10 +1311,6 @@ async function iterateOrchestrationChild(args: {
     });
     return;
   }
-
-  // Attribute to the orchestration's release user (the comment author may not
-  // be a linked platform user; the orchestration already ran under this id).
-  const platformUserId = snapshot.meta.release_context.platform_user_id;
 
   // #247 UX.3: ACK the request the instant we commit to acting on it. 👀 on the
   // TRIGGERING comment is the zero-clutter "on it" signal. The parent-epic path
@@ -1273,6 +1388,10 @@ async function iterateOrchestrationChild(args: {
  * ``orchestration_iteration`` marker, so the reconciler ignores it and fanout
  * owns the ✅/❌ reply. A clean no-op when the issue was never run by ABCA
  * (GSI miss) or its task opened no PR.
+ *
+ * Also handles explicit cancel intent: when the instruction is a short
+ * cancel command (e.g. ``@bgagent cancel``) the active task is cancelled
+ * instead of starting a new iteration.
  */
 async function handleStandaloneCommentTrigger(args: {
   subIssueId: string;
@@ -1286,6 +1405,62 @@ async function handleStandaloneCommentTrigger(args: {
 }): Promise<void> {
   const { subIssueId: issueId, workspaceId, commentId, replyTargetId, trigger, resolved, registryTableName } = args;
 
+  const feedbackCtx = { linearWorkspaceId: workspaceId, registryTableName };
+
+  // --- Cancel intent (e.g. "@bgagent cancel") ---
+  // Checked BEFORE the normal iteration path so a short "cancel" comment
+  // doesn't try to iterate a task that is about to be stopped.
+  if (parseCancelIntent(trigger.instruction)) {
+    logger.info('A6 comment (standalone): detected cancel intent', { linear_issue_id: issueId });
+
+    // Resolve the task now so we know who owns it.
+    const taskForCancel = await resolveTaskByLinearIssue(ddb, process.env.TASK_TABLE_NAME!, issueId);
+    if (!taskForCancel) {
+      logger.info('A6 comment (standalone): cancel intent but no ABCA task — ignoring', {
+        linear_issue_id: issueId,
+      });
+      return;
+    }
+
+    // ACK immediately with 👀 so the user knows we saw the request.
+    await reactToComment(feedbackCtx, commentId, EMOJI_STARTED);
+
+    const cancelResult = await cancelTaskForLinearIssue(
+      process.env.TASK_TABLE_NAME!,
+      process.env.TASK_EVENTS_TABLE_NAME!,
+      issueId,
+      taskForCancel.user_id ?? 'linear',
+    );
+
+    switch (cancelResult.kind) {
+      case 'cancelled':
+        // Swap 👀 → ✅ and post a confirmation reply.
+        await swapCommentReaction(feedbackCtx, commentId, EMOJI_SUCCESS);
+        await replyToComment(feedbackCtx, issueId, replyTargetId, '✅ Task cancelled.');
+        logger.info('A6 comment (standalone): task cancelled via Linear comment', {
+          linear_issue_id: issueId, task_id: cancelResult.taskId,
+        });
+        break;
+      case 'already_terminal':
+        // Task finished before we could cancel — let the user know.
+        await swapCommentReaction(feedbackCtx, commentId, EMOJI_FAILURE);
+        await replyToComment(feedbackCtx, issueId, replyTargetId,
+          '❌ The task already finished (or was cancelled) before your cancel request arrived.');
+        break;
+      case 'no_task':
+        // Shouldn't reach here (we just resolved the task), but guard defensively.
+        break;
+      case 'not_owner':
+      case 'error':
+        await swapCommentReaction(feedbackCtx, commentId, EMOJI_FAILURE);
+        await replyToComment(feedbackCtx, issueId, replyTargetId,
+          '❌ Could not cancel the task. Check the ABCA admin logs for details.');
+        break;
+    }
+    return;
+  }
+
+  // --- Normal iteration path ---
   const task = await resolveTaskByLinearIssue(ddb, process.env.TASK_TABLE_NAME!, issueId);
   if (!task) {
     logger.info('A6 comment (standalone): issue has no ABCA task — ignoring', { linear_issue_id: issueId });
@@ -1306,7 +1481,6 @@ async function handleStandaloneCommentTrigger(args: {
   }
 
   // ACK the instant we commit (same as the orchestration path).
-  const feedbackCtx = { linearWorkspaceId: workspaceId, registryTableName };
   await reactToComment(feedbackCtx, commentId, EMOJI_STARTED);
   // Iteration-UX: immediate "👀 On it" threaded reply + persist its id so the
   // fanout dispatcher matures THIS reply instead of posting new comments.

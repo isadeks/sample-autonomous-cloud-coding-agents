@@ -20,6 +20,7 @@
 import {
   buildIterationInstruction,
   isBotAuthoredComment,
+  parseCancelIntent,
   parseCommentTrigger,
 } from '../../../src/handlers/shared/orchestration-comment-trigger';
 
@@ -109,6 +110,84 @@ describe('parseCommentTrigger', () => {
     test('leading whitespace before a bot marker is still caught', () => {
       expect(isBotAuthoredComment('  \n✅ Updated — PR #193.')).toBe(true);
     });
+  });
+});
+
+describe('parseCancelIntent', () => {
+  // --- Positive cases (should be treated as cancel) ---
+  test('"cancel" alone → cancel intent', () => {
+    expect(parseCancelIntent('cancel')).toBe(true);
+  });
+
+  test('"stop" alone → cancel intent', () => {
+    expect(parseCancelIntent('stop')).toBe(true);
+  });
+
+  test('"abort" alone → cancel intent', () => {
+    expect(parseCancelIntent('abort')).toBe(true);
+  });
+
+  test('"halt" alone → cancel intent', () => {
+    expect(parseCancelIntent('halt')).toBe(true);
+  });
+
+  test('"terminate" alone → cancel intent', () => {
+    expect(parseCancelIntent('terminate')).toBe(true);
+  });
+
+  test('"cancel task" → cancel intent', () => {
+    expect(parseCancelIntent('cancel task')).toBe(true);
+  });
+
+  test('"stop task" → cancel intent', () => {
+    expect(parseCancelIntent('stop task')).toBe(true);
+  });
+
+  test('"cancel this" → cancel intent', () => {
+    expect(parseCancelIntent('cancel this')).toBe(true);
+  });
+
+  test('"stop this" → cancel intent', () => {
+    expect(parseCancelIntent('stop this')).toBe(true);
+  });
+
+  test('case-insensitive — "CANCEL" → cancel intent', () => {
+    expect(parseCancelIntent('CANCEL')).toBe(true);
+  });
+
+  test('"Cancel" with leading whitespace → cancel intent', () => {
+    expect(parseCancelIntent('  cancel  ')).toBe(true);
+  });
+
+  // --- Negative cases (should NOT trigger cancel) ---
+  test('empty string → no cancel intent', () => {
+    expect(parseCancelIntent('')).toBe(false);
+  });
+
+  test('ordinary iteration instruction → no cancel intent', () => {
+    expect(parseCancelIntent('make the header sticky')).toBe(false);
+  });
+
+  test('long instruction containing "cancel" → no cancel intent (> 4 words = work, not stop)', () => {
+    expect(parseCancelIntent('cancel the modal and add a toast instead')).toBe(false);
+  });
+
+  test('"please cancel the subscription button styling" → no cancel intent (> 4 words)', () => {
+    expect(parseCancelIntent('please cancel the subscription button styling')).toBe(false);
+  });
+
+  test('"add cancel button to the form" → no cancel intent (> 4 words)', () => {
+    expect(parseCancelIntent('add cancel button to the form')).toBe(false);
+  });
+
+  test('"fix the login bug" → no cancel intent', () => {
+    expect(parseCancelIntent('fix the login bug')).toBe(false);
+  });
+
+  test('bare empty instruction (bare @bgagent with no text) → no cancel intent', () => {
+    // parseCommentTrigger yields instruction='' for a bare @bgagent mention.
+    // This should NOT cancel — it means "address the latest review feedback".
+    expect(parseCancelIntent('')).toBe(false);
   });
 });
 
