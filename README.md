@@ -138,6 +138,10 @@ Install [mise](https://mise.jdx.dev/getting-started.html) if you want to use rep
 Follow the [Developer Guide](./docs/guides/DEVELOPER_GUIDE.md) to set up your environment and deploy the application to your AWS account.
 Then, follow the [User Guide](./docs/guides/USER_GUIDE.md) to learn how to use the system.
 
+### Running locally
+
+You can run the agent on your machine without a full cloud deployment using the `agent/run.sh` script, which builds the Docker image and applies production-matching resource constraints (2 vCPU, 8 GB RAM). See the [Local testing section of the Developer Guide](./docs/guides/DEVELOPER_GUIDE.md#local-testing) for prerequisites, credential resolution, and example invocations.
+
 ## Documentation
 
 A documentation site is available containing all design documents, roadmap and guides to deploy and use the platform. You can access it [here](https://aws-samples.github.io/sample-autonomous-cloud-coding-agents/).
