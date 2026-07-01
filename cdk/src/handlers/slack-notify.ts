@@ -68,6 +68,23 @@ const TERMINAL_EVENTS = new Set<string>([
 ]);
 
 /**
+ * Cedar HITL approval events that must fire at most once per request_id.
+ * ``approval_requested`` can be emitted multiple times if the agent retries
+ * the hook (defensive), so we dedup by embedding the ``request_id`` from
+ * event metadata in the DDB attribute key — guaranteeing one Slack
+ * notification per approval gate regardless of retry / fanout redelivery.
+ * ``approval_stranded`` is similarly once-per-request (the reconciler emits
+ * it once; the dedup key mirrors the same pattern for consistency).
+ *
+ * Note: these are handled outside ``SLACK_DEDUP_ATTRIBUTE`` because their
+ * dedup key is per-request_id (dynamic), not a static attribute name.
+ */
+const APPROVAL_EVENT_TYPES = new Set<string>([
+  'approval_requested',
+  'approval_stranded',
+]);
+
+/**
  * Map an event type to the ``channel_metadata`` attribute that should
  * guard against double-posting on a partial-batch retry. PR #79 review
  * #4 surfaced the gap: when GitHub or Email rate-limits and the record
@@ -81,6 +98,10 @@ const TERMINAL_EVENTS = new Set<string>([
  * ``session_started`` use the per-event ``slack_*_msg_ts`` conditional
  * persists instead, which is the right shape since they need to store
  * a value, not just a presence marker).
+ *
+ * ``approval_requested`` and ``approval_stranded`` use a dynamic per-
+ * request_id dedup key handled separately in ``dispatchSlackEvent``
+ * via ``APPROVAL_EVENT_TYPES``, so they are intentionally absent here.
  */
 const SLACK_DEDUP_ATTRIBUTE: Record<string, string | null> = {
   task_completed: 'slack_notified_terminal',
@@ -97,9 +118,9 @@ const SLACK_DEDUP_ATTRIBUTE: Record<string, string | null> = {
  *  Slack entries in ``CHANNEL_DEFAULTS`` (see fanout-task-events.ts) —
  *  drift means the router subscribes Slack to events that the
  *  dispatcher silently ignores, which lies in batch telemetry
- *  (issue #64 review Cat 7). Forward-compat ``approval_required`` and
- *  ``status_response`` are deliberately absent until their emitters
- *  ship; until then they fall through and are dropped at this gate.
+ *  (issue #64 review Cat 7). Forward-compat ``status_response`` is
+ *  deliberately absent until its emitter ships; until then it falls
+ *  through and is dropped at this gate.
  *  ``pr_created`` is intentionally omitted from Slack — the
  *  ``task_completed`` block already carries the View PR button, so a
  *  separate "PR opened" message just produces visible duplication
@@ -114,6 +135,13 @@ export const NOTIFIABLE_EVENTS = new Set<string>([
   'task_timed_out',
   'task_stranded',
   'agent_error',
+  // Cedar HITL approval gate signals (design §11.2). These are already
+  // in CHANNEL_DEFAULTS.slack — adding them here closes the router↔
+  // dispatcher drift gap (issue #64 review Cat 7). Each renders an
+  // interactive Slack Block Kit message with Approve/Deny buttons so
+  // users can respond without leaving Slack (parity with the CLI path).
+  'approval_requested',
+  'approval_stranded',
 ]);
 
 /**
@@ -263,6 +291,45 @@ export async function dispatchSlackEvent(
         return;
       }
       throw err;
+    }
+  }
+
+  // Cedar HITL approval events use a per-request_id dedup key so that:
+  //   1. Multiple approval gates on the same task each post their own message.
+  //   2. Fanout retries (from sibling-channel failures) never double-post
+  //      the same gate's notification.
+  // The dedup attribute is ``channel_metadata.slack_approval_<request_id>``
+  // (a dynamic name derived from the event metadata). If the metadata lacks
+  // a request_id we skip dedup and post once (best-effort).
+  if (APPROVAL_EVENT_TYPES.has(eventType)) {
+    const requestId = typeof event.metadata?.request_id === 'string'
+      ? event.metadata.request_id
+      : null;
+    if (requestId) {
+      /** Max length for the safe-suffix of a per-request dedup attribute key. */
+      const APPROVAL_DEDUP_SUFFIX_MAX_LEN = 50;
+      const safeSuffix = requestId.replace(/[^a-zA-Z0-9_]/g, '_').slice(0, APPROVAL_DEDUP_SUFFIX_MAX_LEN);
+      const approvalDedupAttr = `slack_approval_${safeSuffix}`;
+      try {
+        await ddb.send(new UpdateCommand({
+          TableName: tableName,
+          Key: { task_id: taskId },
+          UpdateExpression: `SET channel_metadata.${approvalDedupAttr} = :t`,
+          ConditionExpression: `attribute_not_exists(channel_metadata.${approvalDedupAttr})`,
+          ExpressionAttributeValues: { ':t': true },
+        }));
+      } catch (err) {
+        if ((err as Error)?.name === 'ConditionalCheckFailedException') {
+          logger.info('[fanout/slack] approval notification already sent, skipping duplicate', {
+            event: 'fanout.slack.approval_dedup_hit',
+            task_id: taskId,
+            event_type: eventType,
+            request_id: requestId,
+          });
+          return;
+        }
+        throw err;
+      }
     }
   }
 
