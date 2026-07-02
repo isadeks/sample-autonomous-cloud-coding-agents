@@ -21,6 +21,9 @@ import { formatDuration, truncate } from './slack-format';
 
 /** Max length for task-failure reason text in Slack blocks. */
 const TASK_FAILED_REASON_MAX_LEN = 300;
+
+/** Max length for approval reason / input preview in Slack blocks. */
+const APPROVAL_REASON_MAX_LEN = 500;
 import type { TaskRecord } from './types';
 
 /** A Slack Block Kit mrkdwn text object. */
@@ -121,6 +124,10 @@ export function renderSlackBlocks(
       return taskStrandedMessage(task, eventMetadata);
     case 'agent_error':
       return agentErrorMessage(task, eventMetadata);
+    case 'approval_requested':
+      return approvalRequestedMessage(task, eventMetadata);
+    case 'approval_stranded':
+      return approvalStrandedMessage(task, eventMetadata);
     default:
       return simpleStatusMessage(task, `Event: ${eventType}`);
   }
@@ -244,6 +251,111 @@ function agentErrorMessage(
   const text = `:rotating_light: *Agent error* during \`${task.repo}\`${detail}${previewLine}`;
   return {
     text: `Agent error during ${task.repo}`,
+    blocks: [section(text)],
+  };
+}
+
+/**
+ * Cedar HITL: render the ``approval_requested`` gate notification.
+ *
+ * The agent writes ``approval_requested`` when it pauses at a Cedar policy
+ * gate and waits for human approval. The Slack message surfaces the tool
+ * name, the human-readable reason, the severity, and a live timeout
+ * countdown so the user knows how long they have to decide. Approve/Deny
+ * buttons allow one-click decisions without leaving Slack.
+ *
+ * Action ids use the shape ``approve_task:<task_id>:<request_id>`` and
+ * ``deny_task:<task_id>:<request_id>`` so the interactions handler can
+ * parse task + request identity from the action id alone, matching the
+ * ``cancel_task:<task_id>`` convention already established.
+ *
+ * Metadata shape (from ``progress_writer.write_approval_requested``):
+ *   - ``request_id``         — approval request row PK.
+ *   - ``tool_name``          — the Cedar-gated tool the agent tried to call.
+ *   - ``input_preview``      — sanitised truncation of the tool input.
+ *   - ``reason``             — human-readable policy rationale.
+ *   - ``severity``           — "low" | "medium" | "high".
+ *   - ``timeout_s``          — seconds until the request auto-expires.
+ *   - ``matching_rule_ids``  — Cedar rule ids that fired (for audit).
+ */
+function approvalRequestedMessage(
+  task: Pick<TaskRecord, 'task_id' | 'repo'>,
+  eventMetadata?: Record<string, unknown>,
+): SlackMessage {
+  const requestId = typeof eventMetadata?.request_id === 'string' ? eventMetadata.request_id : '';
+  const toolName = typeof eventMetadata?.tool_name === 'string' ? eventMetadata.tool_name : 'unknown tool';
+  const reason = typeof eventMetadata?.reason === 'string' ? eventMetadata.reason : '';
+  const severity = typeof eventMetadata?.severity === 'string' ? eventMetadata.severity : '';
+  const timeoutS = typeof eventMetadata?.timeout_s === 'number' ? eventMetadata.timeout_s : null;
+  const inputPreview = typeof eventMetadata?.input_preview === 'string' ? eventMetadata.input_preview : '';
+
+  const severityEmoji = severity === 'high' ? ':red_circle:' : severity === 'medium' ? ':large_yellow_circle:' : ':large_blue_circle:';
+  const timeoutLine = timeoutS != null ? `\n_Expires in:_ ${timeoutS}s` : '';
+  const reasonLine = reason ? `\n_Reason:_ ${truncate(reason, APPROVAL_REASON_MAX_LEN)}` : '';
+  const previewLine = inputPreview ? `\n_Input:_ \`${truncate(inputPreview, 200)}\`` : '';
+
+  const text = `:bell: *Approval required* for \`${task.repo}\`\n${severityEmoji} _Tool:_ \`${toolName}\`${reasonLine}${previewLine}${timeoutLine}`;
+
+  const blocks: SlackBlock[] = [section(text)];
+
+  // Only add the interactive buttons when we have a valid request_id.
+  // A missing request_id would produce nonsense action ids (both buttons
+  // would share ``approve_task:<task_id>:`` with an empty suffix, making
+  // the interactions handler unable to locate the approval row).
+  if (requestId) {
+    blocks.push(actions(`approval:${task.task_id}:${requestId}`, [
+      {
+        type: 'button',
+        text: { type: 'plain_text', text: '✅ Approve', emoji: true },
+        action_id: `approve_task:${task.task_id}:${requestId}`,
+        style: 'primary',
+      } as ActionButtonElement,
+      {
+        type: 'button',
+        text: { type: 'plain_text', text: '❌ Deny', emoji: true },
+        action_id: `deny_task:${task.task_id}:${requestId}`,
+        style: 'danger',
+        confirm: {
+          title: { type: 'plain_text', text: 'Deny this action?' },
+          text: { type: 'mrkdwn', text: `The agent tried to call \`${toolName}\`. Deny to block this action.` },
+          confirm: { type: 'plain_text', text: 'Deny' },
+          deny: { type: 'plain_text', text: 'Cancel' },
+        },
+      } as ActionButtonElement,
+    ]));
+  }
+
+  return {
+    text: `Approval required for ${task.repo}`,
+    blocks,
+  };
+}
+
+/**
+ * Cedar HITL: render the ``approval_stranded`` gate notification.
+ *
+ * Emitted by the reconciler when an ``approval_requested`` event times
+ * out before the user responds. Surfaces the timed-out tool name and
+ * reason so the user knows which action the agent paused on.
+ *
+ * After stranding the task is typically in a FAILED or STRANDED state.
+ * Buttons are intentionally omitted because the request is no longer
+ * actionable — the approval window has closed.
+ *
+ * Metadata shape mirrors ``approval_requested``.
+ */
+function approvalStrandedMessage(
+  task: Pick<TaskRecord, 'task_id' | 'repo'>,
+  eventMetadata?: Record<string, unknown>,
+): SlackMessage {
+  const toolName = typeof eventMetadata?.tool_name === 'string' ? eventMetadata.tool_name : 'unknown tool';
+  const reason = typeof eventMetadata?.reason === 'string' ? eventMetadata.reason : '';
+
+  const reasonLine = reason ? `\n_Reason:_ ${truncate(reason, APPROVAL_REASON_MAX_LEN)}` : '';
+  const text = `:timer_clock: *Approval timed out* for \`${task.repo}\`\n_Tool:_ \`${toolName}\`${reasonLine}\n_The agent could not proceed — no decision was made in time._`;
+
+  return {
+    text: `Approval timed out for ${task.repo}`,
     blocks: [section(text)],
   };
 }

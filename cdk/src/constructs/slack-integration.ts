@@ -66,6 +66,15 @@ export interface SlackIntegrationProps {
   /** The DynamoDB repo config table (optional — for repo onboarding checks). */
   readonly repoTable?: dynamodb.ITable;
 
+  /**
+   * The DynamoDB task approvals table (optional — enables Cedar HITL
+   * approve/deny buttons in Slack). When provided, the interactions Lambda
+   * gains read/write access and the approve_task / deny_task Block Kit
+   * actions become operational. Without it, clicking Approve or Deny shows
+   * a guidance message directing the user to the CLI.
+   */
+  readonly taskApprovalsTable?: dynamodb.ITable;
+
   /** Orchestrator Lambda function ARN for async task invocation. */
   readonly orchestratorFunctionArn?: string;
 
@@ -311,23 +320,39 @@ export class SlackIntegration extends Construct {
     commandProcessorFn.grantInvoke(slackEventsFn);
 
     // --- Slack Interactions (Block Kit button actions) ---
+    const interactionsEnv: Record<string, string> = {
+      SLACK_SIGNING_SECRET_ARN: this.signingSecret.secretArn,
+      TASK_TABLE_NAME: props.taskTable.tableName,
+      SLACK_USER_MAPPING_TABLE_NAME: this.userMappingTable.tableName,
+    };
+    if (props.taskEventsTable) {
+      interactionsEnv.TASK_EVENTS_TABLE_NAME = props.taskEventsTable.tableName;
+    }
+    if (props.taskApprovalsTable) {
+      interactionsEnv.TASK_APPROVALS_TABLE_NAME = props.taskApprovalsTable.tableName;
+    }
+    if (props.taskRetentionDays) {
+      interactionsEnv.TASK_RETENTION_DAYS = String(props.taskRetentionDays);
+    }
     const slackInteractionsFn = new lambda.NodejsFunction(this, 'SlackInteractionsFn', {
       entry: path.join(handlersDir, 'slack-interactions.ts'),
       handler: 'handler',
       runtime: Runtime.NODEJS_24_X,
       architecture: Architecture.ARM_64,
       timeout: Duration.seconds(10),
-      environment: {
-        SLACK_SIGNING_SECRET_ARN: this.signingSecret.secretArn,
-        TASK_TABLE_NAME: props.taskTable.tableName,
-        SLACK_USER_MAPPING_TABLE_NAME: this.userMappingTable.tableName,
-      },
+      environment: interactionsEnv,
       bundling: commonBundling,
     });
     this.signingSecret.grantRead(slackInteractionsFn);
     slackInteractionsFn.addToRolePolicy(readSlackSecretsPolicy);
     props.taskTable.grantReadWriteData(slackInteractionsFn);
     this.userMappingTable.grantReadData(slackInteractionsFn);
+    // Cedar HITL: allow the interactions Lambda to write audit events and
+    // transition approval rows when approve/deny buttons are clicked.
+    props.taskEventsTable.grantReadWriteData(slackInteractionsFn);
+    if (props.taskApprovalsTable) {
+      props.taskApprovalsTable.grantReadWriteData(slackInteractionsFn);
+    }
 
     // --- Slash Command Acknowledger ---
     const slackCommandsFn = new lambda.NodejsFunction(this, 'SlackCommandsFn', {
