@@ -270,22 +270,18 @@ describe('fanout-task-events: per-channel filter contract (design §6.2)', () =>
 
   test('every Slack-default event the dispatcher actually renders today is in NOTIFIABLE_EVENTS (issue #64 review Cat 7 drift guard)', () => {
     // The router subscribes Slack to events the dispatcher must
-    // render. ``approval_requested``, ``approval_stranded``, and
-    // ``status_response`` are forward-compat (no Slack-side renderer
-    // today — the CLI surfaces approval UX; Slack is only in the
-    // channel-defaults set so a future Slack-button renderer can
-    // light up without changing the router filter). They're allowed
-    // to be in CHANNEL_DEFAULTS.slack but absent from
-    // NOTIFIABLE_EVENTS — when their emitters land, this test will
-    // start failing and force the dispatcher update at the same time.
-    // Every OTHER Slack default must be renderable, otherwise
-    // telemetry lies. Use ``requireActual`` to bypass the
-    // slack-notify mock and read the real exported NOTIFIABLE_EVENTS
-    // set.
+    // render. ``approval_requested`` and ``approval_stranded`` are now
+    // fully implemented (Block Kit messages with Approve/Deny buttons)
+    // so they have been removed from the forward-compat exemption list
+    // and must appear in NOTIFIABLE_EVENTS. ``status_response`` remains
+    // forward-compat (no renderer yet — its emitter hasn't shipped).
+    // Every Slack-default event not in forward-compat must be renderable,
+    // otherwise telemetry lies. Use ``requireActual`` to bypass the
+    // slack-notify mock and read the real exported NOTIFIABLE_EVENTS set.
     const real = jest.requireActual<typeof import('../../src/handlers/slack-notify')>(
       '../../src/handlers/slack-notify',
     );
-    const forwardCompat = new Set(['approval_requested', 'approval_stranded', 'status_response']);
+    const forwardCompat = new Set(['status_response']);
     const expectedRenderable = [...CHANNEL_DEFAULTS.slack].filter(
       e => !forwardCompat.has(e),
     );

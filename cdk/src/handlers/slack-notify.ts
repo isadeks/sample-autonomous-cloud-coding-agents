@@ -91,19 +91,30 @@ const SLACK_DEDUP_ATTRIBUTE: Record<string, string | null> = {
   agent_error: 'slack_dispatched_agent_error',
   task_created: null,
   session_started: null,
+  // Cedar HITL: approval events are NOT deduped at the task level because
+  // a single task can have multiple approval gates (multiple request_ids).
+  // The per-request dedup is enforced by the interactions handler when the
+  // user presses Approve/Deny; the Slack notification itself is best-effort
+  // delivered once per gate firing. Setting null lets each firing post once
+  // (same pattern as task_created / session_started — per-event, not per-task).
+  approval_requested: null,
+  approval_stranded: null,
 };
 
 /** Event types this dispatcher renders. Must stay in sync with the
  *  Slack entries in ``CHANNEL_DEFAULTS`` (see fanout-task-events.ts) —
  *  drift means the router subscribes Slack to events that the
  *  dispatcher silently ignores, which lies in batch telemetry
- *  (issue #64 review Cat 7). Forward-compat ``approval_required`` and
- *  ``status_response`` are deliberately absent until their emitters
- *  ship; until then they fall through and are dropped at this gate.
- *  ``pr_created`` is intentionally omitted from Slack — the
- *  ``task_completed`` block already carries the View PR button, so a
+ *  (issue #64 review Cat 7). ``status_response`` is deliberately absent
+ *  until its emitter ships; until then it falls through and is dropped
+ *  at this gate.  ``pr_created`` is intentionally omitted from Slack —
+ *  the ``task_completed`` block already carries the View PR button, so a
  *  separate "PR opened" message just produces visible duplication
- *  (verified during issue #64 dev-stack tests). Exported for the
+ *  (verified during issue #64 dev-stack tests).
+ *  ``approval_requested`` and ``approval_stranded`` are Cedar HITL gate
+ *  notifications: the user must approve or deny the agent's pending
+ *  action directly from the Slack thread, making Slack the primary
+ *  approval surface for interactive decisions. Exported for the
  *  cross-file consistency test. */
 export const NOTIFIABLE_EVENTS = new Set<string>([
   'task_created',
@@ -114,6 +125,8 @@ export const NOTIFIABLE_EVENTS = new Set<string>([
   'task_timed_out',
   'task_stranded',
   'agent_error',
+  'approval_requested',
+  'approval_stranded',
 ]);
 
 /**
@@ -512,7 +525,12 @@ export async function dispatchSlackEvent(
  *  is a non-terminal alert: keep the watching ``eyes`` reaction so the
  *  user sees the warning but knows the agent is still working.
  *  ``pr_created`` is a non-terminal milestone: leave reactions alone
- *  (no entry → updateReaction returns immediately). */
+ *  (no entry → updateReaction returns immediately).
+ *  ``approval_requested`` transitions to ``bell`` so the original
+ *  @mention thread shows the gate is waiting for action without
+ *  overwriting the terminal reaction on a task that was already
+ *  decided. ``approval_stranded`` transitions to ``timer_clock`` to
+ *  signal the gate expired. */
 const EVENT_REACTIONS: Record<string, string> = {
   task_created: 'eyes',
   session_started: 'hourglass_flowing_sand',
@@ -521,10 +539,14 @@ const EVENT_REACTIONS: Record<string, string> = {
   task_cancelled: 'no_entry_sign',
   task_timed_out: 'hourglass',
   task_stranded: 'x',
+  approval_requested: 'bell',
+  approval_stranded: 'timer_clock',
 };
 
-/** Reactions to remove when transitioning to a new state. */
-const STALE_REACTIONS = ['eyes', 'hourglass_flowing_sand'];
+/** Reactions to remove when transitioning to a new state. ``bell``
+ *  from ``approval_requested`` and ``timer_clock`` from
+ *  ``approval_stranded`` are cleaned up when a terminal outcome lands. */
+const STALE_REACTIONS = ['eyes', 'hourglass_flowing_sand', 'bell', 'timer_clock'];
 
 async function addReaction(botToken: string, channel: string, timestamp: string, emoji: string): Promise<void> {
   try {

@@ -202,4 +202,115 @@ describe('renderSlackBlocks', () => {
     expect(text.length).toBeLessThan(400);
     expect(text).toContain('...');
   });
+
+  // -------------------------------------------------------------------
+  // Cedar HITL — approval_requested / approval_stranded renderers
+  // -------------------------------------------------------------------
+
+  test('renders approval_requested message with Approve/Deny buttons', () => {
+    // Full metadata from progress_writer.write_approval_requested.
+    const msg = renderSlackBlocks('approval_requested', baseTask, {
+      request_id: 'req-01',
+      tool_name: 'create_file',
+      input_preview: 'path=/etc/cron.d/deploy',
+      reason: 'File creation outside workspace requires approval',
+      severity: 'medium',
+      timeout_s: 300,
+      matching_rule_ids: ['rule-1'],
+    });
+    expect(msg.text).toBe('Approval required for org/repo');
+    const text = sectionText(msg.blocks[0]);
+    expect(text).toContain(':bell:');
+    expect(text).toContain('Approval required');
+    expect(text).toContain('org/repo');
+    expect(text).toContain('create_file');
+    expect(text).toContain('File creation outside workspace requires approval');
+    expect(text).toContain('300s'); // timeout shown
+    expect(text).toContain(':large_yellow_circle:'); // medium severity
+    // Approve and Deny buttons in a separate actions block
+    expect(msg.blocks).toHaveLength(2);
+    const approvalActions = actionsBlock(msg.blocks[1]);
+    expect(approvalActions.elements).toHaveLength(2);
+    const approveBtn = approvalActions.elements[0];
+    const denyBtn = approvalActions.elements[1];
+    expect(approveBtn.text.text).toContain('Approve');
+    expect(denyBtn.text.text).toContain('Deny');
+    if (!('action_id' in approveBtn)) throw new Error('expected action button');
+    expect(approveBtn.action_id).toBe('approve_task:01HXYZ123:req-01');
+    if (!('action_id' in denyBtn)) throw new Error('expected action button');
+    expect(denyBtn.action_id).toBe('deny_task:01HXYZ123:req-01');
+  });
+
+  test('renders approval_requested with high severity emoji', () => {
+    const msg = renderSlackBlocks('approval_requested', baseTask, {
+      request_id: 'req-02',
+      tool_name: 'execute_command',
+      reason: 'Shell execution is high risk',
+      severity: 'high',
+      timeout_s: 60,
+    });
+    const text = sectionText(msg.blocks[0]);
+    expect(text).toContain(':red_circle:'); // high severity
+  });
+
+  test('renders approval_requested with low severity emoji', () => {
+    const msg = renderSlackBlocks('approval_requested', baseTask, {
+      request_id: 'req-03',
+      tool_name: 'read_file',
+      reason: 'Read outside workspace',
+      severity: 'low',
+      timeout_s: 300,
+    });
+    const text = sectionText(msg.blocks[0]);
+    expect(text).toContain(':large_blue_circle:'); // low severity
+  });
+
+  test('renders approval_requested without buttons when request_id is missing', () => {
+    // Defensive case: if the event arrives without a request_id the
+    // buttons would have nonsense action ids. The renderer must omit
+    // the actions block entirely rather than emit a broken button.
+    const msg = renderSlackBlocks('approval_requested', baseTask, {
+      tool_name: 'create_file',
+      reason: 'some reason',
+      severity: 'low',
+    });
+    expect(msg.blocks).toHaveLength(1);
+    expect(msg.blocks[0].type).toBe('section');
+  });
+
+  test('renders approval_requested without metadata gracefully', () => {
+    const msg = renderSlackBlocks('approval_requested', baseTask);
+    expect(msg.text).toBe('Approval required for org/repo');
+    const text = sectionText(msg.blocks[0]);
+    expect(text).toContain(':bell:');
+    expect(text).toContain('Approval required');
+    expect(text).not.toContain('undefined');
+    // No buttons — no request_id available
+    expect(msg.blocks).toHaveLength(1);
+  });
+
+  test('renders approval_stranded message without buttons', () => {
+    // Approval timed out — the gate is closed, no action buttons shown.
+    const msg = renderSlackBlocks('approval_stranded', baseTask, {
+      tool_name: 'create_file',
+      reason: 'File creation outside workspace requires approval',
+      severity: 'medium',
+    });
+    expect(msg.text).toBe('Approval timed out for org/repo');
+    const text = sectionText(msg.blocks[0]);
+    expect(text).toContain(':timer_clock:');
+    expect(text).toContain('Approval timed out');
+    expect(text).toContain('org/repo');
+    expect(text).toContain('create_file');
+    expect(text).toContain('no decision was made in time');
+    expect(msg.blocks).toHaveLength(1); // no interactive buttons
+  });
+
+  test('renders approval_stranded without metadata gracefully', () => {
+    const msg = renderSlackBlocks('approval_stranded', baseTask);
+    expect(msg.text).toBe('Approval timed out for org/repo');
+    const text = sectionText(msg.blocks[0]);
+    expect(text).toContain(':timer_clock:');
+    expect(text).not.toContain('undefined');
+  });
 });
