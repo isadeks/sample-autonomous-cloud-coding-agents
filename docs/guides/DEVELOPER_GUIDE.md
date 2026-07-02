@@ -275,6 +275,23 @@ mise //cdk:deploy
 
 A full deploy takes approximately 10 minutes. Expect variation by region and whether container layers are cached.
 
+### Which compute substrate am I on?
+
+The agent compute backend is chosen at deploy time by the `compute_type` CDK context flag, which defaults to `agentcore` (Amazon Bedrock AgentCore Runtime, a Firecracker MicroVM per session). To deploy the ECS on Fargate backend instead — for repos that exceed AgentCore's 2 GB image limit — pass `--context compute_type=ecs`, sized at 64 GB memory / 16 vCPU so large builds and toolchains have enough headroom that AgentCore's fixed per-session envelope cannot provide:
+
+```bash
+MISE_EXPERIMENTAL=1 mise //cdk:deploy -- -c compute_type=ecs
+```
+
+`compute_type` is recorded as a stack tag, so you can read a deployed stack's substrate without digging through CloudWatch:
+
+```bash
+aws cloudformation describe-stacks --stack-name backgroundagent-dev \
+  --query "Stacks[0].Tags[?Key=='compute_type'].Value" --output text
+```
+
+An empty result means the tag predates this flag; treat it as the `agentcore` default.
+
 ### Stack outputs
 
 After deployment, the stack emits these outputs (retrieve with `aws cloudformation describe-stacks --stack-name backgroundagent-dev --query 'Stacks[0].Outputs' --output table`):
