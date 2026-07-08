@@ -193,6 +193,7 @@ export interface TaskApiProps {
  * Cognito User Pool authentication and Lambda handler integrations.
  *
  * Exposes endpoints:
+ * - GET    /health               → healthCheck (no auth)
  * - POST   /tasks                → createTask (Cognito)
  * - GET    /tasks                → listTasks (Cognito)
  * - GET    /tasks/{task_id}      → getTask (Cognito)
@@ -697,9 +698,32 @@ export class TaskApi extends Construct {
       }
     }
 
+    // --- Health-check Lambda (no auth, no env vars needed) ---
+    const healthCheckFn = new lambda.NodejsFunction(this, 'HealthCheckFn', {
+      entry: path.join(handlersDir, 'health-check.ts'),
+      handler: 'handler',
+      runtime: Runtime.NODEJS_24_X,
+      architecture: Architecture.ARM_64,
+      bundling: commonBundling,
+    });
+
     // Collect all Lambda functions for cdk-nag suppressions
-    const allFunctions: lambda.NodejsFunction[] = [createTaskFn, getTaskFn, listTasksFn, cancelTaskFn, getTaskEventsFn];
+    const allFunctions: lambda.NodejsFunction[] = [createTaskFn, getTaskFn, listTasksFn, cancelTaskFn, getTaskEventsFn, healthCheckFn];
     if (confirmUploadsFn) allFunctions.push(confirmUploadsFn);
+
+    // --- Health-check endpoint: GET /health (unauthenticated) ---
+    const health = this.api.root.addResource('health');
+    const healthCheckMethod = health.addMethod('GET', new apigw.LambdaIntegration(healthCheckFn));
+    NagSuppressions.addResourceSuppressions(healthCheckMethod, [
+      {
+        id: 'AwsSolutions-COG4',
+        reason: 'Health-check endpoint is intentionally unauthenticated — it carries no user data and is used for liveness probing',
+      },
+      {
+        id: 'AwsSolutions-APIG4',
+        reason: 'Health-check endpoint is intentionally unauthenticated — it carries no user data and is used for liveness probing',
+      },
+    ]);
 
     // --- API resource tree: /tasks ---
     const tasks = this.api.root.addResource('tasks');
