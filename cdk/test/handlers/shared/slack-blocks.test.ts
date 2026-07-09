@@ -18,7 +18,13 @@
  */
 
 import { TaskStatus, type TaskStatusType } from '../../../src/constructs/task-status';
-import { type ActionsBlock, renderSlackBlocks, type SlackBlock } from '../../../src/handlers/shared/slack-blocks';
+import {
+  type ActionsBlock,
+  REPO_PICK_ACTION_ID,
+  renderSlackBlocks,
+  repoPickerMessage,
+  type SlackBlock,
+} from '../../../src/handlers/shared/slack-blocks';
 
 /** Narrow to a section block and return its text; throws if block isn't a section. */
 function sectionText(block: SlackBlock): string {
@@ -201,5 +207,39 @@ describe('renderSlackBlocks', () => {
     const text = sectionText(msg.blocks[0]);
     expect(text.length).toBeLessThan(400);
     expect(text).toContain('...');
+  });
+});
+
+describe('repoPickerMessage', () => {
+  test('renders a button per repo for a small list', () => {
+    const msg = repoPickerMessage('tok1', ['org/a', 'org/b', 'org/c']);
+    const actions = actionsBlock(msg.blocks[1]);
+    expect(actions.elements).toHaveLength(3);
+    for (const el of actions.elements) {
+      expect(el.type).toBe('button');
+      // Each button embeds the token and carries the repo in value.
+      const btn = el as { action_id: string; value?: string };
+      expect(btn.action_id.startsWith(`${REPO_PICK_ACTION_ID}:tok1`)).toBe(true);
+      expect(btn.value).toBeDefined();
+    }
+    // Distinct action_ids so Slack accepts the block.
+    const ids = new Set(actions.elements.map((e) => (e as { action_id: string }).action_id));
+    expect(ids.size).toBe(3);
+  });
+
+  test('switches to a static_select once the list exceeds the button threshold', () => {
+    const repos = ['o/a', 'o/b', 'o/c', 'o/d', 'o/e', 'o/f'];
+    const msg = repoPickerMessage('tok1', repos);
+    const actions = actionsBlock(msg.blocks[1]);
+    expect(actions.elements).toHaveLength(1);
+    const select = actions.elements[0] as { type: string; action_id: string; options: unknown[] };
+    expect(select.type).toBe('static_select');
+    expect(select.action_id).toBe(`${REPO_PICK_ACTION_ID}:tok1`);
+    expect(select.options).toHaveLength(repos.length);
+  });
+
+  test('threads the picker when a thread_ts is supplied', () => {
+    const msg = repoPickerMessage('tok1', ['org/a', 'org/b'], '1000.1');
+    expect(msg.thread_ts).toBe('1000.1');
   });
 });

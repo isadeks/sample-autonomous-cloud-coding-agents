@@ -24,7 +24,14 @@ import { buildClarifyResumeDescription, isClarifyHold } from './shared/clarify-r
 import { createTaskCore } from './shared/create-task-core';
 import { logger } from './shared/logger';
 import { slackFetch } from './shared/slack-api';
-import { prNumberFromSlackTask, resolveTaskBySlackThread, type SlackThreadTask } from './shared/slack-task-by-thread';
+import { repoPickerMessage } from './shared/slack-blocks';
+import {
+  addChannelRepo,
+  getChannelRepos,
+  putPendingRepoPick,
+  type PendingRepoPickFile,
+} from './shared/slack-channel-config';
+import { prNumberFromSlackTask, type SlackThreadTask } from './shared/slack-task-by-thread';
 import { getSlackSecret, SLACK_SECRET_PREFIX } from './shared/slack-verify';
 import type { Attachment } from './shared/types';
 import type { SlackCommandPayload } from './slack-commands';
@@ -107,7 +114,6 @@ const ddb = DynamoDBDocumentClient.from(new DynamoDBClient({}));
 const USER_MAPPING_TABLE = process.env.SLACK_USER_MAPPING_TABLE_NAME!;
 const INSTALLATION_TABLE = process.env.SLACK_INSTALLATION_TABLE_NAME!;
 const CHANNEL_MAPPING_TABLE = process.env.SLACK_CHANNEL_MAPPING_TABLE_NAME;
-const TASK_TABLE_NAME = process.env.TASK_TABLE_NAME;
 
 /** Link code TTL. */
 const LINK_CODE_TTL_S = 10 * 60; // 10 minutes
@@ -156,6 +162,14 @@ export async function handler(raw: RawEvent): Promise<void> {
       case 'link':
         await handleLink(event, reply);
         break;
+      case 'set-repo':
+      case 'setup':
+        await handleSetRepo(event, parts.slice(1), reply);
+        break;
+      case 'repos':
+      case 'list-repos':
+        await handleListRepos(event, reply);
+        break;
       case 'help':
         await reply(
           '*Using Shoof*\n\n'
@@ -168,6 +182,9 @@ export async function handler(raw: RawEvent): Promise<void> {
           + '*Thread replies:* Reply in an existing task\'s thread to continue work:\n'
           + '> Reply to trigger PR-iteration on the task\'s open PR.\n'
           + '> Reply to resume a task that asked a clarifying question.\n\n'
+          + '*Set a default repo for this channel:* `/bgagent set-repo org/repo`\n'
+          + 'Once set, you can drop the repo name — `@Shoof fix the login bug` runs against the channel default. Add several repos and Shoof will ask which one to use.\n\n'
+          + '*See configured repos:* `/bgagent repos`\n\n'
           + '*Private submissions:* DM Shoof directly.\n\n'
           + '*Cancel a task:* Use the Cancel button in the thread.\n\n'
           + '*Link your account:* `/bgagent link` — one-time setup.\n\n'
@@ -175,7 +192,7 @@ export async function handler(raw: RawEvent): Promise<void> {
         );
         break;
       default:
-        await reply('Use `@Shoof` to submit tasks, or `/bgagent link` to link your account.\nTry `/bgagent help` for more info.');
+        await reply('Use `@Shoof` to submit tasks, `/bgagent set-repo org/repo` to set a channel default, or `/bgagent link` to link your account.\nTry `/bgagent help` for more info.');
     }
   } catch (err) {
     logger.error('Slack command processing failed', {
@@ -235,33 +252,118 @@ async function handleSubmit(event: MentionEvent, args: string[], reply: ReplyFn)
     return;
   }
 
-  // Resolve the target repo. Two ways:
+  // Resolve the target repo. Three ways, in priority order:
   //   1. The user typed it: "org/repo#42 <description>" — first arg is the repo,
-  //      the rest is the description.
-  //   2. The user omitted it and the channel has an onboarded default repo
-  //      (`bgagent slack onboard-channel`) — the WHOLE message is the description.
+  //      the rest is the description. This explicit override always wins so
+  //      one-off cross-repo tasks still work in a channel with defaults.
+  //   2. The user omitted it and the channel has exactly ONE configured default
+  //      repo (`/bgagent set-repo` or the legacy `bgagent slack onboard-channel`)
+  //      — resolve it automatically; the WHOLE message is the description.
+  //   3. The channel has SEVERAL configured repos — post an interactive picker
+  //      and defer submission until the user chooses one.
   const repoArg = args[0];
-  let { repo, issueNumber } = parseRepoArg(repoArg);
+  const { repo, issueNumber } = parseRepoArg(repoArg);
   let description: string | undefined;
   if (repo) {
     description = args.slice(1).join(' ') || undefined;
   } else {
-    const defaultRepo = await lookupChannelDefaultRepo(event.team_id, event.channel_id);
-    if (defaultRepo) {
-      repo = defaultRepo;
-      issueNumber = undefined;
-      // No repo token was consumed, so the entire message is the description.
-      description = args.join(' ') || undefined;
+    const channelRepos = await getChannelRepos(CHANNEL_MAPPING_TABLE, event.team_id, event.channel_id);
+    if (channelRepos.length === 0) {
+      // No default set — guide the user rather than silently failing.
+      await reply('This channel has no default repo set. Include one — e.g. `@Shoof fix the bug in org/repo#42` — or run `/bgagent set-repo org/repo` to set a channel default.');
+      if (event.mention_thread_ts) {
+        await swapReaction(event.team_id, event.channel_id, event.mention_thread_ts, 'eyes', 'x');
+      }
+      return;
     }
-  }
-  if (!repo) {
-    await reply('Please include a repo — e.g. `@Shoof fix the bug in org/repo#42`. Or ask an admin to set a default with `bgagent slack onboard-channel`.');
-    if (event.mention_thread_ts) {
-      await swapReaction(event.team_id, event.channel_id, event.mention_thread_ts, 'eyes', 'x');
+    if (channelRepos.length === 1) {
+      // Exactly one default — resolve automatically. The whole message is the description.
+      await submitTaskForRepo(event, platformUserId, channelRepos[0], undefined, args.join(' ') || undefined, reply);
+      return;
     }
+    // Multiple defaults — present a Block Kit picker and defer submission.
+    await presentRepoPicker(event, channelRepos, args.join(' ') || undefined, reply);
     return;
   }
 
+  await submitTaskForRepo(event, platformUserId, repo, issueNumber, description, reply);
+}
+
+/**
+ * Post the interactive repo-picker for a channel that has several configured
+ * default repos. Stashes the pending submission context keyed by a random
+ * token so the interaction callback (`pick_repo:{token}`) can complete the
+ * submission against whichever repo the user chooses.
+ */
+async function presentRepoPicker(
+  event: MentionEvent,
+  repos: string[],
+  description: string | undefined,
+  reply: ReplyFn,
+): Promise<void> {
+  if (!CHANNEL_MAPPING_TABLE) {
+    // Should not happen (we only get here after a successful lookup), but stay safe.
+    await reply('This channel has no default repo set. Include one — e.g. `@Shoof fix the bug in org/repo#42`.');
+    return;
+  }
+
+  const token = crypto.randomUUID();
+  const files: PendingRepoPickFile[] | undefined = event.files?.map((f) => ({
+    id: f.id,
+    name: f.name,
+    mimetype: f.mimetype,
+    size: f.size,
+    url_private_download: f.url_private_download,
+  }));
+
+  try {
+    await putPendingRepoPick(CHANNEL_MAPPING_TABLE, token, {
+      description: description ?? '',
+      team_id: event.team_id,
+      channel_id: event.channel_id,
+      user_id: event.user_id,
+      thread_ts: event.mention_thread_ts,
+      files,
+    });
+  } catch (err) {
+    logger.error('Failed to store pending repo pick', {
+      error: err instanceof Error ? err.message : String(err),
+    });
+    await reply(':warning: Could not build the repo picker. Please include the repo explicitly — e.g. `@Shoof fix the bug in org/repo`.');
+    return;
+  }
+
+  const botToken = await getBotToken(event.team_id);
+  if (!botToken) {
+    await reply(':warning: The Slack integration is not fully configured (missing bot token). Ask your workspace admin to reinstall the app.');
+    return;
+  }
+
+  const message = repoPickerMessage(token, repos, event.mention_thread_ts);
+  const ok = await slackFetch(botToken, 'chat.postMessage', {
+    channel: event.channel_id,
+    text: message.text,
+    blocks: message.blocks,
+    ...(message.thread_ts && { thread_ts: message.thread_ts }),
+  });
+  if (!ok) {
+    await reply(':warning: Could not post the repo picker. Please include the repo explicitly — e.g. `@Shoof fix the bug in org/repo`.');
+  }
+}
+
+/**
+ * Complete a task submission against a resolved repo. Shared by the
+ * explicit-repo path, the single-default auto-resolve path, and (via the
+ * interactions handler) the repo-picker path.
+ */
+async function submitTaskForRepo(
+  event: MentionEvent,
+  platformUserId: string,
+  repo: string,
+  issueNumber: number | undefined,
+  description: string | undefined,
+  reply: ReplyFn,
+): Promise<void> {
   // Check if the bot can post to this channel (private channels need an invite).
   const channelCheck = await checkChannelAccess(event.team_id, event.channel_id);
   if (!channelCheck.ok) {
@@ -483,6 +585,68 @@ async function handleThreadReply(event: ThreadReplyEvent): Promise<void> {
     has_pr: prNumber !== null,
     is_clarify_hold: false,
   });
+}
+
+// ─── Set / list channel repos ──────────────────────────────────────────────────
+
+/**
+ * `/bgagent set-repo org/repo` (or `/bgagent setup org/repo`) — add a default
+ * repo to the current channel so members can @mention the bot without typing
+ * the repo. Repeated calls with different repos build up the channel's list;
+ * once several are configured, a bare @mention shows an interactive picker.
+ *
+ * Runs on both the slash-command and mention paths — the channel id and team
+ * id are present in either case.
+ */
+async function handleSetRepo(event: CommandProcessorEvent, args: string[], reply: ReplyFn): Promise<void> {
+  if (!CHANNEL_MAPPING_TABLE) {
+    await reply(':warning: Channel repo configuration is not available in this deployment.');
+    return;
+  }
+
+  const repoArg = args[0];
+  if (!repoArg) {
+    await reply('Usage: `/bgagent set-repo org/repo` — sets the default repo for this channel.\nRun it again with another repo to add more; Shoof will then ask which one to use.');
+    return;
+  }
+
+  const { repo } = parseRepoArg(repoArg);
+  if (!repo) {
+    await reply(`:x: \`${repoArg}\` doesn't look like a repo. Use the \`owner/repo\` format — e.g. \`/bgagent set-repo acme/website\`.`);
+    return;
+  }
+
+  try {
+    const repos = await addChannelRepo(CHANNEL_MAPPING_TABLE, event.team_id, event.channel_id, repo);
+    if (repos.length === 1) {
+      await reply(`:white_check_mark: This channel now defaults to \`${repo}\`.\nMembers can @mention Shoof without naming the repo — e.g. \`@Shoof fix the login bug\`.`);
+    } else {
+      await reply(
+        `:white_check_mark: Added \`${repo}\`. This channel now has ${repos.length} repos configured:\n`
+        + repos.map((r) => `• \`${r}\``).join('\n')
+        + '\n\nWhen you @mention Shoof without a repo, it will ask which one to use.',
+      );
+    }
+  } catch (err) {
+    logger.error('Failed to set channel repo', {
+      error: err instanceof Error ? err.message : String(err),
+      team_id: event.team_id,
+      channel_id: event.channel_id,
+    });
+    await reply(':warning: Could not save the channel repo. Please try again.');
+  }
+}
+
+/** `/bgagent repos` — list the repos configured for the current channel. */
+async function handleListRepos(event: CommandProcessorEvent, reply: ReplyFn): Promise<void> {
+  const repos = await getChannelRepos(CHANNEL_MAPPING_TABLE, event.team_id, event.channel_id);
+  if (repos.length === 0) {
+    await reply('This channel has no default repo set. Run `/bgagent set-repo org/repo` to add one.');
+    return;
+  }
+  await reply(
+    `*Repos configured for this channel:*\n${repos.map((r) => `• \`${r}\``).join('\n')}`,
+  );
 }
 
 // ─── Link ─────────────────────────────────────────────────────────────────────
@@ -726,31 +890,6 @@ async function lookupPlatformUser(teamId: string, userId: string): Promise<strin
   }
   logger.info('Found platform user', { slack_identity: key, platform_user_id: result.Item.platform_user_id });
   return (result.Item.platform_user_id as string) ?? null;
-}
-
-/**
- * Resolve a channel's default repo from the onboarding table
- * (`bgagent slack onboard-channel`). Returns the mapped `owner/repo` when an
- * active mapping exists, else null. Fails open (returns null) on any error so a
- * lookup blip degrades to the "please include a repo" path rather than a 500.
- */
-async function lookupChannelDefaultRepo(teamId: string, channelId: string): Promise<string | null> {
-  if (!CHANNEL_MAPPING_TABLE) return null;
-  const key = `${teamId}#${channelId}`;
-  try {
-    const result = await ddb.send(new GetCommand({
-      TableName: CHANNEL_MAPPING_TABLE,
-      Key: { channel_id: key },
-    }));
-    if (!result.Item || result.Item.status !== 'active') return null;
-    return (result.Item.repo as string) ?? null;
-  } catch (err) {
-    logger.warn('Channel default repo lookup failed, falling back to explicit-repo path', {
-      channel_id: key,
-      error: err instanceof Error ? err.message : String(err),
-    });
-    return null; // nosemgrep: ts-silent-success-masking -- fail-open is intentional; absent default → explicit-repo error path
-  }
 }
 
 async function postToSlack(responseUrl: string, text: string): Promise<void> {

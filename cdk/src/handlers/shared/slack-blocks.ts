@@ -56,6 +56,8 @@ export interface ActionButtonElement {
   readonly type: 'button';
   readonly text: PlainText;
   readonly action_id: string;
+  /** Opaque value delivered back in the interaction payload's `actions[].value`. */
+  readonly value?: string;
   readonly style?: 'primary' | 'danger';
   readonly confirm?: {
     readonly title: PlainText;
@@ -67,11 +69,28 @@ export interface ActionButtonElement {
 
 export type ButtonElement = LinkButtonElement | ActionButtonElement;
 
+/** An option in a static_select menu. */
+export interface StaticSelectOption {
+  readonly text: PlainText;
+  readonly value: string;
+}
+
+/** Static select menu element: a dropdown of predefined options. */
+export interface StaticSelectElement {
+  readonly type: 'static_select';
+  readonly action_id: string;
+  readonly placeholder: PlainText;
+  readonly options: ReadonlyArray<StaticSelectOption>;
+}
+
+/** Any interactive element an actions block can hold. */
+export type ActionElement = ButtonElement | StaticSelectElement;
+
 /** Actions block: a row of interactive elements (buttons, menus, etc.). */
 export interface ActionsBlock {
   readonly type: 'actions';
   readonly block_id: string;
-  readonly elements: ReadonlyArray<ButtonElement>;
+  readonly elements: ReadonlyArray<ActionElement>;
 }
 
 /** Any Block Kit block this module renders. */
@@ -263,7 +282,7 @@ function section(text: string): SectionBlock {
   return { type: 'section', text: { type: 'mrkdwn', text } };
 }
 
-function actions(blockId: string, elements: ReadonlyArray<ButtonElement>): ActionsBlock {
+function actions(blockId: string, elements: ReadonlyArray<ActionElement>): ActionsBlock {
   return { type: 'actions', block_id: blockId, elements };
 }
 
@@ -294,4 +313,79 @@ function dangerButton(label: string, actionId: string): ActionButtonElement {
 function prLabel(prUrl: string): string {
   const match = prUrl.match(/\/pull\/(\d+)$/);
   return match ? `#${match[1]}` : 'Pull Request';
+}
+
+// ─── Repo picker ────────────────────────────────────────────────────────────
+
+/** action_id prefix for the repo-picker callback (wired in slack-interactions.ts). */
+export const REPO_PICK_ACTION_ID = 'pick_repo';
+
+/**
+ * Above this many configured repos, a row of buttons would overflow the
+ * Slack actions-block element cap and wrap awkwardly, so the picker switches
+ * to a single static_select dropdown.
+ */
+const REPO_PICKER_BUTTON_THRESHOLD = 5;
+
+/** Slack caps button/option label text at 75 characters. */
+const REPO_LABEL_MAX_LEN = 75;
+
+/**
+ * Render an interactive repo-picker message shown when a channel has multiple
+ * default repos configured and the user submitted a bare @mention. The user
+ * picks a repo and the interaction callback (`pick_repo:{token}`) submits the
+ * task against it.
+ *
+ * Uses supported Block Kit interactive components: a row of buttons for a small
+ * number of repos, or a static_select dropdown once the list grows past
+ * {@link REPO_PICKER_BUTTON_THRESHOLD}.
+ *
+ * @param token - opaque pending-pick token round-tripped through the action.
+ * @param repos - the channel's configured `owner/repo` defaults.
+ * @param threadTs - optional thread to post the picker into.
+ */
+export function repoPickerMessage(token: string, repos: string[], threadTs?: string): SlackMessage {
+  const actionId = `${REPO_PICK_ACTION_ID}:${token}`;
+  const prompt = ':point_down: This channel has multiple repos configured. Which one is this task for?';
+
+  const elements: ActionElement[] = repos.length > REPO_PICKER_BUTTON_THRESHOLD
+    ? [repoSelect(actionId, repos)]
+    : repos.map((repo) => repoButton(actionId, repo));
+
+  const blocks: SlackBlock[] = [section(prompt), actions(token, elements)];
+
+  return {
+    text: 'Which repo is this task for?',
+    blocks,
+    ...(threadTs && { thread_ts: threadTs }),
+  };
+}
+
+/**
+ * A button that submits the pending task against `repo` when clicked.
+ *
+ * The repo is carried in `value`; the `action_id` embeds the repo too so that
+ * a Block Kit actions block with several repo buttons keeps each action_id
+ * unique (Slack rejects duplicate action_ids within a block).
+ */
+function repoButton(actionId: string, repo: string): ActionButtonElement {
+  return {
+    type: 'button',
+    text: { type: 'plain_text', text: truncate(repo, REPO_LABEL_MAX_LEN) },
+    action_id: `${actionId}#${repo}`,
+    value: repo,
+  };
+}
+
+/** A static_select dropdown listing every configured repo. */
+function repoSelect(actionId: string, repos: string[]): StaticSelectElement {
+  return {
+    type: 'static_select',
+    action_id: actionId,
+    placeholder: { type: 'plain_text', text: 'Choose a repo' },
+    options: repos.map((repo) => ({
+      text: { type: 'plain_text', text: truncate(repo, REPO_LABEL_MAX_LEN) },
+      value: repo,
+    })),
+  };
 }

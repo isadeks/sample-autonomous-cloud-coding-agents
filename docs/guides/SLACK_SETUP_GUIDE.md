@@ -20,6 +20,7 @@ This single command handles everything: deploying the stack (if needed), generat
 ## How it works
 
 - **@Shoof mentions**: `@Shoof fix the bug in org/repo#42` submits a task. Reactions on your message show progress: :eyes: (received) → :hourglass_flowing_sand: (working) → :white_check_mark: (done)
+- **Saved channel repos**: `/bgagent set-repo org/repo` lets a channel default one or more repos, so bare mentions like `@Shoof fix the bug` resolve automatically (with an interactive picker when several are configured)
 - **DMs**: Message Shoof directly for private task submissions
 - **Notifications**: Threaded messages show task_created → completed (with PR link, duration, cost). The Cancel button lets you stop a running task.
 - **Multi-workspace**: Each workspace installs via OAuth and gets its own bot token
@@ -118,6 +119,35 @@ For private submissions, DM Shoof directly:
 fix the login bug in org/repo#42
 ```
 
+### Set a default repo for a channel
+
+So members don't have to type `owner/repo` every time, set one or more default
+repos for the channel:
+```
+/bgagent set-repo org/repo
+```
+Once a default is set, a bare mention resolves the repo automatically:
+```
+@Shoof fix the login bug
+```
+
+Run `set-repo` again with a different repo to configure several. When a channel
+has **more than one** default, a bare mention shows an interactive picker
+(buttons, or a dropdown once the list grows) so you can choose which repo the
+task is for. List the configured repos with `/bgagent repos`.
+
+The explicit `in org/repo` form always wins, so one-off cross-repo tasks still
+work in a channel that has defaults:
+```
+@Shoof fix the auth bug in other-org/other-repo
+```
+
+If no default is set and you don't name a repo, Shoof replies with a prompt to
+run `/bgagent set-repo` rather than silently doing nothing.
+
+> Admins can also seed a channel default from the CLI with
+> `bgagent slack onboard-channel <channel-id> --repo org/repo`.
+
 ### Cancel a task
 
 Click the **Cancel Task** button in the thread while the agent is working.
@@ -133,6 +163,8 @@ Click the **Cancel Task** button in the thread while the agent is working.
 | Command | Purpose |
 |---------|---------|
 | `/bgagent link` | Link your Slack account (one-time) |
+| `/bgagent set-repo org/repo` | Add a default repo for this channel (run again to add more) |
+| `/bgagent repos` | List the repos configured for this channel |
 | `/bgagent help` | Show usage instructions |
 
 ## Troubleshooting
