@@ -43,7 +43,7 @@ process.env.SLACK_USER_MAPPING_TABLE_NAME = 'SlackMap';
 process.env.SLACK_INSTALLATION_TABLE_NAME = 'SlackInstall';
 process.env.SLACK_CHANNEL_MAPPING_TABLE_NAME = 'SlackChannelMap';
 
-import { handler, type MentionEvent, type SlashCommandEvent } from '../../src/handlers/slack-command-processor';
+import { handler, parseWorkflowPrefix, type MentionEvent, type SlashCommandEvent } from '../../src/handlers/slack-command-processor';
 
 function mention(overrides: Partial<MentionEvent> = {}): MentionEvent {
   return {
@@ -82,6 +82,69 @@ function isSlackHooksRequestUrl(url: unknown): boolean {
     return false;
   }
 }
+
+// ─── parseWorkflowPrefix ─────────────────────────────────────────────────────
+
+describe('parseWorkflowPrefix', () => {
+  test('returns null for plain text', () => {
+    expect(parseWorkflowPrefix('fix the login bug')).toBeNull();
+    expect(parseWorkflowPrefix('org/repo update README')).toBeNull();
+    expect(parseWorkflowPrefix('')).toBeNull();
+  });
+
+  test('detects decompose: prefix', () => {
+    const result = parseWorkflowPrefix('decompose: refactor the auth module in org/repo');
+    expect(result).not.toBeNull();
+    expect(result!.workflow_ref).toBe('coding/decompose-v1');
+    expect(result!.rest).toBe('refactor the auth module in org/repo');
+    expect(result!.pr_number).toBeUndefined();
+  });
+
+  test('detects decompose: prefix case-insensitively', () => {
+    const result = parseWorkflowPrefix('DECOMPOSE: plan the migration');
+    expect(result!.workflow_ref).toBe('coding/decompose-v1');
+  });
+
+  test('detects review: prefix', () => {
+    const result = parseWorkflowPrefix('review: check for security issues in org/repo');
+    expect(result).not.toBeNull();
+    expect(result!.workflow_ref).toBe('coding/pr-review-v1');
+    expect(result!.rest).toBe('check for security issues in org/repo');
+    expect(result!.pr_number).toBeUndefined();
+  });
+
+  test('detects review pr #N pattern', () => {
+    const result = parseWorkflowPrefix('review pr #42 in org/repo');
+    expect(result).not.toBeNull();
+    expect(result!.workflow_ref).toBe('coding/pr-review-v1');
+    expect(result!.pr_number).toBe(42);
+    expect(result!.rest).toBe('in org/repo');
+  });
+
+  test('detects review pr N pattern (no hash)', () => {
+    const result = parseWorkflowPrefix('review pr 100 check the changes');
+    expect(result!.pr_number).toBe(100);
+    expect(result!.workflow_ref).toBe('coding/pr-review-v1');
+  });
+
+  test('detects iterate: prefix', () => {
+    const result = parseWorkflowPrefix('iterate: apply review comments in org/repo');
+    expect(result).not.toBeNull();
+    expect(result!.workflow_ref).toBe('coding/pr-iteration-v1');
+    expect(result!.rest).toBe('apply review comments in org/repo');
+    expect(result!.pr_number).toBeUndefined();
+  });
+
+  test('detects iterate pr #N pattern', () => {
+    const result = parseWorkflowPrefix('iterate pr #7 fix the types');
+    expect(result).not.toBeNull();
+    expect(result!.workflow_ref).toBe('coding/pr-iteration-v1');
+    expect(result!.pr_number).toBe(7);
+    expect(result!.rest).toBe('fix the types');
+  });
+});
+
+// ─── workflow routing in handler ─────────────────────────────────────────────
 
 describe('slack-command-processor handler', () => {
   beforeEach(() => {
@@ -266,6 +329,99 @@ describe('slack-command-processor handler', () => {
       ([url, opts]) => String((opts as { body: string }).body).includes('Using Shoof'),
     );
     expect(posted).toBeTruthy();
+  });
+
+  // ─── Keyword-prefix workflow routing ─────────────────────────────────────────
+
+  describe('keyword prefix routing', () => {
+    beforeEach(() => {
+      // Linked user, public channel
+      ddbSend.mockResolvedValueOnce({ Item: { status: 'active', platform_user_id: 'cognito-1' } });
+      ddbSend.mockResolvedValue({ Item: { status: 'active' } });
+      fetchMock.mockResolvedValueOnce({
+        ok: true,
+        json: () => Promise.resolve({ ok: true, channel: { is_private: false, is_member: true } }),
+      });
+      createTaskCoreMock.mockResolvedValueOnce({
+        statusCode: 201,
+        body: JSON.stringify({ data: { task_id: 'T1' } }),
+      });
+    });
+
+    test('decompose: prefix routes to coding/decompose-v1', async () => {
+      await handler(mention({ text: 'submit decompose: plan the auth refactor in org/repo' }));
+      expect(createTaskCoreMock).toHaveBeenCalledTimes(1);
+      const [reqBody] = createTaskCoreMock.mock.calls[0];
+      expect(reqBody.workflow_ref).toBe('coding/decompose-v1');
+      expect(reqBody.repo).toBe('org/repo');
+    });
+
+    test('review pr #N routes to coding/pr-review-v1 with pr_number', async () => {
+      await handler(mention({ text: 'submit review pr #42 in org/repo' }));
+      expect(createTaskCoreMock).toHaveBeenCalledTimes(1);
+      const [reqBody] = createTaskCoreMock.mock.calls[0];
+      expect(reqBody.workflow_ref).toBe('coding/pr-review-v1');
+      expect(reqBody.pr_number).toBe(42);
+      expect(reqBody.repo).toBe('org/repo');
+    });
+
+    test('iterate: prefix routes to coding/pr-iteration-v1', async () => {
+      await handler(mention({ text: 'submit iterate: apply the review comments in org/repo' }));
+      expect(createTaskCoreMock).toHaveBeenCalledTimes(1);
+      const [reqBody] = createTaskCoreMock.mock.calls[0];
+      expect(reqBody.workflow_ref).toBe('coding/pr-iteration-v1');
+      expect(reqBody.repo).toBe('org/repo');
+    });
+
+    test('review: prefix routes to coding/pr-review-v1 without pr_number', async () => {
+      await handler(mention({ text: 'submit review: look for security issues in org/repo' }));
+      expect(createTaskCoreMock).toHaveBeenCalledTimes(1);
+      const [reqBody] = createTaskCoreMock.mock.calls[0];
+      expect(reqBody.workflow_ref).toBe('coding/pr-review-v1');
+      expect(reqBody.pr_number).toBeUndefined();
+    });
+  });
+
+  // ─── pre-resolved workflow_ref from events handler ────────────────────────
+
+  describe('pre-resolved workflow_ref and pr_number from events handler', () => {
+    beforeEach(() => {
+      // Linked user, public channel
+      ddbSend.mockResolvedValueOnce({ Item: { status: 'active', platform_user_id: 'cognito-1' } });
+      ddbSend.mockResolvedValue({ Item: { status: 'active' } });
+      fetchMock.mockResolvedValueOnce({
+        ok: true,
+        json: () => Promise.resolve({ ok: true, channel: { is_private: false, is_member: true } }),
+      });
+      createTaskCoreMock.mockResolvedValueOnce({
+        statusCode: 201,
+        body: JSON.stringify({ data: { task_id: 'T1' } }),
+      });
+    });
+
+    test('passes pre-resolved workflow_ref and pr_number through to createTaskCore', async () => {
+      await handler(mention({
+        text: 'submit org/repo',
+        workflow_ref: 'coding/pr-iteration-v1',
+        pr_number: 55,
+      }));
+      expect(createTaskCoreMock).toHaveBeenCalledTimes(1);
+      const [reqBody] = createTaskCoreMock.mock.calls[0];
+      expect(reqBody.workflow_ref).toBe('coding/pr-iteration-v1');
+      expect(reqBody.pr_number).toBe(55);
+      expect(reqBody.repo).toBe('org/repo');
+    });
+
+    test('passes pre_built_description to createTaskCore', async () => {
+      await handler(mention({
+        text: 'submit org/repo',
+        workflow_ref: 'coding/new-task-v1',
+        pre_built_description: 'Original ask. You asked: ...\nThe reviewer answered: yes',
+      }));
+      expect(createTaskCoreMock).toHaveBeenCalledTimes(1);
+      const [reqBody] = createTaskCoreMock.mock.calls[0];
+      expect(reqBody.task_description).toBe('Original ask. You asked: ...\nThe reviewer answered: yes');
+    });
   });
 
   // ─── Slack file attachment extraction ────────────────────────────────────────

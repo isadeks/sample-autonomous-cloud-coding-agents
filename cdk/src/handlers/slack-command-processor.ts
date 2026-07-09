@@ -57,6 +57,24 @@ export interface MentionEvent extends BasePayload {
   readonly source: 'mention';
   readonly mention_thread_ts?: string;
   readonly files?: readonly SlackFileRef[];
+  /**
+   * Optional workflow selector pre-resolved by the events handler (e.g. from
+   * a keyword prefix like "decompose: …" or a thread-reply context lookup).
+   * When present, passed directly to ``createTaskCore`` as ``workflow_ref`` so
+   * the user does not need to know the internal workflow id string.
+   */
+  readonly workflow_ref?: string;
+  /**
+   * Optional PR number pre-resolved by the events handler for PR-targeted
+   * workflows (``coding/pr-iteration-v1``, ``coding/pr-review-v1``).
+   */
+  readonly pr_number?: number;
+  /**
+   * Optional pre-built task description for clarify-resume paths, where the
+   * events handler already assembled the description from the held task's
+   * original ask, the question, and the user's reply.
+   */
+  readonly pre_built_description?: string;
 }
 
 /** Discriminated union of the inbound events the processor accepts. */
@@ -128,6 +146,15 @@ export async function handler(raw: RawEvent): Promise<void> {
           + '*Submit a task:* Mention `@Shoof` in any channel:\n'
           + '> `@Shoof fix the login bug in org/repo#42`\n'
           + '> `@Shoof update the README in org/repo`\n\n'
+          + '*Plan before coding (decompose):*\n'
+          + '> `@Shoof decompose: refactor the auth module in org/repo`\n\n'
+          + '*Review a PR (read-only):*\n'
+          + '> `@Shoof review pr #42 in org/repo`\n'
+          + '> `@Shoof review: check the auth module for security issues in org/repo`\n\n'
+          + '*Iterate on an existing PR:*\n'
+          + '> `@Shoof iterate pr #42 in org/repo`\n'
+          + '> `@Shoof iterate: apply the reviewer comments in org/repo`\n\n'
+          + '*Reply in a task thread:* Reply to an agent message to iterate on the PR or continue a held task — no need to type the PR number.\n\n'
           + '*Private submissions:* DM Shoof directly.\n\n'
           + '*Cancel a task:* Use the Cancel button in the thread.\n\n'
           + '*Link your account:* `/bgagent link` — one-time setup.\n\n'
@@ -177,6 +204,77 @@ function buildMentionReply(event: MentionEvent): ReplyFn {
   };
 }
 
+// ─── Keyword-prefix workflow routing ─────────────────────────────────────────
+
+/**
+ * Keyword prefixes a user can type before their task description to select a
+ * non-default workflow. Matching is case-insensitive and the prefix (including
+ * the trailing colon or space) is stripped before the description is extracted.
+ *
+ * Supported prefixes:
+ *   ``decompose: <description>``  → ``coding/decompose-v1`` (plan before code)
+ *   ``review: <description>``     → ``coding/pr-review-v1`` (read-only PR review)
+ *   ``review pr #N``              → ``coding/pr-review-v1`` with pr_number=N
+ *   ``iterate: <description>``    → ``coding/pr-iteration-v1`` (update existing PR)
+ *   ``iterate pr #N``             → ``coding/pr-iteration-v1`` with pr_number=N
+ */
+export interface WorkflowHint {
+  readonly workflow_ref: string;
+  /** Remaining text after stripping the prefix. */
+  readonly rest: string;
+  /** PR number parsed from ``review pr #N`` / ``iterate pr #N`` patterns. */
+  readonly pr_number?: number;
+}
+
+/**
+ * Detect and extract a keyword workflow prefix from the message text that
+ * follows the ``submit`` token. Returns ``null`` when no prefix is present
+ * (the caller uses the default ``coding/new-task-v1`` path).
+ *
+ * Exported for unit testing.
+ */
+export function parseWorkflowPrefix(text: string): WorkflowHint | null {
+  // ``decompose: <desc>`` — route to planning workflow
+  const decomposeMatch = text.match(/^decompose:\s*(.*)/is);
+  if (decomposeMatch) {
+    return { workflow_ref: 'coding/decompose-v1', rest: decomposeMatch[1].trim() };
+  }
+
+  // ``review pr #N`` / ``review pr N`` — explicit PR-review with a PR number
+  const reviewPrMatch = text.match(/^review\s+pr\s+#?(\d+)\b(.*)/is);
+  if (reviewPrMatch) {
+    return {
+      workflow_ref: 'coding/pr-review-v1',
+      pr_number: parseInt(reviewPrMatch[1], 10),
+      rest: reviewPrMatch[2].trim(),
+    };
+  }
+
+  // ``review: <desc>`` — PR review by description (no explicit PR number)
+  const reviewMatch = text.match(/^review:\s*(.*)/is);
+  if (reviewMatch) {
+    return { workflow_ref: 'coding/pr-review-v1', rest: reviewMatch[1].trim() };
+  }
+
+  // ``iterate pr #N`` / ``iterate pr N`` — explicit PR-iteration with a PR number
+  const iteratePrMatch = text.match(/^iterate\s+pr\s+#?(\d+)\b(.*)/is);
+  if (iteratePrMatch) {
+    return {
+      workflow_ref: 'coding/pr-iteration-v1',
+      pr_number: parseInt(iteratePrMatch[1], 10),
+      rest: iteratePrMatch[2].trim(),
+    };
+  }
+
+  // ``iterate: <desc>`` — PR iteration by description (no explicit PR number)
+  const iterateMatch = text.match(/^iterate:\s*(.*)/is);
+  if (iterateMatch) {
+    return { workflow_ref: 'coding/pr-iteration-v1', rest: iterateMatch[1].trim() };
+  }
+
+  return null;
+}
+
 // ─── Submit ───────────────────────────────────────────────────────────────────
 
 async function handleSubmit(event: MentionEvent, args: string[], reply: ReplyFn): Promise<void> {
@@ -195,27 +293,83 @@ async function handleSubmit(event: MentionEvent, args: string[], reply: ReplyFn)
     return;
   }
 
-  // Resolve the target repo. Two ways:
-  //   1. The user typed it: "org/repo#42 <description>" — first arg is the repo,
-  //      the rest is the description.
-  //   2. The user omitted it and the channel has an onboarded default repo
-  //      (`bgagent slack onboard-channel`) — the WHOLE message is the description.
-  const repoArg = args[0];
+  // ── Workflow routing ────────────────────────────────────────────────────────
+  // 1. Events handler may supply a pre-resolved workflow_ref (e.g. from a
+  //    thread-reply context lookup or an explicit keyword prefix).
+  // 2. Otherwise, check for a keyword prefix in the message text.
+  // 3. Default: coding/new-task-v1 (resolved by createTaskCore from the repo).
+  let workflowRef: string | undefined = event.workflow_ref;
+  let prNumber: number | undefined = event.pr_number;
+  let workflowHintRest: string | undefined;
+
+  const fullText = args.join(' ');
+
+  if (!workflowRef) {
+    const hint = parseWorkflowPrefix(fullText);
+    if (hint) {
+      workflowRef = hint.workflow_ref;
+      prNumber = hint.pr_number;
+      workflowHintRest = hint.rest;
+    }
+  }
+
+  // ── Repo resolution ─────────────────────────────────────────────────────────
+  // When a workflow hint stripped a prefix, the remaining text is the description
+  // (possibly starting with a repo token). When there's no hint, args[0] may be
+  // a repo token. When neither, fall back to the channel default repo.
+  const effectiveArgs = workflowHintRest !== undefined
+    ? workflowHintRest.split(/\s+/).filter(Boolean)
+    : args;
+
+  const repoArg = effectiveArgs[0] ?? '';
   let { repo, issueNumber } = parseRepoArg(repoArg);
   let description: string | undefined;
   if (repo) {
-    description = args.slice(1).join(' ') || undefined;
+    description = effectiveArgs.slice(1).join(' ') || undefined;
   } else {
+    // When the repo is not the first token (e.g. after stripping a keyword
+    // prefix like "decompose:", "review:", etc.), scan the full effective text
+    // for an embedded ``org/repo`` pattern — the user may write
+    // "@Shoof decompose: plan the auth refactor in org/repo".
+    const fullEffectiveText = effectiveArgs.join(' ');
+    const embeddedRepoMatch = fullEffectiveText.match(/\b([a-zA-Z0-9._-]+\/[a-zA-Z0-9._-]+(?:#\d+)?)\b/);
+    if (embeddedRepoMatch) {
+      const parsed = parseRepoArg(embeddedRepoMatch[1]);
+      if (parsed.repo) {
+        repo = parsed.repo;
+        issueNumber = parsed.issueNumber;
+        description = fullEffectiveText.replace(embeddedRepoMatch[0], '').replace(/\s+/g, ' ').trim() || undefined;
+      }
+    }
+    if (!repo) {
+      const defaultRepo = await lookupChannelDefaultRepo(event.team_id, event.channel_id);
+      if (defaultRepo) {
+        repo = defaultRepo;
+        issueNumber = undefined;
+        // No repo token was consumed, so the effective text is the description.
+        description = effectiveArgs.join(' ') || undefined;
+      }
+    }
+  }
+
+  // PR workflows (pr-iteration-v1, pr-review-v1) don't necessarily need a repo
+  // parsed from the text — pr_number identifies the target. However, createTaskCore
+  // still requires repo for repo-bound workflows. If no repo was parsed and we
+  // have a PR-targeted workflow, attempt to use the channel default repo.
+  if (!repo && prNumber !== undefined) {
     const defaultRepo = await lookupChannelDefaultRepo(event.team_id, event.channel_id);
     if (defaultRepo) {
       repo = defaultRepo;
-      issueNumber = undefined;
-      // No repo token was consumed, so the entire message is the description.
-      description = args.join(' ') || undefined;
     }
   }
+
   if (!repo) {
-    await reply('Please include a repo — e.g. `@Shoof fix the bug in org/repo#42`. Or ask an admin to set a default with `bgagent slack onboard-channel`.');
+    // For PR workflows, give a more targeted hint.
+    if (workflowRef && (workflowRef === 'coding/pr-iteration-v1' || workflowRef === 'coding/pr-review-v1')) {
+      await reply('Please include a repo — e.g. `@Shoof review pr #42 in org/repo` or `@Shoof iterate: fix the tests in org/repo`.');
+    } else {
+      await reply('Please include a repo — e.g. `@Shoof fix the bug in org/repo#42`. Or ask an admin to set a default with `bgagent slack onboard-channel`.');
+    }
     if (event.mention_thread_ts) {
       await swapReaction(event.team_id, event.channel_id, event.mention_thread_ts, 'eyes', 'x');
     }
@@ -251,12 +405,19 @@ async function handleSubmit(event: MentionEvent, args: string[], reply: ReplyFn)
     return;
   }
 
+  // Resolve the task description. For clarify-resume paths the events handler
+  // pre-builds the full description (original ask + question + answer); use it
+  // directly rather than the raw message text.
+  const taskDescription = event.pre_built_description ?? description;
+
   // Create the task through the shared core.
   const result = await createTaskCore(
     {
       repo,
       issue_number: issueNumber,
-      task_description: description,
+      task_description: taskDescription,
+      ...(workflowRef && { workflow_ref: workflowRef }),
+      ...(prNumber !== undefined && { pr_number: prNumber }),
       ...(attachments.length > 0 && { attachments }),
     },
     {
