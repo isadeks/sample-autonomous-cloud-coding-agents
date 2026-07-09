@@ -33,6 +33,8 @@
 
 Users submit tasks through webhooks, CLI, Slack, Linear, Jira,... For each task, the orchestrator executes the blueprint: an isolated environment is provisioned, an agent clones the target GitHub repository, creates a branch, works on the task, and opens a pull request.
 
+Adding the `abca` label to a Linear issue dispatches a coding task for that issue.
+
 Key characteristics:
 
 - **Ephemeral environments** — each task starts fresh, no in-process state carries over
