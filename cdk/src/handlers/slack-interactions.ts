@@ -18,16 +18,30 @@
  */
 
 import { DynamoDBClient } from '@aws-sdk/client-dynamodb';
+import { InvokeCommand, LambdaClient } from '@aws-sdk/client-lambda';
 import { DynamoDBDocumentClient, GetCommand, UpdateCommand } from '@aws-sdk/lib-dynamodb';
 import type { APIGatewayProxyEvent, APIGatewayProxyResult } from 'aws-lambda';
 import { logger } from './shared/logger';
+import { REPO_PICK_ACTION_ID } from './shared/slack-blocks';
+import {
+  deletePendingRepoPick,
+  getPendingRepoPick,
+} from './shared/slack-channel-config';
 import { getSlackSecret, SLACK_SECRET_PREFIX, verifySlackRequest } from './shared/slack-verify';
+import type { MentionEvent } from './slack-command-processor';
 
 const ddb = DynamoDBDocumentClient.from(new DynamoDBClient({}));
+const lambdaClient = new LambdaClient({});
 
 const SIGNING_SECRET_ARN = process.env.SLACK_SIGNING_SECRET_ARN!;
 const TASK_TABLE = process.env.TASK_TABLE_NAME!;
 const USER_MAPPING_TABLE = process.env.SLACK_USER_MAPPING_TABLE_NAME!;
+const CHANNEL_MAPPING_TABLE = process.env.SLACK_CHANNEL_MAPPING_TABLE_NAME;
+const PROCESSOR_FUNCTION_NAME = process.env.SLACK_COMMAND_PROCESSOR_FUNCTION_NAME;
+
+interface SlackSelectedOption {
+  readonly value: string;
+}
 
 interface SlackInteractionPayload {
   readonly type: string;
@@ -36,6 +50,7 @@ interface SlackInteractionPayload {
     readonly action_id: string;
     readonly block_id: string;
     readonly value?: string;
+    readonly selected_option?: SlackSelectedOption;
   }>;
   readonly response_url: string;
   readonly trigger_id: string;
@@ -83,6 +98,8 @@ export async function handler(event: APIGatewayProxyEvent): Promise<APIGatewayPr
       for (const action of payload.actions) {
         if (action.action_id.startsWith('cancel_task:')) {
           await handleCancelAction(payload, action.action_id);
+        } else if (action.action_id.startsWith(`${REPO_PICK_ACTION_ID}:`)) {
+          await handleRepoPickAction(payload, action);
         }
       }
     }
@@ -178,6 +195,84 @@ async function handleCancelAction(payload: SlackInteractionPayload, actionId: st
   }
 }
 
+/**
+ * Handle a repo-picker selection (button click or static_select choice).
+ *
+ * The action carries the picked repo (button `value`, or the dropdown's
+ * `selected_option.value`) and a pending-pick token embedded in the action_id
+ * (`pick_repo:{token}`). We load the stashed submission context, re-synthesize
+ * the mention event as `submit {repo} {description}`, and hand it back to the
+ * command processor Lambda so all the existing submit logic (account link,
+ * channel access, attachment download, task creation) runs unchanged.
+ */
+async function handleRepoPickAction(
+  payload: SlackInteractionPayload,
+  action: NonNullable<SlackInteractionPayload['actions']>[number],
+): Promise<void> {
+  // action_id is `pick_repo:{token}` (dropdown) or `pick_repo:{token}#{repo}` (button).
+  const rest = action.action_id.slice(`${REPO_PICK_ACTION_ID}:`.length);
+  const token = rest.split('#')[0];
+  const repo = action.selected_option?.value ?? action.value;
+
+  if (!CHANNEL_MAPPING_TABLE || !PROCESSOR_FUNCTION_NAME) {
+    logger.warn('Repo pick received but channel/processor wiring is missing');
+    await postToResponseUrl(payload.response_url, ':warning: Repo picker is not available in this deployment.');
+    return;
+  }
+
+  if (!token || !repo) {
+    logger.warn('Repo pick action missing token or repo', { action_id: action.action_id });
+    await postToResponseUrl(payload.response_url, ':warning: Could not read your selection. Please try again.');
+    return;
+  }
+
+  const pending = await getPendingRepoPick(CHANNEL_MAPPING_TABLE, token);
+  if (!pending) {
+    await postToResponseUrl(payload.response_url, ':hourglass: This repo picker has expired. Mention Shoof again to submit your task.');
+    return;
+  }
+
+  // Only the user who triggered the picker may resolve it — another member
+  // clicking the buttons in-channel shouldn't submit a task as them.
+  if (pending.user_id !== payload.user.id) {
+    await postToResponseUrl(payload.response_url, ':no_entry: Only the person who asked can pick the repo for this task.');
+    return;
+  }
+
+  // Replace the picker message so the buttons/dropdown don't get clicked twice.
+  await postToResponseUrl(payload.response_url, `:white_check_mark: Submitting your task against \`${repo}\`…`, true);
+
+  // Re-synthesize the original mention as an explicit-repo submit so the
+  // command processor's submit path runs unchanged.
+  const description = pending.description ? ` ${pending.description}` : '';
+  const mentionPayload: MentionEvent = {
+    source: 'mention',
+    text: `submit ${repo}${description}`,
+    user_id: pending.user_id,
+    team_id: pending.team_id,
+    channel_id: pending.channel_id,
+    ...(pending.thread_ts && { mention_thread_ts: pending.thread_ts }),
+    ...(pending.files && pending.files.length > 0 && { files: pending.files }),
+  };
+
+  try {
+    await lambdaClient.send(new InvokeCommand({
+      FunctionName: PROCESSOR_FUNCTION_NAME,
+      InvocationType: 'Event',
+      Payload: new TextEncoder().encode(JSON.stringify(mentionPayload)),
+    }));
+  } catch (err) {
+    logger.error('Failed to forward repo pick to command processor', {
+      error: err instanceof Error ? err.message : String(err),
+    });
+    await postToResponseUrl(payload.response_url, ':x: Could not submit your task. Please try mentioning Shoof again.');
+    return;
+  }
+
+  // Best-effort cleanup — TTL is the backstop.
+  await deletePendingRepoPick(CHANNEL_MAPPING_TABLE, token);
+}
+
 async function updateSlackMessage(botToken: string, channel: string, ts: string, text: string, threadTs?: string): Promise<void> {
   try {
     const payload: Record<string, unknown> = {
@@ -223,12 +318,15 @@ async function deleteSlackMessage(botToken: string, channel: string, ts: string)
   }
 }
 
-async function postToResponseUrl(responseUrl: string, text: string): Promise<void> {
+async function postToResponseUrl(responseUrl: string, text: string, replaceOriginal = false): Promise<void> {
   try {
     await fetch(responseUrl, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ response_type: 'ephemeral', text, replace_original: false }),
+      // `replace_original` swaps the interactive message (e.g. the repo picker)
+      // for a confirmation so its buttons can't be clicked twice; otherwise the
+      // reply is posted alongside the original message.
+      body: JSON.stringify({ response_type: 'ephemeral', text, replace_original: replaceOriginal }),
     });
   } catch (err) {
     logger.warn('Failed to post to interaction response_url', {

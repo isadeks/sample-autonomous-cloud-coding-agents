@@ -32,7 +32,7 @@ function buildTask(overrides: Partial<TaskDetail> = {}): TaskDetail {
     status: 'RUNNING',
     repo: 'org/repo',
     issue_number: null,
-    task_type: 'new_task',
+    resolved_workflow: { id: 'coding/new-task-v1', version: '1.0.0' },
     pr_number: null,
     task_description: 'fix bug',
     branch_name: 'bgagent/abc123/fix',
@@ -55,6 +55,7 @@ function buildTask(overrides: Partial<TaskDetail> = {}): TaskDetail {
     turns_completed: null,
     trace: false,
     trace_s3_uri: null,
+    artifact_uri: null,
     attachments: null,
     approval_gate_count: 0,
     approval_gate_cap: 50,
@@ -314,33 +315,56 @@ describe('formatStatusSnapshot', () => {
     expect(rendered).not.toContain('Trace S3:');
   });
 
-  // ---- Type + Reason (PR #52 CLI UX carry-forward) ----
-
-  test('renders Type line for pr_iteration tasks with PR number', () => {
-    const task = buildTask({ task_type: 'pr_iteration', pr_number: 42 });
+  test('renders Artifact line when artifact_uri is non-null (#248 Phase 3)', () => {
+    const task = buildTask({ artifact_uri: 's3://artifacts-bkt/artifacts/abc123/result.md' });
     const rendered = formatStatusSnapshot(task, [], NOW);
-    expect(rendered).toContain('Type:          pr_iteration (PR #42)');
+    expect(rendered).toContain('Artifact:      s3://artifacts-bkt/artifacts/abc123/result.md');
   });
 
-  test('renders Type line for pr_review tasks', () => {
-    const task = buildTask({ task_type: 'pr_review', pr_number: 7 });
+  test('omits Artifact line when artifact_uri is null', () => {
+    const task = buildTask();
     const rendered = formatStatusSnapshot(task, [], NOW);
-    expect(rendered).toContain('Type:          pr_review (PR #7)');
+    expect(rendered).not.toContain('Artifact:');
   });
 
-  test('omits Type line for new_task (the compact default path)', () => {
-    const task = buildTask({ task_type: 'new_task' });
+  // ---- Workflow + Reason (PR #52 CLI UX carry-forward) ----
+
+  test('renders Workflow line for pr_iteration tasks with PR number', () => {
+    const task = buildTask({
+      resolved_workflow: { id: 'coding/pr-iteration-v1', version: '1.0.0' },
+      pr_number: 42,
+    });
     const rendered = formatStatusSnapshot(task, [], NOW);
-    expect(rendered).not.toContain('Type:');
+    expect(rendered).toContain('Workflow:      coding/pr-iteration-v1 (PR #42)');
   });
 
-  test('omits PR-number suffix on Type line when pr_number is absent', () => {
+  test('renders Workflow line for pr_review tasks', () => {
+    const task = buildTask({
+      resolved_workflow: { id: 'coding/pr-review-v1', version: '1.0.0' },
+      pr_number: 7,
+    });
+    const rendered = formatStatusSnapshot(task, [], NOW);
+    expect(rendered).toContain('Workflow:      coding/pr-review-v1 (PR #7)');
+  });
+
+  test('omits Workflow line for the default coding/new-task-v1 (compact path)', () => {
+    const task = buildTask({
+      resolved_workflow: { id: 'coding/new-task-v1', version: '1.0.0' },
+    });
+    const rendered = formatStatusSnapshot(task, [], NOW);
+    expect(rendered).not.toContain('Workflow:');
+  });
+
+  test('omits PR-number suffix on Workflow line when pr_number is absent', () => {
     // Defensive: a pr_iteration task without a pr_number would be a
     // server-side data shape oddity, but the renderer must not emit a
     // dangling "PR #undefined".
-    const task = buildTask({ task_type: 'pr_iteration', pr_number: null });
+    const task = buildTask({
+      resolved_workflow: { id: 'coding/pr-iteration-v1', version: '1.0.0' },
+      pr_number: null,
+    });
     const rendered = formatStatusSnapshot(task, [], NOW);
-    expect(rendered).toContain('Type:          pr_iteration\n');
+    expect(rendered).toContain('Workflow:      coding/pr-iteration-v1\n');
     expect(rendered).not.toContain('PR #');
   });
 
@@ -498,5 +522,111 @@ describe('formatStatusSnapshot', () => {
     // the wrapper splits on whitespace.
     expect(rendered).toContain('Description:   Fix the bug');
     expect(rendered).not.toContain('  Description:     ');
+  });
+
+  // --- #251: blocker surface ---
+
+  test('surfaces the latest agent_blocked event with resource + hint', () => {
+    const task = buildTask();
+    const events: TaskEvent[] = [
+      mkEvent({
+        event_id: '01ARZ3NDEKTSV4RRFFQ69G5F10',
+        event_type: 'agent_blocked',
+        timestamp: '2026-04-29T15:29:20Z', // 60s before NOW
+        metadata: {
+          kind: 'egress_denied',
+          detail: 'connection refused',
+          remediation_hint: 'allowlist registry.npmjs.org in DNS Firewall',
+          retryable: false,
+          resource: 'registry.npmjs.org',
+        },
+      }),
+    ];
+    const rendered = formatStatusSnapshot(task, events, NOW);
+    expect(rendered).toContain('Blocker:       egress_denied [registry.npmjs.org] (1m 00s ago) — allowlist registry.npmjs.org in DNS Firewall');
+  });
+
+  test('surfaces the most recent blocker when several were emitted', () => {
+    const task = buildTask();
+    const events: TaskEvent[] = [
+      mkEvent({
+        event_id: '01ARZ3NDEKTSV4RRFFQ69G5F10',
+        event_type: 'agent_blocked',
+        timestamp: '2026-04-29T15:00:00Z', // earlier
+        metadata: {
+          kind: 'dependency_unreachable',
+          detail: 'npm registry timeout',
+          remediation_hint: 'retry the task',
+          retryable: true,
+          resource: 'registry.npmjs.org',
+        },
+      }),
+      mkEvent({
+        event_id: '01ARZ3NDEKTSV4RRFFQ69G5F20',
+        event_type: 'agent_blocked',
+        timestamp: '2026-04-29T15:29:20Z', // later → wins
+        metadata: {
+          kind: 'egress_denied',
+          detail: 'connection refused',
+          remediation_hint: 'allowlist api.example.com in DNS Firewall',
+          retryable: false,
+          resource: 'api.example.com',
+        },
+      }),
+    ];
+    const rendered = formatStatusSnapshot(task, events, NOW);
+    expect(rendered).toContain('Blocker:       egress_denied [api.example.com]');
+    expect(rendered).not.toContain('dependency_unreachable');
+  });
+
+  test('omits the Blocker line when there is no agent_blocked event', () => {
+    const task = buildTask();
+    const rendered = formatStatusSnapshot(task, [], NOW);
+    expect(rendered).not.toContain('Blocker:');
+  });
+
+  test('suppresses a historical Blocker line on a COMPLETED task (#251 review)', () => {
+    // A task that hit a blocker, self-remediated, and reached COMPLETED must not
+    // show the stale ⛔ — that would misrepresent a success as blocked.
+    const task = buildTask({ status: 'COMPLETED' });
+    const events: TaskEvent[] = [
+      mkEvent({
+        event_id: '01ARZ3NDEKTSV4RRFFQ69G5F30',
+        event_type: 'agent_blocked',
+        timestamp: '2026-04-29T15:29:20Z',
+        metadata: {
+          kind: 'dependency_unreachable',
+          detail: 'npm registry timeout',
+          remediation_hint: 'retry the task',
+          retryable: true,
+          resource: 'registry.npmjs.org',
+        },
+      }),
+    ];
+    const rendered = formatStatusSnapshot(task, events, NOW);
+    expect(rendered).not.toContain('Blocker:');
+  });
+
+  test('still shows the Blocker line on a FAILED task (#251 review — guard is COMPLETED-only)', () => {
+    // The suppression is narrow: on a failure state the blocker is the
+    // actionable cause and must stay visible. Guards against a mistaken
+    // broadening to isTerminalStatus().
+    const task = buildTask({ status: 'FAILED' });
+    const events: TaskEvent[] = [
+      mkEvent({
+        event_id: '01ARZ3NDEKTSV4RRFFQ69G5F40',
+        event_type: 'agent_blocked',
+        timestamp: '2026-04-29T15:29:20Z',
+        metadata: {
+          kind: 'egress_denied',
+          detail: 'connection refused',
+          remediation_hint: 'allowlist api.example.com in DNS Firewall',
+          retryable: false,
+          resource: 'api.example.com',
+        },
+      }),
+    ];
+    const rendered = formatStatusSnapshot(task, events, NOW);
+    expect(rendered).toContain('Blocker:       egress_denied [api.example.com]');
   });
 });

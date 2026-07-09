@@ -52,9 +52,31 @@ describe('SlackIntegration construct', () => {
     template = Template.fromStack(stack);
   });
 
-  test('creates two DynamoDB tables (installation + user mapping)', () => {
-    // TaskTable + TaskEventsTable + SlackInstallation + SlackUserMapping = 4
-    template.resourceCountIs('AWS::DynamoDB::Table', 4);
+  test('creates three Slack DynamoDB tables (installation + user mapping + channel mapping)', () => {
+    // TaskTable + TaskEventsTable + SlackInstallation + SlackUserMapping + SlackChannelMapping = 5
+    template.resourceCountIs('AWS::DynamoDB::Table', 5);
+  });
+
+  test('command processor receives the channel-mapping table env var', () => {
+    template.hasResourceProperties('AWS::Lambda::Function', {
+      Environment: {
+        Variables: Match.objectLike({
+          SLACK_CHANNEL_MAPPING_TABLE_NAME: Match.anyValue(),
+        }),
+      },
+    });
+  });
+
+  test('interactions handler receives the channel-mapping table and processor function for the repo picker', () => {
+    template.hasResourceProperties('AWS::Lambda::Function', {
+      Environment: {
+        Variables: Match.objectLike({
+          TASK_TABLE_NAME: Match.anyValue(),
+          SLACK_CHANNEL_MAPPING_TABLE_NAME: Match.anyValue(),
+          SLACK_COMMAND_PROCESSOR_FUNCTION_NAME: Match.anyValue(),
+        }),
+      },
+    });
   });
 
   test('creates 6 Lambda functions', () => {

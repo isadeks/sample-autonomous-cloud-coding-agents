@@ -30,6 +30,28 @@ import { NagSuppressions } from 'cdk-nag';
 import { Construct } from 'constructs';
 
 /**
+ * Durable-execution wall-clock ceiling (hours). Must exceed the longest
+ * agent run including HITL approval waits (2h approval stranded-timeout
+ * plus the agent's own multi-hour budget).
+ */
+const DURABLE_EXECUTION_TIMEOUT_HOURS = 9;
+
+/** Durable-execution state retention after completion (days). */
+const DURABLE_RETENTION_DAYS = 14;
+
+/** Default task-record retention used for TTL computation (days). */
+const DEFAULT_TASK_RETENTION_DAYS = 90;
+
+/** Orchestrator error-alarm metric period (minutes). */
+const ERROR_ALARM_PERIOD_MINUTES = 5;
+
+/** Orchestrator Lambda timeout (seconds). */
+const ORCHESTRATOR_TIMEOUT_SECONDS = 60;
+
+/** Orchestrator Lambda memory (MB). */
+const ORCHESTRATOR_MEMORY_MB = 1024;
+
+/**
  * Properties for TaskOrchestrator construct.
  */
 export interface TaskOrchestratorProps {
@@ -130,12 +152,29 @@ export interface TaskOrchestratorProps {
   readonly ecsConfig?: {
     readonly clusterArn: string;
     readonly taskDefinitionArn: string;
+    /**
+     * #299 ECS_RIGHTSIZED_PLANNING: the smaller read-only PLANNING task def. The
+     * ECS strategy selects it for read-only workflows (coding/decompose-v1) so
+     * planning doesn't run on the 64 GB build box. Shares the build def's roles,
+     * so the RunTask/PassRole grants below cover it with no extra role ARNs.
+     */
+    readonly planningTaskDefinitionArn: string;
     readonly subnets: string;
     readonly securityGroup: string;
     readonly containerName: string;
     readonly taskRoleArn: string;
     readonly executionRoleArn: string;
   };
+
+  /**
+   * S3 bucket for per-task ECS payloads (#502). When provided (alongside
+   * ``ecsConfig``), the orchestrator writes the payload here and passes only an
+   * ``AGENT_PAYLOAD_S3_URI`` pointer in the RunTask override (the full payload
+   * exceeds the 8 KB containerOverrides limit), then deletes the object in the
+   * finalize step. The orchestrator gets write + delete; the ECS task role gets
+   * read-only (granted on the bucket by ``EcsAgentCluster``).
+   */
+  readonly ecsPayloadBucket?: s3.IBucket;
 
   /**
    * S3 bucket for task attachments. When provided, the orchestrator gets
@@ -198,6 +237,7 @@ export class TaskOrchestrator extends Construct {
         '@aws-sdk/client-ecs',
         '@aws-sdk/client-lambda',
         '@aws-sdk/client-bedrock-runtime',
+        '@aws-sdk/client-s3',
         '@aws-sdk/client-secrets-manager',
         '@aws-sdk/lib-dynamodb',
         '@aws-sdk/util-dynamodb',
@@ -212,11 +252,11 @@ export class TaskOrchestrator extends Construct {
       handler: 'handler',
       runtime: Runtime.NODEJS_24_X,
       architecture: Architecture.ARM_64,
-      timeout: Duration.seconds(60),
-      memorySize: 1024,
+      timeout: Duration.seconds(ORCHESTRATOR_TIMEOUT_SECONDS),
+      memorySize: ORCHESTRATOR_MEMORY_MB,
       durableConfig: {
-        executionTimeout: Duration.hours(9),
-        retentionPeriod: Duration.days(14),
+        executionTimeout: Duration.hours(DURABLE_EXECUTION_TIMEOUT_HOURS),
+        retentionPeriod: Duration.days(DURABLE_RETENTION_DAYS),
       },
       environment: {
         TASK_TABLE_NAME: props.taskTable.tableName,
@@ -224,7 +264,7 @@ export class TaskOrchestrator extends Construct {
         USER_CONCURRENCY_TABLE_NAME: props.userConcurrencyTable.tableName,
         RUNTIME_ARN: props.runtimeArn,
         MAX_CONCURRENT_TASKS_PER_USER: String(maxConcurrent),
-        TASK_RETENTION_DAYS: String(props.taskRetentionDays ?? 90),
+        TASK_RETENTION_DAYS: String(props.taskRetentionDays ?? DEFAULT_TASK_RETENTION_DAYS),
         ...(props.repoTable && { REPO_TABLE_NAME: props.repoTable.tableName }),
         ...(props.githubTokenSecretArn && { GITHUB_TOKEN_SECRET_ARN: props.githubTokenSecretArn }),
         ...(props.userPromptTokenBudget !== undefined && {
@@ -236,10 +276,15 @@ export class TaskOrchestrator extends Construct {
         ...(props.ecsConfig && {
           ECS_CLUSTER_ARN: props.ecsConfig.clusterArn,
           ECS_TASK_DEFINITION_ARN: props.ecsConfig.taskDefinitionArn,
+          // #299 ECS_RIGHTSIZED_PLANNING: read-only workflows run on this smaller def.
+          ECS_PLANNING_TASK_DEFINITION_ARN: props.ecsConfig.planningTaskDefinitionArn,
           ECS_SUBNETS: props.ecsConfig.subnets,
           ECS_SECURITY_GROUP: props.ecsConfig.securityGroup,
           ECS_CONTAINER_NAME: props.ecsConfig.containerName,
         }),
+        // #502: bucket the orchestrator writes the ECS payload to (and deletes
+        // from at finalize); the ECS strategy reads this to build the S3 URI.
+        ...(props.ecsPayloadBucket && { ECS_PAYLOAD_BUCKET: props.ecsPayloadBucket.bucketName }),
         ...(props.attachmentsBucket && { ATTACHMENTS_BUCKET_NAME: props.attachmentsBucket.bucketName }),
       },
       bundling: orchestratorBundling,
@@ -256,6 +301,15 @@ export class TaskOrchestrator extends Construct {
     // Attachments bucket grants (URL fetch/screen/upload during hydration)
     if (props.attachmentsBucket) {
       props.attachmentsBucket.grantReadWrite(this.fn);
+    }
+
+    // #502: ECS payload bucket — the orchestrator writes the payload before
+    // RunTask and deletes it at finalize. Write + delete only (it never reads
+    // its own payload back; the ECS container is the reader, with its own
+    // read-only grant from EcsAgentCluster).
+    if (props.ecsPayloadBucket) {
+      props.ecsPayloadBucket.grantPut(this.fn);
+      props.ecsPayloadBucket.grantDelete(this.fn);
     }
 
     // Durable execution managed policy
@@ -355,7 +409,7 @@ export class TaskOrchestrator extends Construct {
     // are consistently failing (throttled, dropped, or crashing).
     this.errorAlarm = new cloudwatch.Alarm(this, 'OrchestratorErrorAlarm', {
       metric: this.fn.metricErrors({
-        period: Duration.minutes(5),
+        period: Duration.minutes(ERROR_ALARM_PERIOD_MINUTES),
       }),
       threshold: 3,
       evaluationPeriods: 2,

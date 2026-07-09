@@ -233,7 +233,7 @@ describe('hydrateAndTransition', () => {
       ...mockHydratedContext,
       guardrail_blocked: 'PR context blocked by content policy',
     });
-    const prTask = { ...baseTask, task_type: 'pr_iteration', pr_number: 10 };
+    const prTask = { ...baseTask, resolved_workflow: { id: 'coding/pr-iteration-v1', version: '1.0.0' }, pr_number: 10 };
     await expect(hydrateAndTransition(prTask as any)).rejects.toThrow(
       'Guardrail blocked: PR context blocked by content policy',
     );
@@ -245,7 +245,7 @@ describe('hydrateAndTransition', () => {
     const guardrailEvent = putCalls.find((item: any) => item.event_type === 'guardrail_blocked');
     expect(guardrailEvent).toBeDefined();
     expect(guardrailEvent.metadata.reason).toBe('PR context blocked by content policy');
-    expect(guardrailEvent.metadata.task_type).toBe('pr_iteration');
+    expect(guardrailEvent.metadata.resolved_workflow).toBe('coding/pr-iteration-v1');
     expect(guardrailEvent.metadata.pr_number).toBe(10);
     expect(guardrailEvent.metadata.sources).toEqual(['task_description']);
     expect(guardrailEvent.metadata.token_estimate).toBe(20);
@@ -265,7 +265,7 @@ describe('hydrateAndTransition', () => {
       ...mockHydratedContext,
       guardrail_blocked: 'PR context blocked by content policy',
     });
-    const prTask = { ...baseTask, task_type: 'pr_iteration', pr_number: 10 };
+    const prTask = { ...baseTask, resolved_workflow: { id: 'coding/pr-iteration-v1', version: '1.0.0' }, pr_number: 10 };
     await expect(hydrateAndTransition(prTask as any)).rejects.toThrow(
       'Guardrail blocked: PR context blocked by content policy',
     );
@@ -667,6 +667,33 @@ describe('loadBlueprintConfig', () => {
     });
     const config = await loadBlueprintConfig(baseTask as any);
     expect(config.cedar_policies).toBeUndefined();
+  });
+
+  // Compute substrate is a per-repo property that applies to ALL workflows: a
+  // read-only decompose/review task clones + reads the SAME repo, so it needs the
+  // SAME compute (a repo big enough to need the 64GB ECS tier to build also OOMs
+  // the AgentCore microVM just reading it). So an ecs repo's ecs compute_type
+  // flows through regardless of the workflow's read-only-ness.
+  const ecsRepoConfig = {
+    repo: 'org/repo',
+    status: 'active' as const,
+    onboarded_at: '2024-01-01T00:00:00Z',
+    updated_at: '2024-01-01T00:00:00Z',
+    compute_type: 'ecs' as const,
+  };
+
+  test('a read-only workflow (coding/decompose-v1) on an ecs repo INHERITS ecs (same repo, same footprint)', async () => {
+    mockLoadRepoConfig.mockResolvedValueOnce(ecsRepoConfig);
+    const planTask = { ...baseTask, resolved_workflow: { id: 'coding/decompose-v1', version: '1.0.0' } };
+    const config = await loadBlueprintConfig(planTask as any);
+    expect(config.compute_type).toBe('ecs');
+  });
+
+  test('a writeable workflow (coding/new-task-v1) on an ecs repo also uses ecs', async () => {
+    mockLoadRepoConfig.mockResolvedValueOnce(ecsRepoConfig);
+    const buildTask = { ...baseTask, resolved_workflow: { id: 'coding/new-task-v1', version: '1.0.0' } };
+    const config = await loadBlueprintConfig(buildTask as any);
+    expect(config.compute_type).toBe('ecs');
   });
 });
 

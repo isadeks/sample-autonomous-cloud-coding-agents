@@ -26,11 +26,11 @@ Before editing, decide which part of the monorepo owns the behavior. This keeps 
 | Agent runtime | `agent/` | Bundled into the image CDK deploys; run `mise run quality` in `agent/` or root build. |
 | Docs (source) | `docs/guides/`, `docs/design/` | After edits, run **`mise //docs:sync`** or **`mise //docs:build`**. Do not edit `docs/src/content/docs/` directly. |
 
-For a concise duplicate of this table, common pitfalls, and a CDK test file map, see **[AGENTS.md](../../AGENTS.md)** at the repo root (oriented toward automation-assisted contributors).
+For a concise duplicate of this table, common pitfalls, and a CDK test file map, see **[AGENTS.md](../../AGENTS.md)** at the repo root (oriented toward automation-assisted contributors). Package-specific detail lives in **`AGENTS.md`** under `cdk/`, `cli/`, `agent/`, and `docs/`.
 
 ## Repository preparation
 
-The [Quick Start](./QUICK_START.md) covers the basic setup: forking a sample repo, creating a PAT, registering a Blueprint, and storing the token in Secrets Manager. This section covers what you need beyond that.
+The [Quick Start](./QUICK_START.mdx) covers the basic setup: forking a sample repo, creating a PAT, registering a Blueprint, and storing the token in Secrets Manager. This section covers what you need beyond that.
 
 ### Pre-flight checks
 
@@ -62,19 +62,46 @@ The default is `awslabs/agent-plugins`. For a quick end-to-end test, fork that r
 To onboard additional repositories, add more `Blueprint` constructs in `cdk/src/stacks/agent.ts` and append them to the `blueprints` array (used to aggregate DNS egress allowlists):
 
 ```typescript
-new Blueprint(this, ‘MyServiceBlueprint’, {
-  repo: ‘acme/my-service’,
+new Blueprint(this, 'MyServiceBlueprint', {
+  repo: 'acme/my-service',
   repoTable: repoTable.table,
 });
 ```
 
-Each Blueprint supports per-repo overrides: `runtimeArn`, `modelId`, `maxTurns`, `systemPromptOverrides`, `githubTokenSecretArn`, and `pollIntervalMs`. If you use a custom `runtimeArn` or secret, pass the ARNs to `TaskOrchestrator` via `additionalRuntimeArns` and `additionalSecretArns` so the Lambda has IAM permission. See [Repo onboarding](../design/REPO_ONBOARDING.md) for the full model.
+Each Blueprint supports per-repo overrides grouped into nested props (`BlueprintProps` in `cdk/src/constructs/blueprint.ts`):
 
-Redeploy after changing Blueprints: `mise run //cdk:deploy`.
+```typescript
+new Blueprint(this, 'MyServiceBlueprint', {
+  repo: 'acme/my-service',
+  repoTable: repoTable.table,
+  compute: { runtimeArn: '...' },                    // override the default runtime ARN
+  agent: {
+    modelId: 'us.anthropic.claude-sonnet-4-6',       // foundation model override
+    maxTurns: 150,                                    // default turn limit for this repo
+    systemPromptOverrides: 'Extra instructions...',   // appended to the platform prompt
+  },
+  credentials: { githubTokenSecretArn: '...' },       // per-repo GitHub token secret
+  pipeline: {
+    pollIntervalMs: 5000,                             // poll interval awaiting completion
+    buildCommand: 'npm run build && npm test',        // build/test verification (default: mise run build)
+    lintCommand: 'npm run lint',                      // lint verification (default: mise run lint)
+  },
+});
+```
+
+If you use a custom `compute.runtimeArn` or `credentials.githubTokenSecretArn`, pass the ARNs to `TaskOrchestrator` via `additionalRuntimeArns` and `additionalSecretArns` so the Lambda has IAM permission. See [Repo onboarding](../design/REPO_ONBOARDING.md) for the full model.
+
+#### Build-regression gating (important for non-mise repos)
+
+Before opening a PR, the agent runs a **build** and **lint** command in its cloud container — once on the clean clone (baseline) and again after its changes. If the build was green before and fails after, the task fails (a build-**regression** gate). This is a compile/test verification, **not** a deployment — your app's actual deploy stays in your own CI/CD after the PR merges.
+
+The command defaults to **`mise run build`** / **`mise run lint`**. A repo that uses [mise](https://mise.jdx.dev/) with `build` / `lint` tasks gets gating for free. A repo that uses npm, gradle, cargo, make, etc. **must set `pipeline.buildCommand`** (and optionally `lintCommand`) to its real command — otherwise the default `mise run build` finds no task, **build-regression gating is silently OFF, and a change that breaks the build still reports success**. When that happens the agent surfaces a `⚠️ Build-regression gating is OFF` warning on the PR so the gap is visible, but the fix is to configure the command. For #247 orchestration this matters doubly: dependent sub-issues stack onto a predecessor's branch, so an unverified broken predecessor propagates downstream.
+
+Redeploy after changing Blueprints: `mise //cdk:deploy`.
 
 ### Customizing the agent image
 
-The default image (`agent/Dockerfile`) includes Python, Node 20, `git`, `gh`, Claude Code CLI, and `mise`. If your repositories need additional runtimes (Java, Go, native libs), extend the Dockerfile. A normal `cdk deploy` rebuilds the image asset.
+The default image (`agent/Dockerfile`) includes Python, Node 24 (LTS), `git`, `gh`, Claude Code CLI, and `mise`. If your repositories need additional runtimes (Java, Go, native libs), extend the Dockerfile. A normal `cdk deploy` rebuilds the image asset.
 
 ### Writing Cedar policies for the repo
 
@@ -89,7 +116,7 @@ See the [Cedar policy guide](./CEDAR_POLICY_GUIDE.md) for the full authoring ref
 
 ## Installation
 
-Follow the [Quick Start](./QUICK_START.md) to clone, install, deploy, and submit your first task. It covers prerequisites, toolchain setup, deployment, PAT configuration, Cognito user creation, and a smoke test.
+Follow the [Quick Start](./QUICK_START.mdx) to clone, install, deploy, and submit your first task. It covers prerequisites, toolchain setup, deployment, PAT configuration, Cognito user creation, and a smoke test.
 
 This section covers what the Quick Start does not: troubleshooting, local testing, and the development workflow.
 
@@ -182,7 +209,7 @@ curl http://localhost:8080/ping
 
 curl -X POST http://localhost:8080/invocations \
   -H "Content-Type: application/json" \
-  -d ‘{"input":{"prompt":"Fix the login bug","repo_url":"owner/repo"}}’
+  -d '{"input":{"prompt":"Fix the login bug","repo_url":"owner/repo"}}'
 ```
 
 #### Monitoring
@@ -239,18 +266,18 @@ For the full list, see `agent/README.md`.
 
 ### Deployment
 
-Follow the [Quick Start](./QUICK_START.md) steps 3-6 for first-time deployment. For subsequent deploys after code changes:
+Follow the [Quick Start](./QUICK_START.mdx) steps 3-6 for first-time deployment. For subsequent deploys after code changes:
 
 ```bash
 mise run build
-mise run //cdk:deploy
+mise //cdk:deploy
 ```
 
 A full deploy takes approximately 10 minutes. Expect variation by region and whether container layers are cached.
 
 ### Stack outputs
 
-After deployment, the stack emits these outputs (retrieve with `aws cloudformation describe-stacks --stack-name backgroundagent-dev --query ‘Stacks[0].Outputs’ --output table`):
+After deployment, the stack emits these outputs (retrieve with `aws cloudformation describe-stacks --stack-name backgroundagent-dev --query 'Stacks[0].Outputs' --output table`):
 
 | Output | Description |
 |---|---|
@@ -259,10 +286,16 @@ After deployment, the stack emits these outputs (retrieve with `aws cloudformati
 | `UserPoolId` / `AppClientId` | Cognito identifiers |
 | `TaskTableName` | DynamoDB table for task state |
 | `TaskEventsTableName` | DynamoDB table for audit events |
+| `TaskNudgesTableName` | DynamoDB table for task nudges |
+| `TaskApprovalsTableName` | DynamoDB table for Cedar HITL approval gates |
 | `UserConcurrencyTableName` | DynamoDB table for per-user concurrency |
 | `WebhookTableName` | DynamoDB table for webhook integrations |
 | `RepoTableName` | DynamoDB table for per-repo Blueprint config |
+| `CedarWasmLayerArn` | Lambda layer ARN for the Cedar WASM policy engine |
+| `TraceArtifactsBucketName` | S3 bucket for agent trace artifacts (7-day lifecycle) |
 | `GitHubTokenSecretArn` | Secrets Manager secret ARN for the GitHub PAT |
+
+When the Slack or Linear integrations are enabled, the stack emits additional outputs (e.g. `Slack*` and `Linear*` secret ARNs and integration table names).
 
 Use the same AWS Region as your deployment. If `--region` is omitted, the CLI uses your default from `aws configure`.
 
@@ -317,7 +350,7 @@ The code that runs inside the compute environment (AgentCore MicroVM). This is t
 | I want to... | Look at |
 |---|---|
 | Change what the agent does during a task | `agent/src/pipeline.py` (execution flow), `agent/src/runner.py` (CLI invocation) |
-| Modify system prompts | `agent/prompts/` - base template and per-task-type variants (`new_task`, `pr_iteration`, `pr_review`) |
+| Modify system prompts | `agent/src/prompts/` - base template and per-workflow variants (`coding/new-task-v1`, `coding/pr-iteration-v1`, `coding/pr-review-v1`) |
 | Change agent configuration or environment | `agent/src/config.py` |
 | Add or modify hooks (pre/post execution) | `agent/src/hooks.py` |
 | Change the Docker image (add runtimes, tools) | `agent/Dockerfile` |
@@ -344,9 +377,11 @@ Source docs live in `docs/guides/` and `docs/design/`. The Starlight site under 
 
 | I want to... | Look at |
 |---|---|
-| Update a user-facing guide | `docs/guides/` (USER_GUIDE.md, DEVELOPER_GUIDE.md, QUICK_START.md, PROMPT_GUIDE.md, ROADMAP.md) |
+| Update a user-facing guide | `docs/guides/` (USER_GUIDE.md, DEVELOPER_GUIDE.md, QUICK_START.mdx, PROMPT_GUIDE.md) |
 | Update an architecture doc | `docs/design/` |
 | Change the sidebar or site config | `docs/astro.config.mjs` |
 | Change how docs are synced | `docs/scripts/sync-starlight.mjs` |
 
 After editing source docs, run `mise //docs:sync` or `mise //docs:build` to regenerate the site.
+
+To validate that all cross-references are intact, run `mise //docs:link-check`. This checks all Markdown sources (`docs/guides/`, `docs/design/`, `docs/decisions/`, and root-level `.md` files) for broken internal (relative) links. The same check runs automatically in CI on every pull request, as part of the build's drift-prevention step. External `http(s)` URLs are deliberately not checked, so that network or bot-block flakiness cannot fail an unrelated PR.

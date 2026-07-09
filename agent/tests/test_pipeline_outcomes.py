@@ -1,11 +1,54 @@
 """Unit tests for pipeline task outcome resolution and error chaining."""
 
+import pytest
+
+from config import NEEDS_INPUT_MARKER
+from hooks import _record_blocker_reason, _reset_blocker_reason_for_tests
 from models import AgentResult
 from pipeline import (
     _chain_prior_agent_error,
     _compute_turns_completed,
     _resolve_overall_task_status,
+    _starts_with_needs_input_marker,
+    _strip_needs_input_marker,
 )
+
+
+class TestNeedsInputMarker:
+    """Clarify-before-spend (UX #4): detect + strip the hold-and-ask marker."""
+
+    def test_detects_marker_on_first_line(self):
+        text = f"{NEEDS_INPUT_MARKER}\nWhich page feels slow — the dashboard or the list?"
+        assert _starts_with_needs_input_marker(text) is True
+
+    def test_detects_marker_after_leading_blank_lines(self):
+        text = f"\n\n{NEEDS_INPUT_MARKER} What target latency are you aiming for?"
+        assert _starts_with_needs_input_marker(text) is True
+
+    def test_ignores_marker_buried_mid_message(self):
+        # A stray mention deep in prose is NOT a hold signal — only the first line.
+        text = f"I made the change.\nBy the way {NEEDS_INPUT_MARKER} is our sentinel."
+        assert _starts_with_needs_input_marker(text) is False
+
+    def test_none_or_empty_is_not_a_hold(self):
+        assert _starts_with_needs_input_marker(None) is False
+        assert _starts_with_needs_input_marker("") is False
+        assert _starts_with_needs_input_marker("Just a normal answer.") is False
+
+    def test_strip_removes_leading_marker_only(self):
+        text = f"{NEEDS_INPUT_MARKER}\nWhich part is slow?"
+        assert _strip_needs_input_marker(text) == "Which part is slow?"
+        # Idempotent-ish: no marker → unchanged (trimmed).
+        assert _strip_needs_input_marker("  plain question?  ") == "plain question?"
+
+
+@pytest.fixture(autouse=True)
+def _reset_blocker_latch():
+    """#251 carry-path latch is module-level; reset around every test so a
+    detected blocker never leaks into an unrelated outcome-resolution case."""
+    _reset_blocker_reason_for_tests()
+    yield
+    _reset_blocker_reason_for_tests()
 
 
 class TestResolveOverallTaskStatus:
@@ -14,6 +57,33 @@ class TestResolveOverallTaskStatus:
         overall, err = _resolve_overall_task_status(ar, build_ok=True, pr_url="https://pr")
         assert overall == "success"
         assert err is None
+
+    def test_infra_failed_build_forces_error_even_when_gate_would_pass(self):
+        # ABCA-659 #2: the build was killed by ENOSPC/OOM (build_infra_failed).
+        # Even if the regression-only gate would pass (build_ok=True — e.g. the
+        # pre-agent baseline was ALSO infra-killed, so "already red → not a
+        # regression"), we must NOT report a false ✅ on unverified code. Forces
+        # an error with a build_ok=infra marker for the platform's honest copy.
+        ar = AgentResult(status="success", error=None)
+        overall, err = _resolve_overall_task_status(
+            ar,
+            build_ok=True,
+            pr_url="https://pr",
+            build_infra_failed=True,
+        )
+        assert overall == "error"
+        assert "build_ok=infra" in (err or "")
+
+    def test_infra_failed_marker_present_when_gate_also_fails(self):
+        ar = AgentResult(status="end_turn", error=None)
+        overall, err = _resolve_overall_task_status(
+            ar,
+            build_ok=False,
+            pr_url=None,
+            build_infra_failed=True,
+        )
+        assert overall == "error"
+        assert "build_ok=infra" in (err or "")
 
     def test_unknown_is_always_error_even_with_pr(self):
         ar = AgentResult(status="unknown", error=None)
@@ -41,6 +111,39 @@ class TestResolveOverallTaskStatus:
         assert overall == "error"
         assert err is not None
         assert "agent_status='error'" in err
+
+    def test_error_promotes_latched_blocker_reason(self):
+        # #251 carry-path: a hook-detected blocker with no SDK error message is
+        # promoted into the terminal reason so the CDK classifier gives a remedy.
+        _record_blocker_reason("egress_denied", "blocked host", resource="pypi.org")
+        ar = AgentResult(status="error", error=None)
+        overall, err = _resolve_overall_task_status(ar, build_ok=True, pr_url=None)
+        assert overall == "error"
+        assert err == "BLOCKED[egress_denied]: blocked host (resource: pypi.org)"
+
+    def test_specific_agent_error_wins_over_latched_blocker(self):
+        # A concrete SDK error must NOT be overwritten by the latch.
+        _record_blocker_reason("egress_denied", "blocked host", resource="pypi.org")
+        ar = AgentResult(status="error", error="receive_response() failed: boom")
+        overall, err = _resolve_overall_task_status(ar, build_ok=True, pr_url=None)
+        assert overall == "error"
+        assert err == "receive_response() failed: boom"
+
+    def test_unknown_status_promotes_latched_blocker(self):
+        # An egress denial that kills outbound calls is a likely cause of a
+        # missing ResultMessage (agent_status=unknown). The precise blocker
+        # reason must win over the generic SDK-no-result message.
+        _record_blocker_reason("egress_denied", "blocked host", resource="pypi.org")
+        ar = AgentResult(status="unknown", error=None)
+        overall, err = _resolve_overall_task_status(ar, build_ok=False, pr_url=None)
+        assert overall == "error"
+        assert err == "BLOCKED[egress_denied]: blocked host (resource: pypi.org)"
+
+    def test_unknown_status_without_blocker_uses_sdk_message(self):
+        ar = AgentResult(status="unknown", error=None)
+        overall, err = _resolve_overall_task_status(ar, build_ok=False, pr_url=None)
+        assert overall == "error"
+        assert "ResultMessage" in (err or "")
 
     def test_error_status_preserves_bedrock_entitlement_message(self):
         """Runner maps ResultMessage.is_error to agent_status=error; pipeline must fail."""

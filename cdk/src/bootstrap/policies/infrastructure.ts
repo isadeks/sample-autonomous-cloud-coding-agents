@@ -17,7 +17,6 @@
  *  SOFTWARE.
  */
 
-/* eslint-disable @cdklabs/no-literal-partition */
 // ARN partitions are intentionally literal — this policy is a bootstrap
 // template matching the exact resource patterns in DEPLOYMENT_ROLES.md.
 
@@ -67,6 +66,7 @@ export function infrastructurePolicy(): iam.PolicyDocument {
           'iam:DeleteRole',
           'iam:GetRole',
           'iam:UpdateRole',
+          'iam:UpdateAssumeRolePolicy',
           'iam:TagRole',
           'iam:UntagRole',
           'iam:ListRoleTags',

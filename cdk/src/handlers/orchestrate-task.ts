@@ -20,6 +20,8 @@
 import { withDurableExecution, type DurableExecutionHandler } from '@aws/durable-execution-sdk-js';
 import { TaskStatus, TERMINAL_STATUSES } from '../constructs/task-status';
 import { resolveComputeStrategy } from './shared/compute-strategy';
+import { classifyError, isTransientError } from './shared/error-classifier';
+import { reportIssueFailure as reportJiraIssueFailure } from './shared/jira-feedback';
 import { reportIssueFailure } from './shared/linear-feedback';
 import { logger } from './shared/logger';
 import {
@@ -35,7 +37,9 @@ import {
   type PollState,
 } from './shared/orchestrator';
 import { runPreflightChecks } from './shared/preflight';
+import { deleteEcsPayload } from './shared/strategies/ecs-strategy';
 import type { TaskRecord } from './shared/types';
+import { workflowIsReadOnly, workflowRequiresRepo } from './shared/workflows';
 
 interface OrchestrateTaskEvent {
   readonly task_id: string;
@@ -45,6 +49,8 @@ const MAX_POLL_ATTEMPTS = 1020; // ~8.5h at 30s intervals
 const MAX_NON_RUNNING_POLLS = 10; // ~5min grace period for session to start
 const MAX_CONSECUTIVE_ECS_POLL_FAILURES = 3;
 const MAX_CONSECUTIVE_ECS_COMPLETED_POLLS = 5;
+/** Poll cadence when the blueprint doesn't override ``poll_interval_ms`` (seconds). */
+const DEFAULT_POLL_INTERVAL_SECONDS = 30;
 
 const durableHandler: DurableExecutionHandler<OrchestrateTaskEvent, void> = async (event, context) => {
   const { task_id: taskId } = event;
@@ -75,12 +81,20 @@ const durableHandler: DurableExecutionHandler<OrchestrateTaskEvent, void> = asyn
     if (!result) {
       await failTask(taskId, current.status, 'User concurrency limit reached', task.user_id, false);
       await emitTaskEvent(taskId, 'admission_rejected', { reason: 'concurrency_limit' });
-      // Linear feedback is non-fatal: a throw here would re-run failTask +
+      // Channel feedback is non-fatal: a throw here would re-run failTask +
       // emitTaskEvent on the durable-execution retry, producing duplicate events.
       try {
         await notifyLinearOnConcurrencyCap(task);
       } catch (err) {
         logger.warn('Linear concurrency-cap feedback failed (non-fatal)', {
+          task_id: taskId,
+          error: err instanceof Error ? err.message : String(err),
+        });
+      }
+      try {
+        await notifyJiraOnConcurrencyCap(task);
+      } catch (err) {
+        logger.warn('Jira concurrency-cap feedback failed (non-fatal)', {
           task_id: taskId,
           error: err instanceof Error ? err.message : String(err),
         });
@@ -100,7 +114,14 @@ const durableHandler: DurableExecutionHandler<OrchestrateTaskEvent, void> = asyn
       if (TERMINAL_STATUSES.includes(current.status)) {
         return false;
       }
-      const result = await runPreflightChecks(task.repo, blueprintConfig, task.pr_number, task.task_type);
+      const workflowId = task.resolved_workflow?.id ?? 'coding/new-task-v1';
+      const result = await runPreflightChecks(
+        task.repo,
+        blueprintConfig,
+        task.pr_number,
+        workflowIsReadOnly(workflowId),
+        workflowRequiresRepo(workflowId),
+      );
       if (!result.passed) {
         const errorMessage = `Pre-flight check failed: ${result.failureReason}${result.failureDetail ? ' — ' + result.failureDetail : ''}`;
         await failTask(taskId, current.status, errorMessage, task.user_id, true);
@@ -135,14 +156,45 @@ const durableHandler: DurableExecutionHandler<OrchestrateTaskEvent, void> = asyn
   // Step 4: Start agent session — resolve compute strategy, invoke runtime, transition to RUNNING
   // Returns the full SessionHandle (serializable) so ECS polling can use it in step 5.
   const sessionHandle = await context.step('start-session', async () => {
+    let autoRetried = false;
     try {
       const strategy = resolveComputeStrategy(blueprintConfig);
-      const handle = await strategy.startSession({
+      const startInput = {
         taskId,
         userId: task.user_id,
         payload,
         blueprintConfig,
-      });
+        // #299 ECS_RIGHTSIZED_PLANNING: a read-only workflow (decompose-v1 planning)
+        // runs on the smaller ECS planning task def. Ignored by AgentCore.
+        readOnly: workflowIsReadOnly(task.resolved_workflow?.id ?? 'coding/new-task-v1'),
+      };
+      // Transient-error AUTO-RETRY (once). session-start is the ONE place a retry
+      // is idempotent by construction — no repo clone, no commits, no PR have
+      // happened yet, so re-invoking RunTask/InvokeAgentRuntime can't double-run
+      // work. A transient hiccup here (ECS deploy-race "TaskDefinition is inactive",
+      // ENI/capacity delay, a Bedrock/agentcore throttle) usually clears on a second
+      // attempt — so we swallow the first transient failure and try once more before
+      // surfacing anything to the user. A NON-transient failure (bad config, missing
+      // ECS substrate) throws immediately — retrying it just wastes ~a minute. Mid-run
+      // crashes are NOT retried here (step 5); the agent may have pushed commits.
+      let handle;
+      try {
+        handle = await strategy.startSession(startInput);
+      } catch (firstErr) {
+        const classification = classifyError(`Session start failed: ${String(firstErr)}`);
+        if (!isTransientError(classification)) {
+          throw firstErr; // service/user error — a retry won't help; surface now.
+        }
+        autoRetried = true;
+        logger.warn('Session start hit a transient error — auto-retrying once', {
+          task_id: taskId,
+          error: firstErr instanceof Error ? firstErr.message : String(firstErr),
+        });
+        await emitTaskEvent(taskId, 'session_start_retry', {
+          reason: classification?.title ?? 'transient',
+        });
+        handle = await strategy.startSession(startInput);
+      }
 
       // Build compute metadata for the task record so cancel-task can stop the right backend
       const computeMetadata: Record<string, string> = handle.strategyType === 'ecs'
@@ -169,7 +221,12 @@ const durableHandler: DurableExecutionHandler<OrchestrateTaskEvent, void> = asyn
 
       return handle;
     } catch (err) {
-      await failTask(taskId, TaskStatus.HYDRATING, `Session start failed: ${String(err)}`, task.user_id, true);
+      // Carry the auto-retry fact into error_message so the channel surface can say
+      // "I already tried again" (a bare marker the classifier ignores but
+      // renderFailureReply detects — see AUTO_RETRIED_MARKER). Only stamped when the
+      // single transient retry above also failed.
+      const retriedNote = autoRetried ? ' [auto-retried]' : '';
+      await failTask(taskId, TaskStatus.HYDRATING, `Session start failed: ${String(err)}${retriedNote}`, task.user_id, true);
       throw err;
     }
   });
@@ -269,7 +326,7 @@ const durableHandler: DurableExecutionHandler<OrchestrateTaskEvent, void> = asyn
         }
         const pollSeconds = blueprintConfig.poll_interval_ms
           ? Math.ceil(blueprintConfig.poll_interval_ms / 1000)
-          : 30;
+          : DEFAULT_POLL_INTERVAL_SECONDS;
         return { shouldContinue: true, delay: { seconds: pollSeconds } };
       },
     },
@@ -278,6 +335,14 @@ const durableHandler: DurableExecutionHandler<OrchestrateTaskEvent, void> = asyn
   // Step 6: Finalize — update terminal status, emit events, release concurrency
   await context.step('finalize', async () => {
     await finalizeTask(taskId, finalPollState, task.user_id);
+    // #502: the task is terminal — the container has long since read its
+    // payload, so delete the ephemeral S3 payload object now. Best-effort
+    // (deleteEcsPayload swallows errors) and a no-op for AgentCore tasks /
+    // deployments without a payload bucket; the bucket's 1-day lifecycle rule
+    // is the backstop if this delete or the whole step never runs.
+    if (blueprintConfig.compute_type === 'ecs') {
+      await deleteEcsPayload(taskId);
+    }
   });
 };
 
@@ -330,6 +395,49 @@ export async function notifyLinearOnConcurrencyCap(task: TaskRecord): Promise<vo
       task_id: task.task_id,
       linear_workspace_id: linearWorkspaceId,
       issue_id: issueId,
+      error: err instanceof Error ? err.message : String(err),
+    });
+  }
+}
+
+/**
+ * Post a Jira issue comment when admission control rejects a task for the
+ * user concurrency cap. Jira-only; silently no-ops for other channels.
+ *
+ * Parity with {@link notifyLinearOnConcurrencyCap}: the webhook processor
+ * covers pre-`createTaskCore` rejections (unmapped project, unlinked actor,
+ * guardrail), while this hook covers the post-201 case where the orchestrator
+ * rejects on admission. Without it, a Jira user who hits the cap sees the
+ * integration silently drop the request (the agent — which would otherwise
+ * comment — never starts).
+ *
+ * Best-effort: `reportIssueFailure` swallows its own errors; we wrap in
+ * try/catch anyway because a transient throw during the registry lookup must
+ * never block the rejection path. Exported for unit testing.
+ */
+export async function notifyJiraOnConcurrencyCap(task: TaskRecord): Promise<void> {
+  if (task.channel_source !== 'jira') return;
+  const cloudId = task.channel_metadata?.jira_cloud_id;
+  const issueKey = task.channel_metadata?.jira_issue_key;
+  if (!cloudId || !issueKey) return;
+  const registryTableName = process.env.JIRA_WORKSPACE_REGISTRY_TABLE_NAME;
+  if (!registryTableName) {
+    logger.warn('Skipping Jira concurrency-cap feedback: JIRA_WORKSPACE_REGISTRY_TABLE_NAME not set', {
+      task_id: task.task_id,
+    });
+    return;
+  }
+  try {
+    await reportJiraIssueFailure(
+      { cloudId, registryTableName },
+      issueKey,
+      '❌ ABCA hit your concurrency limit — too many tasks running for your user. Wait for one to finish, then re-apply the trigger label.',
+    );
+  } catch (err) {
+    logger.warn('Jira concurrency-cap feedback failed (non-fatal)', {
+      task_id: task.task_id,
+      jira_cloud_id: cloudId,
+      issue_key: issueKey,
       error: err instanceof Error ? err.message : String(err),
     });
   }

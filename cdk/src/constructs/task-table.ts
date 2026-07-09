@@ -54,6 +54,9 @@ export interface TaskTableProps {
  * - UserStatusIndex (PK: user_id, SK: status_created_at) — "my tasks" queries
  * - StatusIndex (PK: status, SK: created_at) — queue processing, monitoring
  * - IdempotencyIndex (PK: idempotency_key) — sparse index for dedup
+ * - LinearIssueIndex (PK: linear_issue_id, SK: created_at) — sparse; resolve a
+ *   Linear issue back to its newest ABCA task + PR (#247 UX.3 standalone
+ *   comment trigger)
  */
 export class TaskTable extends Construct {
   /**
@@ -75,6 +78,26 @@ export class TaskTable extends Construct {
   public static readonly IDEMPOTENCY_INDEX = 'IdempotencyIndex';
 
   /**
+   * GSI name for resolving a Linear issue → its newest ABCA task + PR (#247
+   * UX.3). PK: linear_issue_id, SK: created_at (newest task wins). Sparse —
+   * only Linear-origin tasks (which write the top-level ``linear_issue_id``
+   * attribute) are projected; GitHub/Slack/API tasks are absent. Powers the
+   * standalone ``@bgagent`` comment trigger on a plain (non-orchestration)
+   * issue, where no orchestration row records the issue→PR link.
+   */
+  public static readonly LINEAR_ISSUE_INDEX = 'LinearIssueIndex';
+
+  /**
+   * GSI name for resolving a Slack thread → its ABCA task (ABCA-661).
+   * PK: slack_thread_ts, SK: created_at (newest task wins). Sparse — only
+   * Slack-origin tasks with a ``slack_thread_ts`` carry the top-level
+   * attribute. Powers the Slack thread-reply handler, which maps a reply in
+   * an existing task thread back to that task's PR (for PR-iteration) or
+   * clarify-hold (for resume).
+   */
+  public static readonly SLACK_THREAD_INDEX = 'SlackThreadIndex';
+
+  /**
    * The underlying DynamoDB table. Use this to grant access or read the table name.
    */
   public readonly table: dynamodb.Table;
@@ -93,6 +116,17 @@ export class TaskTable extends Construct {
       pointInTimeRecoverySpecification: {
         pointInTimeRecoveryEnabled: props.pointInTimeRecovery ?? true,
       },
+      // NEW_IMAGE stream feeds the #247 orchestration reconciler
+      // (`OrchestrationReconciler`), which reacts to child tasks reaching
+      // terminal status to release dependency-unblocked children. This is
+      // the table's FIRST and only stream consumer — deliberately on
+      // TaskTable rather than TaskEventsTable, whose stream is already at
+      // its 2-consumer limit (FanOutConsumer + ApprovalMetricsPublisher;
+      // see TaskEventsTable). NEW_IMAGE suffices — the reconciler reads
+      // status/build_passed/orchestration_id off the new record image.
+      // Enabling a stream on an existing table is an in-place CFN update
+      // (no table replacement).
+      stream: dynamodb.StreamViewType.NEW_IMAGE,
       removalPolicy: props.removalPolicy ?? RemovalPolicy.DESTROY,
     });
 
@@ -117,6 +151,38 @@ export class TaskTable extends Construct {
       indexName: TaskTable.IDEMPOTENCY_INDEX,
       partitionKey: { name: 'idempotency_key', type: dynamodb.AttributeType.STRING },
       projectionType: dynamodb.ProjectionType.KEYS_ONLY,
+    });
+
+    // GSI: Linear issue → newest ABCA task + PR (sparse — only Linear-origin
+    // tasks carry the top-level linear_issue_id). #247 UX.3 standalone
+    // comment trigger. INCLUDE-projects just the fields the trigger reads, so
+    // the index stays lean (no full-item copy on every task write).
+    this.table.addGlobalSecondaryIndex({
+      indexName: TaskTable.LINEAR_ISSUE_INDEX,
+      partitionKey: { name: 'linear_issue_id', type: dynamodb.AttributeType.STRING },
+      sortKey: { name: 'created_at', type: dynamodb.AttributeType.STRING },
+      projectionType: dynamodb.ProjectionType.INCLUDE,
+      // NOTE: a GSI's projection CANNOT be changed in place — DynamoDB rejects it
+      // ("Cannot update GSI's properties other than Provisioned Throughput…";
+      // live-caught on the iteration-UX deploy, 2026-06-23). So the iteration-UX
+      // running-total query does a per-task GetItem for cost_usd rather than
+      // widening this projection. Keep this list as-is unless you create a NEW
+      // index with a different name.
+      nonKeyAttributes: ['pr_url', 'pr_number', 'status', 'repo', 'user_id', 'channel_metadata'],
+    });
+
+    // GSI: Slack thread → ABCA task (sparse — only Slack-origin tasks with a
+    // slack_thread_ts carry the top-level attribute). ABCA-661 thread-reply
+    // handler. INCLUDE-projects the fields the reply handler reads.
+    this.table.addGlobalSecondaryIndex({
+      indexName: TaskTable.SLACK_THREAD_INDEX,
+      partitionKey: { name: 'slack_thread_ts', type: dynamodb.AttributeType.STRING },
+      sortKey: { name: 'created_at', type: dynamodb.AttributeType.STRING },
+      projectionType: dynamodb.ProjectionType.INCLUDE,
+      nonKeyAttributes: [
+        'task_id', 'user_id', 'repo', 'pr_url', 'pr_number', 'status',
+        'resolved_workflow', 'workflow_ref', 'code_changed', 'answer_text', 'task_description',
+      ],
     });
   }
 }

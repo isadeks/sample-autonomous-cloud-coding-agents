@@ -7,7 +7,7 @@ title: Observability
 For a system where agents run for hours and burn tokens autonomously, observability is load-bearing infrastructure. The platform captures task lifecycle, agent reasoning, tool use, and outcomes so operators can monitor health, debug failures, and improve agent performance over time.
 
 - **Use this doc for:** understanding what the platform observes, how telemetry flows, metrics, dashboards, alarms, and deployment safety.
-- **Related docs:** [ORCHESTRATOR.md](/architecture/orchestrator) for task state machine, [MEMORY.md](/architecture/memory) for code attribution and cross-session learning, [EVALUATION.md](/architecture/evaluation) for agent performance measurement.
+- **Related docs:** [ORCHESTRATOR.md](/sample-autonomous-cloud-coding-agents/architecture/orchestrator) for task state machine, [MEMORY.md](/sample-autonomous-cloud-coding-agents/architecture/memory) for code attribution and cross-session learning, [EVALUATION.md](/sample-autonomous-cloud-coding-agents/architecture/evaluation) for agent performance measurement.
 
 ## Telemetry architecture
 
@@ -65,7 +65,7 @@ The platform tracks four categories of signals, each serving different consumers
 
 Every task emits structured events at each state transition, stored in the TaskEvents table:
 
-- State transitions: `task_created`, `admission_passed`, `admission_rejected`, `hydration_started`, `hydration_complete`, `session_started`, `session_ended`, `pr_created`, `task_completed`, `task_failed`, `task_cancelled`, `task_timed_out`
+- State transitions: `task_created`, `admission_rejected`, `uploads_confirmed`, `hydration_started`, `hydration_complete`, `session_started`, `pr_created`, `task_completed`, `task_failed`, `task_cancelled`, `task_timed_out`
 - Blueprint custom step events: `{step_name}_started`, `{step_name}_completed`, `{step_name}_failed`
 - Guardrail events: `guardrail_blocked` (content blocked during hydration)
 
@@ -109,7 +109,7 @@ Emitted as custom CloudWatch metrics and used in dashboards and alarms.
 
 ## Dashboard
 
-A CloudWatch dashboard (`BackgroundAgent-Tasks`) is deployed via the `TaskDashboard` CDK construct. It provides Logs Insights widgets for:
+A CloudWatch dashboard (`BackgroundAgent-Tasks-${stackName}`, i.e. the base name suffixed with the stack name) is deployed via the `TaskDashboard` CDK construct. It provides Logs Insights widgets for:
 
 - Task success rate and count by status
 - Cost per task and turns per task
@@ -134,7 +134,7 @@ The CloudWatch GenAI Observability console provides additional views: per-sessio
 
 Every agent commit carries `Task-Id:` and `Prompt-Version:` trailers (via a git hook installed during repo setup). This links code changes to the task and prompt that produced them, enabling queries like "what prompt led to this change?" and supporting the evaluation pipeline.
 
-Task conversations, tool calls, decisions, and outcomes are persisted with metadata (`task_id`, `session_id`, `repo`, `branch`, `commit SHAs`, `pr_url`) in a searchable store. The agent retrieves relevant past context via memory search at task start. See [MEMORY.md](/architecture/memory) for the memory lifecycle and retrieval strategy.
+Task conversations, tool calls, decisions, and outcomes are persisted with metadata (`task_id`, `session_id`, `repo`, `branch`, `commit SHAs`, `pr_url`) in a searchable store. The agent retrieves relevant past context via memory search at task start. See [MEMORY.md](/sample-autonomous-cloud-coding-agents/architecture/memory) for the memory lifecycle and retrieval strategy.
 
 ## Audit and retention
 
@@ -143,13 +143,22 @@ Task conversations, tool calls, decisions, and outcomes are persisted with metad
 - **Logs** - Application and usage logs retained for 90 days in CloudWatch. Traces flow to X-Ray via CloudWatch Transaction Search.
 - **Model invocation logs** - Bedrock model invocation logging with 90-day retention for compliance and prompt injection investigation.
 
+## Task replay bundle
+
+For post-mortems, eval-harness input, and compliance export, the API exposes a single **replay bundle** per task that aggregates the telemetry stores above — chronological `TaskEvents`, the verification verdict, the `--trace` S3 URI, `prompt_version` / `workflow_ref`, the OTEL trace id (or `session_id` as the correlation proxy when absent), and cost — without manually correlating CloudWatch, DynamoDB, and S3. It reads existing stores only (no new persistence).
+
+- **API:** `GET /v1/tasks/{task_id}/replay` (Cognito, owner-scoped — same auth as task read). Schema and example in [API_CONTRACT.md](/sample-autonomous-cloud-coding-agents/architecture/api-contract#get-replay-bundle).
+- **CLI:** `bgagent replay <task-id> [--json] [--output <file>]`.
+
+Fields whose source did not run for a given task are returned `null`/empty (e.g. no `--trace` → `trace_uri: null`), so the schema is stable for consumers.
+
 ## Deployment safety
 
 Agent sessions run for up to 8 hours. CDK deployments replace Lambda functions, which can orphan in-flight orchestrator executions. The platform handles this through multiple mechanisms:
 
 - **Drain before deploy** - Pre-deploy check for active tasks. Warn or block if tasks are running.
 - **Durable execution resilience** - Lambda Durable Functions checkpoints are stored externally. A replaced Lambda can resume from its last checkpoint.
-- **Consistency recovery** - If a deploy interrupts a running orchestrator, the counter drift reconciliation Lambda (every 5 minutes) corrects the concurrency counter. The stuck task alarm fires and triggers manual finalization.
+- **Consistency recovery** - If a deploy interrupts a running orchestrator, the `ConcurrencyReconciler` Lambda (every 15 minutes) corrects the concurrency counter. (This is distinct from the stranded-task reconciler, a separate Lambda that runs every 5 minutes to fail tasks whose pipeline never started.) The stuck task alarm fires and triggers manual finalization.
 - **Blue-green deployment** - CI/CD pipeline uses blue-green for the orchestrator Lambda, with automatic rollback if error rates increase.
 
 ## Account prerequisites

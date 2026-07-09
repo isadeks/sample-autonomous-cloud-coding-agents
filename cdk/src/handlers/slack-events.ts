@@ -24,8 +24,9 @@ import { DynamoDBDocumentClient, UpdateCommand } from '@aws-sdk/lib-dynamodb';
 import type { APIGatewayProxyEvent, APIGatewayProxyResult } from 'aws-lambda';
 import { logger } from './shared/logger';
 import { slackFetch } from './shared/slack-api';
+import { resolveTaskBySlackThread } from './shared/slack-task-by-thread';
 import { getSlackSecret, SLACK_SECRET_PREFIX, verifySlackRequest } from './shared/slack-verify';
-import type { MentionEvent, SlackFileRef } from './slack-command-processor';
+import type { MentionEvent, SlackFileRef, ThreadReplyEvent } from './slack-command-processor';
 
 const ddb = DynamoDBDocumentClient.from(new DynamoDBClient({}));
 const sm = new SecretsManagerClient({});
@@ -34,6 +35,7 @@ const lambdaClient = new LambdaClient({});
 const TABLE_NAME = process.env.SLACK_INSTALLATION_TABLE_NAME!;
 const SIGNING_SECRET_ARN = process.env.SLACK_SIGNING_SECRET_ARN!;
 const PROCESSOR_FUNCTION_NAME = process.env.SLACK_COMMAND_PROCESSOR_FUNCTION_NAME;
+const TASK_TABLE_NAME = process.env.TASK_TABLE_NAME;
 
 /** Secret recovery window for revoked installations. */
 const SECRET_RECOVERY_DAYS = 7;
@@ -127,6 +129,18 @@ export async function handler(event: APIGatewayProxyEvent): Promise<APIGatewayPr
         if (!payload.event.bot_id) {
           await handleAppMention(payload.event, teamId);
         }
+      } else if (
+        eventType === 'message'
+        && teamId
+        && !payload.event.bot_id
+        && !payload.event.subtype // skip message_changed, message_deleted, etc.
+        && payload.event.thread_ts // only thread replies (root messages have no thread_ts)
+        && payload.event.thread_ts !== payload.event.ts // exclude the root message itself
+        && !payload.event.text?.match(/<@[A-Z0-9]+>/) // exclude @mentions (handled as app_mention)
+      ) {
+        // Thread reply in a channel (not a DM, not the bot, not an @mention).
+        // Check if this thread belongs to an ABCA task and route accordingly.
+        await handleThreadReply(payload.event, teamId);
       } else {
         logger.info('Unhandled Slack event type', { event_type: eventType, team_id: teamId });
       }
@@ -169,6 +183,24 @@ async function handleAppMention(
     return;
   }
 
+  // ABCA-661: keyword prefix detection — strip the prefix and record the
+  // intended workflow_ref before any other text processing. Recognised prefixes:
+  //   "decompose: …"  → coding/decompose-v1
+  //   "review: …"     → coding/pr-review-v1
+  // The prefix is case-insensitive and consumes the leading word + colon + space.
+  let workflowRef: string | undefined;
+  let processedText = text;
+  const keywordPrefixMatch = processedText.match(/^(decompose|review)\s*:\s*/i);
+  if (keywordPrefixMatch) {
+    const keyword = keywordPrefixMatch[1].toLowerCase();
+    workflowRef = keyword === 'decompose' ? 'coding/decompose-v1' : 'coding/pr-review-v1';
+    processedText = processedText.slice(keywordPrefixMatch[0].length).trim();
+    if (!processedText) {
+      logger.info('app_mention with empty text after keyword prefix, ignoring');
+      return;
+    }
+  }
+
   // Build a payload compatible with the command processor.
   // Use source: 'mention' so the processor knows there's no response_url —
   // it should use chat.postMessage with the bot token instead.
@@ -176,30 +208,24 @@ async function handleAppMention(
   // For natural language mentions like "@Shoof fix the bug in org/repo#42",
   // extract the repo pattern and reorder so submit gets "org/repo#42 fix the bug".
   // The submit handler expects: submit <repo> <description...>
+  //
+  // When no repo is present we still forward the mention (rather than erroring
+  // here): the processor falls back to the channel's onboarded default repo
+  // (`bgagent slack onboard-channel`), and only replies with guidance if no
+  // default exists. Keeping that decision in one place (the processor) avoids
+  // duplicating the channel-mapping lookup in the events handler.
   const repoPattern = /\b([a-zA-Z0-9_.-]+\/[a-zA-Z0-9_.-]+(?:#\d+)?)\b/;
-  const repoMatch = text.match(repoPattern);
-  if (!repoMatch) {
-    // No repo found — reply with a helpful error instead of a broken submit.
-    const botToken = await getSlackSecret(`${SLACK_SECRET_PREFIX}${teamId}`);
-    if (botToken) {
-      const mentionTs = threadTs ?? messageTs;
-      // Swap :eyes: to :x: on the mention
-      if (mentionTs) {
-        await slackFetch(botToken, 'reactions.remove', { channel: channelId, timestamp: mentionTs, name: 'eyes' });
-        await slackFetch(botToken, 'reactions.add', { channel: channelId, timestamp: mentionTs, name: 'x' });
-      }
-      await slackFetch(botToken, 'chat.postMessage', {
-        channel: channelId,
-        thread_ts: mentionTs,
-        text: ':x: Please include a repo — e.g. `@Shoof fix the bug in org/repo#42`',
-      });
-    }
-    return;
+  const repoMatch = processedText.match(repoPattern);
+  let commandText: string;
+  if (repoMatch) {
+    const repo = repoMatch[0];
+    const description = processedText.replace(repo, '').replace(/\s+/g, ' ').trim();
+    commandText = `submit ${repo} ${description}`.trim();
+  } else {
+    // No repo token — forward the whole text; the processor treats it as the
+    // task description against the channel default repo (or replies with help).
+    commandText = `submit ${processedText}`;
   }
-
-  const repo = repoMatch[0];
-  const description = text.replace(repo, '').replace(/\s+/g, ' ').trim();
-  const commandText = `submit ${repo} ${description}`;
 
   // Extract file references from the Slack event (if any attached)
   const rawFiles = Array.isArray(event.files) ? event.files as Array<Record<string, unknown>> : [];
@@ -221,6 +247,8 @@ async function handleAppMention(
     source: 'mention',
     mention_thread_ts: threadTs ?? messageTs,
     ...(files.length > 0 && { files }),
+    // Pass the workflow_ref through if a keyword prefix was detected.
+    ...(workflowRef !== undefined && { workflow_ref: workflowRef }),
   };
 
   // React with :eyes: immediately so the user knows the bot saw their message.
@@ -258,6 +286,118 @@ async function handleAppMention(
         channel: channelId,
         thread_ts: mentionTs,
         text: ':x: Something went wrong forwarding your request. Please try again.',
+      });
+    }
+  }
+}
+
+/**
+ * ABCA-661: Handle a thread reply in a non-DM channel.
+ *
+ * Queries the ``SlackThreadIndex`` GSI to check whether the thread belongs to
+ * an ABCA task. If it does, forwards a ``ThreadReplyEvent`` to the command
+ * processor which decides between PR-iteration and clarify-resume.
+ *
+ * If the thread is not an ABCA task thread (no row in the GSI), silently
+ * ignores the reply — ordinary Slack thread replies are not actionable.
+ */
+async function handleThreadReply(
+  event: NonNullable<SlackEventPayload['event']>,
+  teamId: string,
+): Promise<void> {
+  if (!PROCESSOR_FUNCTION_NAME) {
+    logger.warn('SLACK_COMMAND_PROCESSOR_FUNCTION_NAME not set, ignoring thread_reply');
+    return;
+  }
+  if (!TASK_TABLE_NAME) {
+    logger.warn('TASK_TABLE_NAME not set, cannot look up task for thread reply');
+    return;
+  }
+
+  const userId = event.user;
+  const channelId = event.channel;
+  const threadTs = event.thread_ts as string; // guaranteed by the caller's guard
+  const messageTs = event.ts;
+
+  if (!userId || !channelId || !threadTs) {
+    logger.warn('thread_reply event missing user/channel/thread_ts', { event });
+    return;
+  }
+
+  // Look up the task that originated this thread.
+  const task = await resolveTaskBySlackThread(ddb, TASK_TABLE_NAME, threadTs);
+  if (!task) {
+    // Not an ABCA task thread — silently ignore.
+    logger.info('Thread reply in non-ABCA thread — ignoring', {
+      team_id: teamId,
+      channel_id: channelId,
+      thread_ts: threadTs,
+    });
+    return;
+  }
+
+  // Strip @mentions and trim the reply text.
+  const rawText = (event.text as string | undefined) ?? '';
+  const replyText = rawText.replace(/<@[A-Z0-9]+>/g, '').trim();
+
+  // Extract file references from the Slack event (if any attached).
+  const rawFiles = Array.isArray(event.files) ? event.files as Array<Record<string, unknown>> : [];
+  const files: SlackFileRef[] = rawFiles
+    .filter(f => typeof f.url_private_download === 'string' && typeof f.name === 'string')
+    .map(f => ({
+      id: String(f.id ?? ''),
+      name: String(f.name),
+      mimetype: String(f.mimetype ?? 'application/octet-stream'),
+      size: typeof f.size === 'number' ? f.size : 0,
+      url_private_download: String(f.url_private_download),
+    }));
+
+  const threadReplyPayload: ThreadReplyEvent = {
+    source: 'thread_reply',
+    text: replyText,
+    user_id: userId,
+    team_id: teamId,
+    channel_id: channelId,
+    thread_ts: threadTs,
+    reply_text: replyText,
+    thread_task: task,
+    ...(files.length > 0 && { files }),
+  };
+
+  // React with :eyes: so the user knows the bot acknowledged their reply.
+  if (messageTs) {
+    const botToken = await getSlackSecret(`${SLACK_SECRET_PREFIX}${teamId}`);
+    if (botToken) {
+      await slackFetch(botToken, 'reactions.add', { channel: channelId, timestamp: messageTs, name: 'eyes' });
+    }
+  }
+
+  try {
+    await lambdaClient.send(new InvokeCommand({
+      FunctionName: PROCESSOR_FUNCTION_NAME,
+      InvocationType: 'Event',
+      Payload: new TextEncoder().encode(JSON.stringify(threadReplyPayload)),
+    }));
+    logger.info('Thread reply forwarded to command processor', {
+      team_id: teamId,
+      user_id: userId,
+      channel_id: channelId,
+      thread_ts: threadTs,
+      task_id: task.task_id,
+    });
+  } catch (err) {
+    logger.error('Failed to invoke command processor for thread_reply', {
+      error: err instanceof Error ? err.message : String(err),
+    });
+    // Swap :eyes: to :x: so the user isn't left staring at a stuck reaction.
+    const botToken = await getSlackSecret(`${SLACK_SECRET_PREFIX}${teamId}`);
+    if (botToken && messageTs) {
+      await slackFetch(botToken, 'reactions.remove', { channel: channelId, timestamp: messageTs, name: 'eyes' });
+      await slackFetch(botToken, 'reactions.add', { channel: channelId, timestamp: messageTs, name: 'x' });
+      await slackFetch(botToken, 'chat.postMessage', {
+        channel: channelId,
+        thread_ts: threadTs,
+        text: ':x: Something went wrong forwarding your reply. Please try again.',
       });
     }
   }

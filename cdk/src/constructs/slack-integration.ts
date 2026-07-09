@@ -28,8 +28,24 @@ import * as lambda from 'aws-cdk-lib/aws-lambda-nodejs';
 import * as secretsmanager from 'aws-cdk-lib/aws-secretsmanager';
 import { NagSuppressions } from 'cdk-nag';
 import { Construct } from 'constructs';
+import { SlackChannelMappingTable } from './slack-channel-mapping-table';
 import { SlackInstallationTable } from './slack-installation-table';
 import { SlackUserMappingTable } from './slack-user-mapping-table';
+
+/** Default task-record retention used for TTL computation (days). */
+const DEFAULT_TASK_RETENTION_DAYS = 90;
+
+/** OAuth-callback Lambda timeout (seconds). */
+const OAUTH_CALLBACK_TIMEOUT_SECONDS = 15;
+
+/** Slash-command processor (async worker) Lambda timeout (seconds). */
+const COMMAND_PROCESSOR_TIMEOUT_SECONDS = 30;
+
+/** Slash-command acknowledger Lambda timeout (seconds). */
+const COMMAND_ACK_TIMEOUT_SECONDS = 3;
+
+/** Slash-command processor Lambda memory (MB). */
+const COMMAND_PROCESSOR_MEMORY_MB = 512;
 
 /**
  * Properties for SlackIntegration construct.
@@ -88,6 +104,9 @@ export class SlackIntegration extends Construct {
   /** The Slack user mapping table. */
   public readonly userMappingTable: dynamodb.Table;
 
+  /** The Slack channel → default-repo mapping table. */
+  public readonly channelMappingTable: dynamodb.Table;
+
   /** The Slack signing secret (placeholder — user populates after creating the Slack App). */
   public readonly signingSecret: secretsmanager.Secret;
 
@@ -105,8 +124,10 @@ export class SlackIntegration extends Construct {
     // --- DynamoDB Tables ---
     const installationTable = new SlackInstallationTable(this, 'InstallationTable', { removalPolicy });
     const userMappingTable = new SlackUserMappingTable(this, 'UserMappingTable', { removalPolicy });
+    const channelMappingTable = new SlackChannelMappingTable(this, 'ChannelMappingTable', { removalPolicy });
     this.installationTable = installationTable.table;
     this.userMappingTable = userMappingTable.table;
+    this.channelMappingTable = channelMappingTable.table;
 
     // --- Slack App Secrets (CDK-created placeholders) ---
     // Users populate these after creating the Slack App via the SlackAppCreateUrl output.
@@ -161,7 +182,7 @@ export class SlackIntegration extends Construct {
     const createTaskEnv: Record<string, string> = {
       TASK_TABLE_NAME: props.taskTable.tableName,
       TASK_EVENTS_TABLE_NAME: props.taskEventsTable.tableName,
-      TASK_RETENTION_DAYS: String(props.taskRetentionDays ?? 90),
+      TASK_RETENTION_DAYS: String(props.taskRetentionDays ?? DEFAULT_TASK_RETENTION_DAYS),
     };
     if (props.repoTable) {
       createTaskEnv.REPO_TABLE_NAME = props.repoTable.tableName;
@@ -184,7 +205,7 @@ export class SlackIntegration extends Construct {
       handler: 'handler',
       runtime: Runtime.NODEJS_24_X,
       architecture: Architecture.ARM_64,
-      timeout: Duration.seconds(15),
+      timeout: Duration.seconds(OAUTH_CALLBACK_TIMEOUT_SECONDS),
       environment: {
         SLACK_INSTALLATION_TABLE_NAME: this.installationTable.tableName,
         SLACK_CLIENT_ID_SECRET_ARN: this.clientIdSecret.secretArn,
@@ -238,21 +259,30 @@ export class SlackIntegration extends Construct {
     }));
 
     // --- Slash Command Processor (async worker) ---
+    // Memory bumped from default 128 MB → 512 MB after module-init OOM
+    // surfaced in dev. Bundle grew past the 128 MB cap once createTaskCore's
+    // transitive dependency graph (Cedar, attachment-screening) imported
+    // here through the shared task-creation path.
     const commandProcessorFn = new lambda.NodejsFunction(this, 'CommandProcessorFn', {
       entry: path.join(handlersDir, 'slack-command-processor.ts'),
       handler: 'handler',
       runtime: Runtime.NODEJS_24_X,
       architecture: Architecture.ARM_64,
-      timeout: Duration.seconds(30),
+      timeout: Duration.seconds(COMMAND_PROCESSOR_TIMEOUT_SECONDS),
+      memorySize: COMMAND_PROCESSOR_MEMORY_MB,
       environment: {
         ...createTaskEnv,
         SLACK_USER_MAPPING_TABLE_NAME: this.userMappingTable.tableName,
         SLACK_INSTALLATION_TABLE_NAME: this.installationTable.tableName,
+        SLACK_CHANNEL_MAPPING_TABLE_NAME: this.channelMappingTable.tableName,
       },
       bundling: commonBundling,
     });
     this.userMappingTable.grantReadWriteData(commandProcessorFn);
     this.installationTable.grantReadData(commandProcessorFn);
+    // Read defaults for @mention resolution AND write them via `/bgagent set-repo`
+    // (and store transient pending repo-pick records for the interactive picker).
+    this.channelMappingTable.grantReadWriteData(commandProcessorFn);
     commandProcessorFn.addToRolePolicy(readSlackSecretsPolicy);
     props.taskTable.grantReadWriteData(commandProcessorFn);
     props.taskEventsTable.grantReadWriteData(commandProcessorFn);
@@ -293,6 +323,8 @@ export class SlackIntegration extends Construct {
         SLACK_SIGNING_SECRET_ARN: this.signingSecret.secretArn,
         TASK_TABLE_NAME: props.taskTable.tableName,
         SLACK_USER_MAPPING_TABLE_NAME: this.userMappingTable.tableName,
+        SLACK_CHANNEL_MAPPING_TABLE_NAME: this.channelMappingTable.tableName,
+        SLACK_COMMAND_PROCESSOR_FUNCTION_NAME: commandProcessorFn.functionName,
       },
       bundling: commonBundling,
     });
@@ -300,6 +332,11 @@ export class SlackIntegration extends Construct {
     slackInteractionsFn.addToRolePolicy(readSlackSecretsPolicy);
     props.taskTable.grantReadWriteData(slackInteractionsFn);
     this.userMappingTable.grantReadData(slackInteractionsFn);
+    // Read/delete transient pending repo-pick records written by the picker.
+    this.channelMappingTable.grantReadWriteData(slackInteractionsFn);
+    // The repo-picker callback forwards the resolved submission back to the
+    // command processor so the existing submit path runs unchanged.
+    commandProcessorFn.grantInvoke(slackInteractionsFn);
 
     // --- Slash Command Acknowledger ---
     const slackCommandsFn = new lambda.NodejsFunction(this, 'SlackCommandsFn', {
@@ -307,7 +344,7 @@ export class SlackIntegration extends Construct {
       handler: 'handler',
       runtime: Runtime.NODEJS_24_X,
       architecture: Architecture.ARM_64,
-      timeout: Duration.seconds(3),
+      timeout: Duration.seconds(COMMAND_ACK_TIMEOUT_SECONDS),
       environment: {
         SLACK_SIGNING_SECRET_ARN: this.signingSecret.secretArn,
         SLACK_COMMAND_PROCESSOR_FUNCTION_NAME: commandProcessorFn.functionName,

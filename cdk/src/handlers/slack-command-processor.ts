@@ -20,9 +20,18 @@
 import * as crypto from 'crypto';
 import { DynamoDBClient } from '@aws-sdk/client-dynamodb';
 import { DynamoDBDocumentClient, GetCommand, PutCommand } from '@aws-sdk/lib-dynamodb';
+import { buildClarifyResumeDescription, isClarifyHold } from './shared/clarify-resume';
 import { createTaskCore } from './shared/create-task-core';
 import { logger } from './shared/logger';
 import { slackFetch } from './shared/slack-api';
+import { repoPickerMessage } from './shared/slack-blocks';
+import {
+  addChannelRepo,
+  getChannelRepos,
+  putPendingRepoPick,
+  type PendingRepoPickFile,
+} from './shared/slack-channel-config';
+import { prNumberFromSlackTask, type SlackThreadTask } from './shared/slack-task-by-thread';
 import { getSlackSecret, SLACK_SECRET_PREFIX } from './shared/slack-verify';
 import type { Attachment } from './shared/types';
 import type { SlackCommandPayload } from './slack-commands';
@@ -57,10 +66,34 @@ export interface MentionEvent extends BasePayload {
   readonly source: 'mention';
   readonly mention_thread_ts?: string;
   readonly files?: readonly SlackFileRef[];
+  /**
+   * Workflow ref pre-parsed by the events handler from a keyword prefix
+   * (e.g. "decompose: …" → "coding/decompose-v1"). When set, the submit
+   * handler passes it through to createTaskCore instead of relying on the
+   * platform's default resolution ladder.
+   */
+  readonly workflow_ref?: string;
+}
+
+/**
+ * A thread-reply in an existing ABCA task thread — triggers PR-iteration or
+ * clarify-resume, depending on the originating task's state. Routed here by
+ * the events handler (``slack-events.ts``) when it detects a non-bot,
+ * non-mention message in a thread whose ``thread_ts`` belongs to a task.
+ */
+export interface ThreadReplyEvent extends BasePayload {
+  readonly source: 'thread_reply';
+  /** The ``thread_ts`` of the Slack thread (= the root message ts). */
+  readonly thread_ts: string;
+  /** The reply text (bot-mention stripped, trimmed). */
+  readonly reply_text: string;
+  /** The task found in the SlackThreadIndex for this thread. */
+  readonly thread_task: SlackThreadTask;
+  readonly files?: readonly SlackFileRef[];
 }
 
 /** Discriminated union of the inbound events the processor accepts. */
-export type CommandProcessorEvent = SlashCommandEvent | MentionEvent;
+export type CommandProcessorEvent = SlashCommandEvent | MentionEvent | ThreadReplyEvent;
 
 /**
  * Legacy shape — the slash-command acknowledger (`slack-commands.ts`) forwards
@@ -80,9 +113,16 @@ const ddb = DynamoDBDocumentClient.from(new DynamoDBClient({}));
 
 const USER_MAPPING_TABLE = process.env.SLACK_USER_MAPPING_TABLE_NAME!;
 const INSTALLATION_TABLE = process.env.SLACK_INSTALLATION_TABLE_NAME!;
+const CHANNEL_MAPPING_TABLE = process.env.SLACK_CHANNEL_MAPPING_TABLE_NAME;
 
 /** Link code TTL. */
 const LINK_CODE_TTL_S = 10 * 60; // 10 minutes
+
+/** Random bytes for slash-command account-link codes (→ 6 hex chars). */
+const LINK_CODE_ENTROPY_BYTES = 3;
+
+/** Prefix length when logging Slack response_url values (avoid leaking tokens). */
+const RESPONSE_URL_LOG_PREFIX_LEN = 80;
 
 /**
  * Async processor for Slack slash commands and @mention triggers.
@@ -93,6 +133,13 @@ const LINK_CODE_TTL_S = 10 * 60; // 10 minutes
  */
 export async function handler(raw: RawEvent): Promise<void> {
   const event = normalizeEvent(raw);
+
+  // Thread-reply path — entirely separate from subcommand routing.
+  if (event.source === 'thread_reply') {
+    await handleThreadReply(event);
+    return;
+  }
+
   const text = (event.text ?? '').trim();
   const parts = text.split(/\s+/);
   const subcommand = parts[0]?.toLowerCase() ?? '';
@@ -115,12 +162,29 @@ export async function handler(raw: RawEvent): Promise<void> {
       case 'link':
         await handleLink(event, reply);
         break;
+      case 'set-repo':
+      case 'setup':
+        await handleSetRepo(event, parts.slice(1), reply);
+        break;
+      case 'repos':
+      case 'list-repos':
+        await handleListRepos(event, reply);
+        break;
       case 'help':
         await reply(
           '*Using Shoof*\n\n'
           + '*Submit a task:* Mention `@Shoof` in any channel:\n'
           + '> `@Shoof fix the login bug in org/repo#42`\n'
           + '> `@Shoof update the README in org/repo`\n\n'
+          + '*Workflow keywords:* Prefix your message to select a workflow:\n'
+          + '> `@Shoof decompose: fix the auth bug in org/repo` — plan and decompose\n'
+          + '> `@Shoof review: check the PR in org/repo#42` — PR review only\n\n'
+          + '*Thread replies:* Reply in an existing task\'s thread to continue work:\n'
+          + '> Reply to trigger PR-iteration on the task\'s open PR.\n'
+          + '> Reply to resume a task that asked a clarifying question.\n\n'
+          + '*Set a default repo for this channel:* `/bgagent set-repo org/repo`\n'
+          + 'Once set, you can drop the repo name — `@Shoof fix the login bug` runs against the channel default. Add several repos and Shoof will ask which one to use.\n\n'
+          + '*See configured repos:* `/bgagent repos`\n\n'
           + '*Private submissions:* DM Shoof directly.\n\n'
           + '*Cancel a task:* Use the Cancel button in the thread.\n\n'
           + '*Link your account:* `/bgagent link` — one-time setup.\n\n'
@@ -128,7 +192,7 @@ export async function handler(raw: RawEvent): Promise<void> {
         );
         break;
       default:
-        await reply('Use `@Shoof` to submit tasks, or `/bgagent link` to link your account.\nTry `/bgagent help` for more info.');
+        await reply('Use `@Shoof` to submit tasks, `/bgagent set-repo org/repo` to set a channel default, or `/bgagent link` to link your account.\nTry `/bgagent help` for more info.');
     }
   } catch (err) {
     logger.error('Slack command processing failed', {
@@ -188,26 +252,124 @@ async function handleSubmit(event: MentionEvent, args: string[], reply: ReplyFn)
     return;
   }
 
-  // Parse repo and optional issue number from first arg: "org/repo#42" or "org/repo".
+  // Resolve the target repo. Three ways, in priority order:
+  //   1. The user typed it: "org/repo#42 <description>" — first arg is the repo,
+  //      the rest is the description. This explicit override always wins so
+  //      one-off cross-repo tasks still work in a channel with defaults.
+  //   2. The user omitted it and the channel has exactly ONE configured default
+  //      repo (`/bgagent set-repo` or the legacy `bgagent slack onboard-channel`)
+  //      — resolve it automatically; the WHOLE message is the description.
+  //   3. The channel has SEVERAL configured repos — post an interactive picker
+  //      and defer submission until the user chooses one.
   const repoArg = args[0];
   const { repo, issueNumber } = parseRepoArg(repoArg);
-  if (!repo) {
-    await reply(`Invalid repo format: \`${repoArg}\`. Expected \`org/repo\` or \`org/repo#42\`.`);
-    if (event.mention_thread_ts) {
-      await swapReaction(event.team_id, event.channel_id, event.mention_thread_ts, 'eyes', 'x');
+  let description: string | undefined;
+  if (repo) {
+    description = args.slice(1).join(' ') || undefined;
+  } else {
+    const channelRepos = await getChannelRepos(CHANNEL_MAPPING_TABLE, event.team_id, event.channel_id);
+    if (channelRepos.length === 0) {
+      // No default set — guide the user rather than silently failing.
+      await reply('This channel has no default repo set. Include one — e.g. `@Shoof fix the bug in org/repo#42` — or run `/bgagent set-repo org/repo` to set a channel default.');
+      if (event.mention_thread_ts) {
+        await swapReaction(event.team_id, event.channel_id, event.mention_thread_ts, 'eyes', 'x');
+      }
+      return;
     }
+    if (channelRepos.length === 1) {
+      // Exactly one default — resolve automatically. The whole message is the description.
+      await submitTaskForRepo(event, platformUserId, channelRepos[0], undefined, args.join(' ') || undefined, reply);
+      return;
+    }
+    // Multiple defaults — present a Block Kit picker and defer submission.
+    await presentRepoPicker(event, channelRepos, args.join(' ') || undefined, reply);
     return;
   }
 
+  await submitTaskForRepo(event, platformUserId, repo, issueNumber, description, reply);
+}
+
+/**
+ * Post the interactive repo-picker for a channel that has several configured
+ * default repos. Stashes the pending submission context keyed by a random
+ * token so the interaction callback (`pick_repo:{token}`) can complete the
+ * submission against whichever repo the user chooses.
+ */
+async function presentRepoPicker(
+  event: MentionEvent,
+  repos: string[],
+  description: string | undefined,
+  reply: ReplyFn,
+): Promise<void> {
+  if (!CHANNEL_MAPPING_TABLE) {
+    // Should not happen (we only get here after a successful lookup), but stay safe.
+    await reply('This channel has no default repo set. Include one — e.g. `@Shoof fix the bug in org/repo#42`.');
+    return;
+  }
+
+  const token = crypto.randomUUID();
+  const files: PendingRepoPickFile[] | undefined = event.files?.map((f) => ({
+    id: f.id,
+    name: f.name,
+    mimetype: f.mimetype,
+    size: f.size,
+    url_private_download: f.url_private_download,
+  }));
+
+  try {
+    await putPendingRepoPick(CHANNEL_MAPPING_TABLE, token, {
+      description: description ?? '',
+      team_id: event.team_id,
+      channel_id: event.channel_id,
+      user_id: event.user_id,
+      thread_ts: event.mention_thread_ts,
+      files,
+    });
+  } catch (err) {
+    logger.error('Failed to store pending repo pick', {
+      error: err instanceof Error ? err.message : String(err),
+    });
+    await reply(':warning: Could not build the repo picker. Please include the repo explicitly — e.g. `@Shoof fix the bug in org/repo`.');
+    return;
+  }
+
+  const botToken = await getBotToken(event.team_id);
+  if (!botToken) {
+    await reply(':warning: The Slack integration is not fully configured (missing bot token). Ask your workspace admin to reinstall the app.');
+    return;
+  }
+
+  const message = repoPickerMessage(token, repos, event.mention_thread_ts);
+  const ok = await slackFetch(botToken, 'chat.postMessage', {
+    channel: event.channel_id,
+    text: message.text,
+    blocks: message.blocks,
+    ...(message.thread_ts && { thread_ts: message.thread_ts }),
+  });
+  if (!ok) {
+    await reply(':warning: Could not post the repo picker. Please include the repo explicitly — e.g. `@Shoof fix the bug in org/repo`.');
+  }
+}
+
+/**
+ * Complete a task submission against a resolved repo. Shared by the
+ * explicit-repo path, the single-default auto-resolve path, and (via the
+ * interactions handler) the repo-picker path.
+ */
+async function submitTaskForRepo(
+  event: MentionEvent,
+  platformUserId: string,
+  repo: string,
+  issueNumber: number | undefined,
+  description: string | undefined,
+  reply: ReplyFn,
+): Promise<void> {
   // Check if the bot can post to this channel (private channels need an invite).
   const channelCheck = await checkChannelAccess(event.team_id, event.channel_id);
   if (!channelCheck.ok) {
     await reply(channelCheck.error!);
     return;
   }
-
-  // Remaining args are the task description.
-  const description = args.slice(1).join(' ') || undefined;
 
   // handleSubmit is only invoked for the mention path, so there's no response_url.
   // Notifications thread under the user's @mention message using mention_thread_ts.
@@ -238,6 +400,9 @@ async function handleSubmit(event: MentionEvent, args: string[], reply: ReplyFn)
       issue_number: issueNumber,
       task_description: description,
       ...(attachments.length > 0 && { attachments }),
+      // Pass through the workflow_ref if the mention included a keyword prefix
+      // (e.g. "decompose: …" → workflow_ref='coding/decompose-v1').
+      ...(event.workflow_ref && { workflow_ref: event.workflow_ref }),
     },
     {
       userId: platformUserId,
@@ -273,11 +438,222 @@ function parseRepoArg(arg: string): { repo: string | null; issueNumber?: number 
   };
 }
 
+// ─── Thread Reply ─────────────────────────────────────────────────────────────
+
+/**
+ * Handle a reply in an existing ABCA task thread.
+ *
+ * Three sub-cases, checked in order:
+ *
+ *   1. **Clarify-resume** — the originating task is a ``coding/new-task-v1``
+ *      that paused to ask a clarifying question (``code_changed===false``,
+ *      non-empty ``answer_text``, no PR). The user's reply is the answer;
+ *      dispatch a fresh ``new-task-v1`` with the resume description.
+ *
+ *   2. **PR-iteration** — the originating task has an open PR (``pr_number``
+ *      or parseable ``pr_url``). The user's reply is the iteration instruction;
+ *      dispatch a ``coding/pr-iteration-v1`` on that PR.
+ *
+ *   3. **Neither** — the task thread exists but the task has no actionable
+ *      state (e.g. it's still running, or it failed without a PR). Ignore
+ *      silently — reacting to every reply in a task thread would be noisy.
+ */
+async function handleThreadReply(event: ThreadReplyEvent): Promise<void> {
+  const { thread_task: task, reply_text, thread_ts } = event;
+
+  // Build a reply fn that posts in-thread under the root message.
+  const reply = async (text: string): Promise<void> => {
+    const botToken = await getBotToken(event.team_id);
+    if (!botToken) return;
+    await fetch('https://slack.com/api/chat.postMessage', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json; charset=utf-8',
+        'Authorization': `Bearer ${botToken}`,
+      },
+      body: JSON.stringify({
+        channel: event.channel_id,
+        text,
+        thread_ts,
+      }),
+    });
+  };
+
+  // Resolve the platform user.
+  const platformUserId = await lookupPlatformUser(event.team_id, event.user_id);
+  if (!platformUserId) {
+    await reply(':link: Your Slack account is not linked. Run `/bgagent link` first.');
+    return;
+  }
+
+  const channelMetadata: Record<string, string> = {
+    slack_team_id: event.team_id,
+    slack_channel_id: event.channel_id,
+    slack_user_id: event.user_id,
+    slack_thread_ts: thread_ts,
+  };
+
+  // 1. Clarify-resume — re-run new-task-v1 with the user's answer baked into
+  //    the description. Mirror the exact same predicate used by the Linear path.
+  const clarifyHoldRow = {
+    resolved_workflow: task.resolved_workflow_id
+      ? { id: task.resolved_workflow_id }
+      : undefined,
+    workflow_ref: task.workflow_ref,
+    code_changed: task.code_changed,
+    answer_text: task.answer_text,
+    task_description: task.task_description,
+    pr_url: task.pr_url,
+    pr_number: task.pr_number,
+  };
+  if (isClarifyHold(clarifyHoldRow)) {
+    const resumeDescription = buildClarifyResumeDescription(
+      task.task_description,
+      task.answer_text,
+      reply_text,
+    );
+    const result = await createTaskCore(
+      {
+        repo: task.repo,
+        task_description: resumeDescription,
+        workflow_ref: 'coding/new-task-v1',
+      },
+      {
+        userId: platformUserId,
+        channelSource: 'slack',
+        channelMetadata,
+      },
+      crypto.randomUUID(),
+    );
+    if (result.statusCode !== 201) {
+      const body = JSON.parse(result.body);
+      const errMsg = body.error?.message ?? 'Unknown error';
+      await reply(`:x: Failed to resume task: ${errMsg}`);
+      logger.warn('Slack clarify-resume task creation failed', {
+        status: result.statusCode,
+        task_id: task.task_id,
+        error: errMsg,
+      });
+    }
+    // On success the notify handler posts in-thread — don't duplicate.
+    return;
+  }
+
+  // 2. PR-iteration — the task opened a PR; the user's reply is the instruction.
+  const prNumber = prNumberFromSlackTask(task);
+  if (prNumber !== null && task.repo) {
+    // Extract file attachments if any.
+    const attachments = await extractSlackFileAttachments(
+      { ...event, files: event.files, source: 'mention', text: '', mention_thread_ts: thread_ts } as MentionEvent,
+      reply,
+    );
+    if (attachments === null) return; // validation error already replied
+
+    const result = await createTaskCore(
+      {
+        repo: task.repo,
+        pr_number: prNumber,
+        task_description: reply_text || undefined,
+        workflow_ref: 'coding/pr-iteration-v1',
+        ...(attachments.length > 0 && { attachments }),
+      },
+      {
+        userId: platformUserId,
+        channelSource: 'slack',
+        channelMetadata,
+      },
+      crypto.randomUUID(),
+    );
+    if (result.statusCode !== 201) {
+      const body = JSON.parse(result.body);
+      const errMsg = body.error?.message ?? 'Unknown error';
+      await reply(`:x: Failed to create PR iteration task: ${errMsg}`);
+      logger.warn('Slack PR-iteration task creation failed', {
+        status: result.statusCode,
+        task_id: task.task_id,
+        error: errMsg,
+      });
+    }
+    // On success the notify handler posts in-thread — don't duplicate.
+    return;
+  }
+
+  // 3. Neither — task thread but no actionable state. Log and silently ignore.
+  logger.info('Slack thread reply in non-actionable task thread — ignoring', {
+    task_id: task.task_id,
+    task_status: task.status,
+    has_pr: prNumber !== null,
+    is_clarify_hold: false,
+  });
+}
+
+// ─── Set / list channel repos ──────────────────────────────────────────────────
+
+/**
+ * `/bgagent set-repo org/repo` (or `/bgagent setup org/repo`) — add a default
+ * repo to the current channel so members can @mention the bot without typing
+ * the repo. Repeated calls with different repos build up the channel's list;
+ * once several are configured, a bare @mention shows an interactive picker.
+ *
+ * Runs on both the slash-command and mention paths — the channel id and team
+ * id are present in either case.
+ */
+async function handleSetRepo(event: CommandProcessorEvent, args: string[], reply: ReplyFn): Promise<void> {
+  if (!CHANNEL_MAPPING_TABLE) {
+    await reply(':warning: Channel repo configuration is not available in this deployment.');
+    return;
+  }
+
+  const repoArg = args[0];
+  if (!repoArg) {
+    await reply('Usage: `/bgagent set-repo org/repo` — sets the default repo for this channel.\nRun it again with another repo to add more; Shoof will then ask which one to use.');
+    return;
+  }
+
+  const { repo } = parseRepoArg(repoArg);
+  if (!repo) {
+    await reply(`:x: \`${repoArg}\` doesn't look like a repo. Use the \`owner/repo\` format — e.g. \`/bgagent set-repo acme/website\`.`);
+    return;
+  }
+
+  try {
+    const repos = await addChannelRepo(CHANNEL_MAPPING_TABLE, event.team_id, event.channel_id, repo);
+    if (repos.length === 1) {
+      await reply(`:white_check_mark: This channel now defaults to \`${repo}\`.\nMembers can @mention Shoof without naming the repo — e.g. \`@Shoof fix the login bug\`.`);
+    } else {
+      await reply(
+        `:white_check_mark: Added \`${repo}\`. This channel now has ${repos.length} repos configured:\n`
+        + repos.map((r) => `• \`${r}\``).join('\n')
+        + '\n\nWhen you @mention Shoof without a repo, it will ask which one to use.',
+      );
+    }
+  } catch (err) {
+    logger.error('Failed to set channel repo', {
+      error: err instanceof Error ? err.message : String(err),
+      team_id: event.team_id,
+      channel_id: event.channel_id,
+    });
+    await reply(':warning: Could not save the channel repo. Please try again.');
+  }
+}
+
+/** `/bgagent repos` — list the repos configured for the current channel. */
+async function handleListRepos(event: CommandProcessorEvent, reply: ReplyFn): Promise<void> {
+  const repos = await getChannelRepos(CHANNEL_MAPPING_TABLE, event.team_id, event.channel_id);
+  if (repos.length === 0) {
+    await reply('This channel has no default repo set. Run `/bgagent set-repo org/repo` to add one.');
+    return;
+  }
+  await reply(
+    `*Repos configured for this channel:*\n${repos.map((r) => `• \`${r}\``).join('\n')}`,
+  );
+}
+
 // ─── Link ─────────────────────────────────────────────────────────────────────
 
 async function handleLink(event: CommandProcessorEvent, reply: ReplyFn): Promise<void> {
   // Generate a 6-character alphanumeric code.
-  const code = crypto.randomBytes(3).toString('hex').toUpperCase();
+  const code = crypto.randomBytes(LINK_CODE_ENTROPY_BYTES).toString('hex').toUpperCase();
   const now = new Date().toISOString();
   const ttl = Math.floor(Date.now() / 1000) + LINK_CODE_TTL_S;
 
@@ -518,7 +894,7 @@ async function lookupPlatformUser(teamId: string, userId: string): Promise<strin
 
 async function postToSlack(responseUrl: string, text: string): Promise<void> {
   logger.info('Posting to Slack response_url', {
-    response_url: responseUrl.substring(0, 80),
+    response_url: responseUrl.substring(0, RESPONSE_URL_LOG_PREFIX_LEN),
     text_length: text.length,
   });
   try {
@@ -531,7 +907,7 @@ async function postToSlack(responseUrl: string, text: string): Promise<void> {
       const body = await response.text().catch(() => '');
       logger.warn('Failed to post to Slack response_url', {
         status: response.status,
-        response_url: responseUrl.substring(0, 80),
+        response_url: responseUrl.substring(0, RESPONSE_URL_LOG_PREFIX_LEN),
         body,
       });
     } else {
