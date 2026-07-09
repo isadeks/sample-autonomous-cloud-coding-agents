@@ -26,6 +26,7 @@ jest.mock('@aws-sdk/client-dynamodb', () => ({ DynamoDBClient: jest.fn(() => ({}
 jest.mock('@aws-sdk/lib-dynamodb', () => ({
   DynamoDBDocumentClient: { from: jest.fn(() => ({ send: ddbSend })) },
   UpdateCommand: jest.fn((input: unknown) => ({ _type: 'Update', input })),
+  ScanCommand: jest.fn((input: unknown) => ({ _type: 'Scan', input })),
 }));
 
 const lambdaSend = jest.fn();
@@ -47,6 +48,7 @@ const fetchMock = jest.fn();
 process.env.SLACK_INSTALLATION_TABLE_NAME = 'SlackInstall';
 process.env.SLACK_SIGNING_SECRET_ARN = 'arn:aws:secretsmanager:us-east-1:123:secret:bgagent/slack/signing-XYZ';
 process.env.SLACK_COMMAND_PROCESSOR_FUNCTION_NAME = 'cmd-processor';
+process.env.TASK_TABLE_NAME = 'TaskTable';
 
 import { invalidateSlackSecretCache } from '../../src/handlers/shared/slack-verify';
 import { handler } from '../../src/handlers/slack-events';
@@ -266,6 +268,71 @@ describe('slack-events handler', () => {
     expect(postedReply).toBeFalsy();
   });
 
+  test('app_mention with keyword prefix "decompose:" is forwarded verbatim (no repo reorder)', async () => {
+    fetchMock.mockResolvedValue({
+      ok: true,
+      json: () => Promise.resolve({ ok: true }),
+    });
+    smSend.mockImplementation((cmd: { _type: string; input?: { SecretId?: string } }) => {
+      if (cmd._type === 'GetSecretValue' && cmd.input?.SecretId === process.env.SLACK_SIGNING_SECRET_ARN) {
+        return Promise.resolve({ SecretString: SIGNING_SECRET });
+      }
+      return Promise.resolve({ SecretString: 'xoxb-bot' });
+    });
+
+    const body = JSON.stringify({
+      type: 'event_callback',
+      team_id: 'T1',
+      event: {
+        type: 'app_mention',
+        user: 'U1',
+        channel: 'C1',
+        text: '<@BOT> decompose: plan the auth refactor in org/repo',
+        ts: '1.0',
+      },
+    });
+    const result = await handler(signedEvent(body));
+    expect(result.statusCode).toBe(200);
+    expect(lambdaSend).toHaveBeenCalledTimes(1);
+    const [invokeCmd] = lambdaSend.mock.calls[0];
+    const payload = JSON.parse(new TextDecoder().decode(invokeCmd.input.Payload));
+    // Must contain "decompose:" so the processor's parseWorkflowPrefix can extract it
+    expect(payload.text).toContain('decompose:');
+    expect(payload.text).toContain('org/repo');
+  });
+
+  test('app_mention with "review pr #N" is forwarded verbatim', async () => {
+    fetchMock.mockResolvedValue({
+      ok: true,
+      json: () => Promise.resolve({ ok: true }),
+    });
+    smSend.mockImplementation((cmd: { _type: string; input?: { SecretId?: string } }) => {
+      if (cmd._type === 'GetSecretValue' && cmd.input?.SecretId === process.env.SLACK_SIGNING_SECRET_ARN) {
+        return Promise.resolve({ SecretString: SIGNING_SECRET });
+      }
+      return Promise.resolve({ SecretString: 'xoxb-bot' });
+    });
+
+    const body = JSON.stringify({
+      type: 'event_callback',
+      team_id: 'T1',
+      event: {
+        type: 'app_mention',
+        user: 'U1',
+        channel: 'C1',
+        text: '<@BOT> review pr #42 in org/repo',
+        ts: '2.0',
+      },
+    });
+    const result = await handler(signedEvent(body));
+    expect(result.statusCode).toBe(200);
+    expect(lambdaSend).toHaveBeenCalledTimes(1);
+    const [invokeCmd] = lambdaSend.mock.calls[0];
+    const payload = JSON.parse(new TextDecoder().decode(invokeCmd.input.Payload));
+    expect(payload.text).toContain('review pr');
+    expect(payload.text).toContain('#42');
+  });
+
   test('app_mention with Lambda invoke failure swaps :eyes: to :x:', async () => {
     fetchMock.mockResolvedValue({
       ok: true,
@@ -305,5 +372,192 @@ describe('slack-events handler', () => {
     expect(removeCall).toBeTruthy();
     expect(addCall).toBeTruthy();
     expect(errorReply).toBeTruthy();
+  });
+
+  // ─── Thread-reply routing ─────────────────────────────────────────────────
+
+  describe('thread reply routing', () => {
+    const THREAD_TS = '1000.0001';
+    const REPLY_TS = '1001.0002';
+
+    function commonSmSetup(): void {
+      smSend.mockImplementation((cmd: { _type: string; input?: { SecretId?: string } }) => {
+        if (cmd._type === 'GetSecretValue' && cmd.input?.SecretId === process.env.SLACK_SIGNING_SECRET_ARN) {
+          return Promise.resolve({ SecretString: SIGNING_SECRET });
+        }
+        return Promise.resolve({ SecretString: 'xoxb-bot' });
+      });
+    }
+
+    function threadReplyBody(text: string, channelType = 'channel'): string {
+      return JSON.stringify({
+        type: 'event_callback',
+        team_id: 'T1',
+        event: {
+          type: 'message',
+          user: 'U1',
+          channel: 'C1',
+          channel_type: channelType,
+          text,
+          ts: REPLY_TS,
+          thread_ts: THREAD_TS, // thread_ts != ts → this is a reply
+        },
+      });
+    }
+
+    test('thread reply in a PR-bearing task thread routes to pr-iteration-v1', async () => {
+      commonSmSetup();
+      fetchMock.mockResolvedValue({
+        ok: true,
+        json: () => Promise.resolve({ ok: true }),
+      });
+      // DDB Scan returns a task with a pr_number
+      ddbSend.mockResolvedValueOnce({
+        Items: [{
+          task_id: 'TASK1',
+          status: 'COMPLETED',
+          channel_source: 'slack',
+          repo: 'org/repo',
+          pr_number: 42,
+          created_at: '2024-01-01T00:00:00Z',
+          channel_metadata: {
+            slack_team_id: 'T1',
+            slack_channel_id: 'C1',
+            slack_thread_ts: THREAD_TS,
+          },
+        }],
+      });
+      lambdaSend.mockResolvedValueOnce({});
+
+      const result = await handler(signedEvent(threadReplyBody('please also add unit tests')));
+      expect(result.statusCode).toBe(200);
+      expect(lambdaSend).toHaveBeenCalledTimes(1);
+      const [invokeCmd] = lambdaSend.mock.calls[0];
+      const payload = JSON.parse(new TextDecoder().decode(invokeCmd.input.Payload));
+      expect(payload.source).toBe('mention');
+      expect(payload.workflow_ref).toBe('coding/pr-iteration-v1');
+      expect(payload.pr_number).toBe(42);
+      expect(payload.mention_thread_ts).toBe(THREAD_TS);
+    });
+
+    test('thread reply in a clarify-hold task thread routes to new-task-v1 with assembled description', async () => {
+      commonSmSetup();
+      fetchMock.mockResolvedValue({
+        ok: true,
+        json: () => Promise.resolve({ ok: true }),
+      });
+      // DDB Scan returns a clarify-hold task (code_changed=false, answer_text, no PR)
+      ddbSend.mockResolvedValueOnce({
+        Items: [{
+          task_id: 'TASK2',
+          status: 'COMPLETED',
+          channel_source: 'slack',
+          repo: 'org/repo',
+          code_changed: false,
+          answer_text: 'Which file should I focus on?',
+          task_description: 'Fix the login bug',
+          resolved_workflow: { id: 'coding/new-task-v1', version: '1.0.0' },
+          created_at: '2024-01-01T00:00:00Z',
+          channel_metadata: {
+            slack_team_id: 'T1',
+            slack_channel_id: 'C1',
+            slack_thread_ts: THREAD_TS,
+          },
+        }],
+      });
+      lambdaSend.mockResolvedValueOnce({});
+
+      const result = await handler(signedEvent(threadReplyBody('auth/login.ts please')));
+      expect(result.statusCode).toBe(200);
+      expect(lambdaSend).toHaveBeenCalledTimes(1);
+      const [invokeCmd] = lambdaSend.mock.calls[0];
+      const payload = JSON.parse(new TextDecoder().decode(invokeCmd.input.Payload));
+      expect(payload.workflow_ref).toBe('coding/new-task-v1');
+      expect(payload.pre_built_description).toContain('Fix the login bug');
+      expect(payload.pre_built_description).toContain('Which file should I focus on?');
+      expect(payload.pre_built_description).toContain('auth/login.ts please');
+    });
+
+    test('thread reply with no matching task is silently ignored', async () => {
+      commonSmSetup();
+      fetchMock.mockResolvedValue({
+        ok: true,
+        json: () => Promise.resolve({ ok: true }),
+      });
+      // DDB Scan returns empty — no matching task
+      ddbSend.mockResolvedValueOnce({ Items: [] });
+
+      const result = await handler(signedEvent(threadReplyBody('some reply in a non-ABCA thread')));
+      expect(result.statusCode).toBe(200);
+      expect(lambdaSend).not.toHaveBeenCalled();
+    });
+
+    test('thread reply on active task is ignored to prevent concurrent execution', async () => {
+      commonSmSetup();
+      fetchMock.mockResolvedValue({
+        ok: true,
+        json: () => Promise.resolve({ ok: true }),
+      });
+      // DDB Scan returns a RUNNING task
+      ddbSend.mockResolvedValueOnce({
+        Items: [{
+          task_id: 'TASK3',
+          status: 'RUNNING',
+          channel_source: 'slack',
+          repo: 'org/repo',
+          pr_number: 42,
+          created_at: '2024-01-01T00:00:00Z',
+          channel_metadata: {
+            slack_team_id: 'T1',
+            slack_channel_id: 'C1',
+            slack_thread_ts: THREAD_TS,
+          },
+        }],
+      });
+
+      const result = await handler(signedEvent(threadReplyBody('a message in an active task thread')));
+      expect(result.statusCode).toBe(200);
+      expect(lambdaSend).not.toHaveBeenCalled();
+    });
+
+    test('bot messages (bot_id set) in threads are not treated as thread replies', async () => {
+      commonSmSetup();
+      const botThreadBody = JSON.stringify({
+        type: 'event_callback',
+        team_id: 'T1',
+        event: {
+          type: 'message',
+          bot_id: 'B123', // bot message — must be ignored
+          channel: 'C1',
+          channel_type: 'channel',
+          text: 'Task started.',
+          ts: REPLY_TS,
+          thread_ts: THREAD_TS,
+        },
+      });
+      const result = await handler(signedEvent(botThreadBody));
+      expect(result.statusCode).toBe(200);
+      expect(lambdaSend).not.toHaveBeenCalled();
+    });
+
+    test('root message (thread_ts == ts) in a channel is ignored', async () => {
+      commonSmSetup();
+      const rootMsgBody = JSON.stringify({
+        type: 'event_callback',
+        team_id: 'T1',
+        event: {
+          type: 'message',
+          user: 'U1',
+          channel: 'C1',
+          channel_type: 'channel',
+          text: 'A plain channel message with no thread',
+          ts: '5000.0001',
+          // No thread_ts — root message
+        },
+      });
+      const result = await handler(signedEvent(rootMsgBody));
+      expect(result.statusCode).toBe(200);
+      expect(lambdaSend).not.toHaveBeenCalled();
+    });
   });
 });

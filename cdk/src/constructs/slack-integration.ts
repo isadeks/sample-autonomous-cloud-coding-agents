@@ -232,16 +232,22 @@ export class SlackIntegration extends Construct {
 
     // --- Slack Events ---
     // Note: SLACK_COMMAND_PROCESSOR_FUNCTION_NAME is set below after commandProcessorFn is created.
+    const slackEventsEnv: Record<string, string> = {
+      SLACK_INSTALLATION_TABLE_NAME: this.installationTable.tableName,
+      SLACK_SIGNING_SECRET_ARN: this.signingSecret.secretArn,
+    };
+    // Thread-reply task lookup: the events handler needs read access to the task
+    // table to detect PR-iteration and clarify-resume routing from thread_ts.
+    if (props.taskTable) {
+      slackEventsEnv.TASK_TABLE_NAME = props.taskTable.tableName;
+    }
     const slackEventsFn = new lambda.NodejsFunction(this, 'SlackEventsFn', {
       entry: path.join(handlersDir, 'slack-events.ts'),
       handler: 'handler',
       runtime: Runtime.NODEJS_24_X,
       architecture: Architecture.ARM_64,
       timeout: Duration.seconds(10),
-      environment: {
-        SLACK_INSTALLATION_TABLE_NAME: this.installationTable.tableName,
-        SLACK_SIGNING_SECRET_ARN: this.signingSecret.secretArn,
-      },
+      environment: slackEventsEnv,
       bundling: commonBundling,
     });
 
@@ -257,6 +263,8 @@ export class SlackIntegration extends Construct {
       actions: ['secretsmanager:DeleteSecret'],
       resources: [slackSecretArnPrefix],
     }));
+    // Grant read access to task table for thread-reply task lookup.
+    props.taskTable.grantReadData(slackEventsFn);
 
     // --- Slash Command Processor (async worker) ---
     // Memory bumped from default 128 MB → 512 MB after module-init OOM
