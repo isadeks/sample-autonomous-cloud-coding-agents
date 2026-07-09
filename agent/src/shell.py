@@ -119,6 +119,7 @@ def slugify(text: str, max_len: int = 40) -> str:
     return text or "task"
 
 
+# Runs on every logged line (see ``log``/``run_cmd``), so patterns stay cheap.
 def redact_secrets(text: str) -> str:
     """Redact tokens and secrets from log output."""
     # GitHub and generic token-like values.
