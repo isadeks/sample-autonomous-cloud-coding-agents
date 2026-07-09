@@ -29,6 +29,7 @@ import * as secretsmanager from 'aws-cdk-lib/aws-secretsmanager';
 import { NagSuppressions } from 'cdk-nag';
 import { Construct } from 'constructs';
 import { AgentSessionRole } from './agent-session-role';
+import { resolveBedrockModelIds } from './bedrock-models';
 
 export interface EcsAgentClusterProps {
   readonly vpc: ec2.IVpc;
@@ -75,18 +76,6 @@ export interface EcsAgentClusterProps {
   readonly agentSessionRole?: AgentSessionRole;
 }
 
-/**
- * Bedrock model IDs the agent may invoke (kept in sync with the AgentCore
- * runtime grants in agent.ts). Used to scope the ECS task role's Bedrock
- * permissions to explicit foundation-model + inference-profile ARNs instead of
- * a `Resource: '*'` wildcard.
- */
-const BEDROCK_MODEL_IDS = [
-  'anthropic.claude-sonnet-4-6',
-  'anthropic.claude-opus-4-20250514-v1:0',
-  'anthropic.claude-haiku-4-5-20251001-v1:0',
-];
-
 /** HTTPS port — the only egress allowed from the agent task ENIs. */
 const HTTPS_PORT = 443;
 
@@ -100,6 +89,17 @@ const BUILD_TASK_CPU = 16384;
 const BUILD_TASK_MEMORY_MIB = 65536;
 const PLANNING_TASK_CPU = 2048;
 const PLANNING_TASK_MEMORY_MIB = 8192;
+
+// Fargate defaults to only 20 GiB of ephemeral (root-fs) storage. A heavy build
+// task clones the repo, then fills disk with uv + yarn/node_modules caches,
+// build outputs, cdk.out/synth assets, and Docker layers — and the cluster runs
+// several tasks at once (a fan-out epic releases its children in parallel).
+// Live-caught on ABCA-659's retry: 3 concurrent ABCA-on-ABCA runs each blew past
+// 20 GiB → ``ENOSPC: no space left on device`` mid-build, which then surfaced as
+// a bogus ``build_passed=false`` (a disk-full, not broken code). Raise the BUILD
+// def to 100 GiB (Fargate allows 21–200 in 1 GiB steps) for ample headroom; the
+// PLANNING def only clones + reads so it keeps the 20 GiB default.
+const BUILD_TASK_EPHEMERAL_STORAGE_GIB = 100;
 
 export class EcsAgentCluster extends Construct {
   public readonly cluster: ecs.Cluster;
@@ -196,12 +196,21 @@ export class EcsAgentCluster extends Construct {
       }),
     };
     const image = ecs.ContainerImage.fromDockerImageAsset(props.agentImageAsset);
-    const makeTaskDef = (taskDefId: string, cpu: number, memoryLimitMiB: number, extraEnv: Record<string, string>) => {
+    const makeTaskDef = (
+      taskDefId: string,
+      cpu: number,
+      memoryLimitMiB: number,
+      extraEnv: Record<string, string>,
+      ephemeralStorageGiB?: number,
+    ) => {
       const def = new ecs.FargateTaskDefinition(this, taskDefId, {
         cpu,
         memoryLimitMiB,
         taskRole,
         executionRole,
+        // Raise root-fs storage past Fargate's 20 GiB default for build tasks
+        // (ENOSPC mid-build on ABCA-659); omitted → the 20 GiB default.
+        ...(ephemeralStorageGiB !== undefined && { ephemeralStorageGiB }),
         runtimePlatform: {
           cpuArchitecture: ecs.CpuArchitecture.ARM64,
           operatingSystemFamily: ecs.OperatingSystemFamily.LINUX,
@@ -232,7 +241,7 @@ export class EcsAgentCluster extends Construct {
     this.taskDefinition = makeTaskDef('TaskDef', BUILD_TASK_CPU, BUILD_TASK_MEMORY_MIB, {
       // Heavy CI-parity builds legitimately run longer than the 1800s default.
       BUILD_VERIFY_TIMEOUT_S: '3600',
-    });
+    }, BUILD_TASK_EPHEMERAL_STORAGE_GIB);
 
     // PLANNING task def (#299 ECS_RIGHTSIZED_PLANNING) — for read-only workflows
     // (coding/decompose-v1) that clone + read + emit a plan artifact but NEVER
@@ -308,10 +317,12 @@ export class EcsAgentCluster extends Construct {
 
     // Bedrock model invocation — scoped to explicit foundation-model and
     // cross-region inference-profile ARNs (parity with the AgentCore runtime
-    // grants in agent.ts), replacing the prior Resource: '*' wildcard.
+    // grants in agent.ts), NOT a Resource: '*' wildcard. The model set is the
+    // shared, context-overridable list (constructs/bedrock-models.ts) so the
+    // ECS and AgentCore backends can't drift.
     const stack = Stack.of(this);
     const bedrockResources: string[] = [];
-    for (const modelId of BEDROCK_MODEL_IDS) {
+    for (const modelId of resolveBedrockModelIds(this.node)) {
       bedrockResources.push(
         stack.formatArn({
           service: 'bedrock',

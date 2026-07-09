@@ -29,8 +29,10 @@ import * as secretsmanager from 'aws-cdk-lib/aws-secretsmanager';
 import { AgentSessionRole } from '../../src/constructs/agent-session-role';
 import { EcsAgentCluster } from '../../src/constructs/ecs-agent-cluster';
 
-function createStack(overrides?: { memoryId?: string }): { stack: Stack; template: Template } {
-  const app = new App();
+function createStack(overrides?: { memoryId?: string; bedrockModels?: string[] }): { stack: Stack; template: Template } {
+  const app = new App({
+    context: overrides?.bedrockModels ? { bedrockModels: overrides.bedrockModels } : undefined,
+  });
   const stack = new Stack(app, 'TestStack');
 
   const vpc = new ec2.Vpc(stack, 'Vpc', { maxAzs: 2 });
@@ -96,6 +98,23 @@ describe('EcsAgentCluster construct', () => {
         OperatingSystemFamily: 'LINUX',
       },
     });
+  });
+
+  test('the BUILD def raises ephemeral storage past the 20 GiB Fargate default (ABCA-659 #2: concurrent builds → ENOSPC)', () => {
+    baseTemplate.hasResourceProperties('AWS::ECS::TaskDefinition', {
+      Cpu: '16384',
+      Memory: '65536',
+      EphemeralStorage: { SizeInGiB: 100 },
+    });
+  });
+
+  test('the PLANNING def keeps the 20 GiB default (no EphemeralStorage — a clone+read planner needs no extra disk)', () => {
+    const taskDefs = baseTemplate.findResources('AWS::ECS::TaskDefinition');
+    const planning = Object.values(taskDefs).find(
+      d => d.Properties.Cpu === '2048' && d.Properties.Memory === '8192',
+    );
+    expect(planning).toBeDefined();
+    expect(planning!.Properties.EphemeralStorage).toBeUndefined();
   });
 
   test('creates a second, smaller PLANNING task def (2 vCPU / 8 GB) for read-only workflows (#299 ECS_RIGHTSIZED_PLANNING)', () => {
@@ -250,6 +269,29 @@ describe('EcsAgentCluster construct', () => {
     expect(serialized).toContain('inference-profile/us.anthropic.claude-sonnet-4-6');
     expect(serialized).toContain('anthropic.claude-opus-4-20250514-v1:0');
     expect(serialized).toContain('anthropic.claude-haiku-4-5-20251001-v1:0');
+  });
+
+  test('bedrockModels context override changes the granted model ARNs (#433)', () => {
+    const template = createStack({ bedrockModels: ['anthropic.claude-opus-4-8'] }).template;
+    const policies = template.findResources('AWS::IAM::Policy');
+    let bedrockStatement: { Resource: unknown } | undefined;
+    for (const policy of Object.values(policies)) {
+      for (const s of policy.Properties.PolicyDocument.Statement) {
+        const actions = Array.isArray(s.Action) ? s.Action : [s.Action];
+        if (actions.includes('bedrock:InvokeModel')) {
+          bedrockStatement = s;
+        }
+      }
+    }
+    expect(bedrockStatement).toBeDefined();
+    const serialized = JSON.stringify(bedrockStatement!.Resource);
+    // The override model is granted...
+    expect(serialized).toContain('foundation-model/anthropic.claude-opus-4-8');
+    expect(serialized).toContain('inference-profile/us.anthropic.claude-opus-4-8');
+    // ...and the defaults are NOT (the override replaces, not appends).
+    expect(serialized).not.toContain('claude-sonnet-4-6');
+    // Still scoped, never a wildcard.
+    expect(bedrockStatement!.Resource).not.toEqual('*');
   });
 
   test('container has required environment variables', () => {

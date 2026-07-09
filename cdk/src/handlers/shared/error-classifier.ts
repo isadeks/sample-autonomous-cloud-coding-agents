@@ -29,6 +29,11 @@ export const ErrorCategory = {
   GUARDRAIL: 'guardrail',
   CONFIG: 'config',
   TIMEOUT: 'timeout',
+  // Environmental blocker (#251): agent could not progress for a missing
+  // secret, egress denial, unreachable dependency, or fail-closed policy
+  // engine error. Distinct from AUTH/CONFIG so operators can spot the
+  // typed, self-diagnosed faults the platform names precisely.
+  BLOCKED: 'blocked',
   UNKNOWN: 'unknown',
 } as const;
 
@@ -250,6 +255,30 @@ const PATTERNS: readonly ErrorPattern[] = [
       errorClass: ErrorClass.TRANSIENT,
     },
   },
+  {
+    // The `claude` CLI on the agent image couldn't be exec'd: either the OS
+    // refused the binary (`OSError: [Errno 8] Exec format error: 'claude'`) or
+    // the claude-code shim reports its platform-native binary was never placed
+    // ("claude native binary not installed" — its postinstall silently fell
+    // back at image-build time). Live-caught on ABCA-659's retry: all 3 ECS runs
+    // died at the run_agent step this way on a freshly rebuilt image, while the
+    // native binary was present but unwired. This is an IMAGE/infra fault, NOT a
+    // problem with the user's request — a fresh attempt usually lands on a host
+    // that materializes the image cleanly; a persistent one is a bad build an
+    // admin must rebuild. Without this bucket it fell through to a bare
+    // "Unexpected error" with no guidance (the anti-pattern the error-feedback
+    // work set out to kill). Matched before AGENT/UNKNOWN so the precise,
+    // retry-oriented copy wins.
+    pattern: /Exec format error.*claude|claude.*Exec format error|claude native binary not installed/i,
+    classification: {
+      category: ErrorCategory.COMPUTE,
+      title: 'Couldn\'t start the coding agent (environment issue)',
+      description: 'The agent runtime couldn\'t launch the `claude` CLI on the compute image — an infrastructure/image problem, not a problem with your request or code.',
+      remedy: 'This is usually a transient image/compute hiccup. Reply here to try again — a fresh attempt typically clears it. If every attempt fails the same way, the agent image needs a rebuild: contact your ABCA admin with the task id above.',
+      retryable: true,
+      errorClass: ErrorClass.TRANSIENT,
+    },
+  },
 
   // --- Agent ---
   {
@@ -305,6 +334,23 @@ const PATTERNS: readonly ErrorPattern[] = [
       title: 'Agent errored during execution',
       description: 'The agent raised an uncaught error mid-turn. The Claude Agent SDK reported the task as failed before a clean terminal.',
       remedy: 'Retry the task. If persistent, check the agent container logs and the PR branch for partial state.',
+      retryable: true,
+      errorClass: ErrorClass.TRANSIENT,
+    },
+  },
+  {
+    // ABCA-659 #2: the build gate was KILLED by an environment fault (out of
+    // disk / OOM) — the code was never verified. The agent tags the verdict
+    // ``build_ok=infra`` so this reads as a retryable INFRA fault, not "your
+    // build failed" and not a bogus ✅ (a build also killed before the agent
+    // would otherwise look "already red → not a regression → success"). Matched
+    // before the generic ``Task did not succeed.*agent_status=`` catch-all.
+    pattern: /Task did not succeed.*build_ok=infra/i,
+    classification: {
+      category: ErrorCategory.COMPUTE,
+      title: 'Build couldn\'t finish — the build machine ran out of resources',
+      description: 'The build/verify step was stopped because the build environment ran out of disk or memory, so your changes were never actually verified — this is an infrastructure limit, not a problem with your code.',
+      remedy: 'Reply here to try again — a fresh run usually clears a transient resource crunch (e.g. several builds sharing a box at once). If it keeps happening on this repo, its build needs more capacity: contact your ABCA admin to raise the build task\'s disk/memory.',
       retryable: true,
       errorClass: ErrorClass.TRANSIENT,
     },
@@ -427,6 +473,127 @@ const PATTERNS: readonly ErrorPattern[] = [
   },
 ];
 
+/**
+ * Canonical blocker-reason contract (#251, decision D). Matches
+ * ``BLOCKED[<kind>]`` and, separately, the optional `` (resource: <resource>)``
+ * segment ``format_blocker_reason`` appends. This is the SINGLE source of truth
+ * on the CDK side and must stay in lockstep with ``format_blocker_reason`` in
+ * ``agent/src/progress_writer.py`` and the taxonomy table in
+ * ``docs/design/CEDAR_HITL_GATES.md`` §13.
+ *
+ * The two parts are matched independently (not one ``$``-anchored regex)
+ * because ``failTask`` persists ``TaskResult.error`` verbatim and it may be
+ * wrapped with trailing text or a stack trace after the reason — anchoring the
+ * resource group to end-of-string would silently drop the host/secret name in
+ * exactly that case. ``kind`` is matched case-insensitively and lowercased
+ * before dispatch so a mixed-case producer still routes to the right remedy.
+ */
+const BLOCKED_KIND = /BLOCKED\[([a-z_]+)\]/i;
+const BLOCKED_RESOURCE = /\(resource:\s*([^)]+)\)/i;
+
+/** Closed blocker-kind set — mirrors ``BLOCKER_KINDS`` in agent/src/progress_writer.py. */
+export type BlockerKind =
+  | 'missing_secret'
+  | 'egress_denied'
+  | 'dependency_unreachable'
+  | 'policy_fail_closed'
+  | 'auth_failure'
+  | 'unknown_environmental';
+
+/**
+ * Build the canonical terminal-reason string for an orchestration-side blocker
+ * (#251, decision D) — the TypeScript twin of ``format_blocker_reason`` in
+ * ``agent/src/progress_writer.py``. Produces ``BLOCKED[<kind>]: <detail>`` with
+ * `` (resource: <resource>)`` appended when ``resource`` is set, so the same
+ * ``classifyError`` regex that handles agent-carried reasons also classifies
+ * reasons written directly by the orchestrator (e.g. a missing secret detected
+ * during hydration).
+ */
+const BLOCKER_KINDS: ReadonlySet<string> = new Set<BlockerKind>([
+  'missing_secret',
+  'egress_denied',
+  'dependency_unreachable',
+  'policy_fail_closed',
+  'auth_failure',
+  'unknown_environmental',
+]);
+
+export function formatBlockerReason(kind: BlockerKind, detail: string, resource?: string): string {
+  // Normalise an out-of-set kind to unknown_environmental — matches the Python
+  // format_blocker_reason fallback so a value cast via `as BlockerKind` (or a
+  // future non-literal caller) can never emit a reason the classifier's closed
+  // taxonomy won't recognise.
+  const safeKind = BLOCKER_KINDS.has(kind) ? kind : 'unknown_environmental';
+  const base = `BLOCKED[${safeKind}]: ${detail}`;
+  return resource ? `${base} (resource: ${resource})` : base;
+}
+
+/** Per-kind blocker remedy builder. ``resource`` is the extracted name (secret, host, …). */
+function blockerClassification(kind: string, resource: string | undefined): ErrorClassification {
+  const res = resource?.trim();
+  switch (kind) {
+    case 'missing_secret':
+      return {
+        category: ErrorCategory.BLOCKED,
+        title: 'Blocked: missing secret',
+        description: `A required secret${res ? ` (\`${res}\`)` : ''} was never wired into the blueprint, so the agent could not proceed.`,
+        remedy: `Wire the secret${res ? ` \`${res}\`` : ''} into this repo's blueprint (Secrets Manager) and resubmit. The agent never acquires secrets itself.`,
+        retryable: false,
+      };
+    case 'egress_denied':
+      return {
+        category: ErrorCategory.BLOCKED,
+        title: 'Blocked: egress denied',
+        description: `The agent's connection to a non-allowlisted host${res ? ` (\`${res}\`)` : ''} was blocked by the DNS Firewall.`,
+        remedy: `Allowlist the domain${res ? ` \`${res}\`` : ''} in the DNS Firewall rule group if it is a legitimate dependency, then resubmit. The agent never widens egress itself.`,
+        retryable: false,
+      };
+    case 'dependency_unreachable':
+      return {
+        category: ErrorCategory.BLOCKED,
+        title: 'Blocked: dependency unreachable',
+        description: `A dependency or registry${res ? ` (\`${res}\`)` : ''} could not be reached after bounded retries.`,
+        remedy: 'Check whether the registry is up and reachable from the agent VPC. This is often transient — retry the task.',
+        retryable: true,
+      };
+    case 'policy_fail_closed':
+      return {
+        category: ErrorCategory.BLOCKED,
+        title: 'Blocked: policy engine fail-closed',
+        description: 'The Cedar policy engine errored or was unavailable, so the tool call was denied fail-closed. This is a misconfiguration signal, not an intentional hard-deny.',
+        remedy: 'Check the agent policy-engine logs (cedarpy load / policy compilation). Fix the policy bundle or engine availability, then resubmit.',
+        retryable: false,
+      };
+    case 'auth_failure': {
+      // A Secrets Manager ARN resource means the secret exists but couldn't be
+      // read (AccessDenied / throttling) — the fix is IAM on the task role or
+      // blueprint wiring, NOT PAT scopes (#251 review). A non-ARN resource is a
+      // runtime credential rejection where scope/validity is the right advice.
+      const isSecretArn = res?.startsWith('arn:aws:secretsmanager:') ?? false;
+      return {
+        category: ErrorCategory.BLOCKED,
+        title: 'Blocked: authentication rejected',
+        description: isSecretArn
+          ? `The GitHub token secret${res ? ` (\`${res}\`)` : ''} exists but could not be read (access denied or throttled).`
+          : `A credential was present but rejected${res ? ` for \`${res}\`` : ''}.`,
+        remedy: isSecretArn
+          ? 'Grant the task role `secretsmanager:GetSecretValue` on this secret (check the secret resource policy and the blueprint wiring), then resubmit.'
+          : 'Verify the credential is valid and has the required scopes, then resubmit.',
+        retryable: false,
+      };
+    }
+    default:
+      // unknown_environmental + any future/mis-typed kind
+      return {
+        category: ErrorCategory.BLOCKED,
+        title: 'Blocked: environmental fault',
+        description: `The agent was blocked by an environmental fault${res ? ` involving \`${res}\`` : ''} that could not be classified further.`,
+        remedy: 'Check the agent logs for the blocker detail. This is an environmental issue, not a code problem.',
+        retryable: false,
+      };
+  }
+}
+
 const UNKNOWN_CLASSIFICATION: ErrorClassification = {
   category: ErrorCategory.UNKNOWN,
   title: 'Unexpected error',
@@ -449,6 +616,15 @@ const UNKNOWN_CLASSIFICATION: ErrorClassification = {
 export function classifyError(errorMessage: string | undefined | null): ErrorClassification | null {
   if (!errorMessage) {
     return null;
+  }
+
+  // Environmental blockers (#251) carry a canonical ``BLOCKED[<kind>]`` prefix
+  // and an extractable resource — check them first so the remedy can name the
+  // exact secret / host rather than falling through to a generic pattern.
+  const kindMatch = BLOCKED_KIND.exec(errorMessage);
+  if (kindMatch) {
+    const resource = BLOCKED_RESOURCE.exec(errorMessage)?.[1];
+    return blockerClassification(kindMatch[1].toLowerCase(), resource);
   }
 
   for (const { pattern, exclude, classification } of PATTERNS) {

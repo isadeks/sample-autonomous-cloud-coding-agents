@@ -49,7 +49,7 @@ import type { DynamoDBRecord, DynamoDBStreamEvent } from 'aws-lambda';
 import { createTaskCore } from './shared/create-task-core';
 import { renderFailureReply, renderPanelFailureReason } from './shared/failure-reply';
 import { isNoChangeIteration, renderMaturingReply } from './shared/iteration-reply';
-import { EMOJI_FAILURE, EMOJI_NEEDS_INPUT, EMOJI_SUCCESS, type LinearFeedbackContext, replyToComment, revertIssueToNotStarted, sweepDecompositionNotes, swapCommentReaction, transitionIssueState, upsertStatusComment, upsertThreadedReply } from './shared/linear-feedback';
+import { EMOJI_FAILURE, EMOJI_NEEDS_INPUT, EMOJI_SUCCESS, type LinearFeedbackContext, revertIssueToNotStarted, sweepDecompositionNotes, swapCommentReaction, swapIssueReaction, transitionIssueState, upsertStatusComment, upsertThreadedReply } from './shared/linear-feedback';
 import { resolveLinearOauthToken } from './shared/linear-oauth-resolver';
 import type { SubIssueNode } from './shared/linear-subissue-fetch';
 import { logger } from './shared/logger';
@@ -492,6 +492,62 @@ async function reconcileTerminalChild(evt: TerminalTaskEvent): Promise<void> {
     } catch (err) {
       if (isConditionalCheckFailed(err)) continue; // already in target state
       throw err;
+    }
+  }
+
+  // 1b. ABCA-659 — reconcile a FAILED child's OWN Linear state. The agent moves
+  //     a writeable child to "In Review" only on AGENT success; but the platform
+  //     build gate is independent — a child can finish COMPLETED-with-build_passed
+  //     =false (PR opened, build red), and a child that succeeded on an EARLIER
+  //     run (→ "In Review") then fails a RETRY leaves the "In Review" behind (the
+  //     agent's failure path leaves state as-is; transitions never move backward).
+  //     Either way the graph says `failed` while Linear still reads "In Review"
+  //     with a PR link — the exact inconsistency the user hit. The reconciler
+  //     holds the authoritative verdict, so when a terminal child did NOT succeed
+  //     we pull its issue back out of any bot-set "In Review"/"In Progress" state.
+  //     `revertIssueToNotStarted` is tightly guarded (only demotes an issue still
+  //     in a bot-set `started` state — never a human-advanced Done/Canceled or a
+  //     human-pulled-back one) and idempotent on replay. The ❌ reaction + K1
+  //     failure reason on the panel convey "it failed"; a reply re-runs it (the
+  //     retry re-drives the state Backlog → In Progress). Skip the integration
+  //     node (synthetic id, no real Linear issue). Best-effort; never throws.
+  if (WORKSPACE_REGISTRY_TABLE && !plan.terminalSucceeded && !isIntegrationNode(subIssueId)) {
+    const feedbackCtx: LinearFeedbackContext = {
+      linearWorkspaceId: snapshot.meta.linear_workspace_id,
+      registryTableName: WORKSPACE_REGISTRY_TABLE,
+    };
+    try {
+      const reverted = await revertIssueToNotStarted(feedbackCtx, subIssueId);
+      // Also settle the child's ISSUE reaction to ❌. The agent reacts ✅ on its
+      // OWN verdict (agent-success + regression-only build gate — a build that was
+      // already red before the agent isn't counted as the agent's regression, so
+      // it posts ✅ and "Task completed"). The orchestration gate is stricter
+      // (build_passed===false ⇒ failed, absolute), so a child can legitimately end
+      // agent-✅ but graph-failed — leaving a ✅ reaction that contradicts the
+      // failed node (live-caught on ABCA-659: PR opened, agent ✅, build red).
+      // swapIssueReaction deletes only the bot's own status emojis (✅/👀/❓) and
+      // adds ❌ — a human's reaction is never touched, and it's idempotent on
+      // replay. This makes the reaction agree with the reverted state + the panel's
+      // ❌ row. (The stale "✅ Task completed" fanout COMMENT is left as history —
+      // Linear can't edit another actor's comment; the reaction + state + panel are
+      // the authoritative signals, and a reply re-runs the child.)
+      const reactionSwapped = await swapIssueReaction(feedbackCtx, subIssueId, EMOJI_FAILURE);
+      if (reverted || reactionSwapped) {
+        logger.info('Reconciler settled a failed child to match the graph (state + reaction)', {
+          orchestration_id: orchestrationId,
+          sub_issue_id: subIssueId,
+          task_status: outcome.status,
+          build_passed: outcome.build_passed,
+          state_reverted: reverted,
+          reaction_swapped: reactionSwapped,
+        });
+      }
+    } catch (err) {
+      logger.warn('Failed to reconcile failed child Linear state/reaction (non-fatal)', {
+        orchestration_id: orchestrationId,
+        sub_issue_id: subIssueId,
+        error: err instanceof Error ? err.message : String(err),
+      });
     }
   }
 
