@@ -630,6 +630,12 @@ export async function createTaskCore(
     ...(context.channelMetadata?.linear_issue_id && {
       linear_issue_id: context.channelMetadata.linear_issue_id,
     }),
+    // ABCA-661: hoist slack_thread_ts to the top level so the sparse
+    // SlackThreadIndex GSI can resolve a Slack thread reply → its task (a GSI
+    // cannot key off the nested channel_metadata map). Slack-origin only.
+    ...(context.channelMetadata?.slack_thread_ts && {
+      slack_thread_ts: context.channelMetadata.slack_thread_ts,
+    }),
     ...(attachmentRecords.length > 0 && { attachments: attachmentRecords }),
     status_created_at: `${initialStatus}#${now}`,
     created_at: now,

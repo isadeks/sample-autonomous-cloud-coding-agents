@@ -20,9 +20,11 @@
 import * as crypto from 'crypto';
 import { DynamoDBClient } from '@aws-sdk/client-dynamodb';
 import { DynamoDBDocumentClient, GetCommand, PutCommand } from '@aws-sdk/lib-dynamodb';
+import { buildClarifyResumeDescription, isClarifyHold } from './shared/clarify-resume';
 import { createTaskCore } from './shared/create-task-core';
 import { logger } from './shared/logger';
 import { slackFetch } from './shared/slack-api';
+import { prNumberFromSlackTask, resolveTaskBySlackThread, type SlackThreadTask } from './shared/slack-task-by-thread';
 import { getSlackSecret, SLACK_SECRET_PREFIX } from './shared/slack-verify';
 import type { Attachment } from './shared/types';
 import type { SlackCommandPayload } from './slack-commands';
@@ -57,10 +59,34 @@ export interface MentionEvent extends BasePayload {
   readonly source: 'mention';
   readonly mention_thread_ts?: string;
   readonly files?: readonly SlackFileRef[];
+  /**
+   * Workflow ref pre-parsed by the events handler from a keyword prefix
+   * (e.g. "decompose: …" → "coding/decompose-v1"). When set, the submit
+   * handler passes it through to createTaskCore instead of relying on the
+   * platform's default resolution ladder.
+   */
+  readonly workflow_ref?: string;
+}
+
+/**
+ * A thread-reply in an existing ABCA task thread — triggers PR-iteration or
+ * clarify-resume, depending on the originating task's state. Routed here by
+ * the events handler (``slack-events.ts``) when it detects a non-bot,
+ * non-mention message in a thread whose ``thread_ts`` belongs to a task.
+ */
+export interface ThreadReplyEvent extends BasePayload {
+  readonly source: 'thread_reply';
+  /** The ``thread_ts`` of the Slack thread (= the root message ts). */
+  readonly thread_ts: string;
+  /** The reply text (bot-mention stripped, trimmed). */
+  readonly reply_text: string;
+  /** The task found in the SlackThreadIndex for this thread. */
+  readonly thread_task: SlackThreadTask;
+  readonly files?: readonly SlackFileRef[];
 }
 
 /** Discriminated union of the inbound events the processor accepts. */
-export type CommandProcessorEvent = SlashCommandEvent | MentionEvent;
+export type CommandProcessorEvent = SlashCommandEvent | MentionEvent | ThreadReplyEvent;
 
 /**
  * Legacy shape — the slash-command acknowledger (`slack-commands.ts`) forwards
@@ -81,6 +107,7 @@ const ddb = DynamoDBDocumentClient.from(new DynamoDBClient({}));
 const USER_MAPPING_TABLE = process.env.SLACK_USER_MAPPING_TABLE_NAME!;
 const INSTALLATION_TABLE = process.env.SLACK_INSTALLATION_TABLE_NAME!;
 const CHANNEL_MAPPING_TABLE = process.env.SLACK_CHANNEL_MAPPING_TABLE_NAME;
+const TASK_TABLE_NAME = process.env.TASK_TABLE_NAME;
 
 /** Link code TTL. */
 const LINK_CODE_TTL_S = 10 * 60; // 10 minutes
@@ -100,6 +127,13 @@ const RESPONSE_URL_LOG_PREFIX_LEN = 80;
  */
 export async function handler(raw: RawEvent): Promise<void> {
   const event = normalizeEvent(raw);
+
+  // Thread-reply path — entirely separate from subcommand routing.
+  if (event.source === 'thread_reply') {
+    await handleThreadReply(event);
+    return;
+  }
+
   const text = (event.text ?? '').trim();
   const parts = text.split(/\s+/);
   const subcommand = parts[0]?.toLowerCase() ?? '';
@@ -128,6 +162,12 @@ export async function handler(raw: RawEvent): Promise<void> {
           + '*Submit a task:* Mention `@Shoof` in any channel:\n'
           + '> `@Shoof fix the login bug in org/repo#42`\n'
           + '> `@Shoof update the README in org/repo`\n\n'
+          + '*Workflow keywords:* Prefix your message to select a workflow:\n'
+          + '> `@Shoof decompose: fix the auth bug in org/repo` — plan and decompose\n'
+          + '> `@Shoof review: check the PR in org/repo#42` — PR review only\n\n'
+          + '*Thread replies:* Reply in an existing task\'s thread to continue work:\n'
+          + '> Reply to trigger PR-iteration on the task\'s open PR.\n'
+          + '> Reply to resume a task that asked a clarifying question.\n\n'
           + '*Private submissions:* DM Shoof directly.\n\n'
           + '*Cancel a task:* Use the Cancel button in the thread.\n\n'
           + '*Link your account:* `/bgagent link` — one-time setup.\n\n'
@@ -258,6 +298,9 @@ async function handleSubmit(event: MentionEvent, args: string[], reply: ReplyFn)
       issue_number: issueNumber,
       task_description: description,
       ...(attachments.length > 0 && { attachments }),
+      // Pass through the workflow_ref if the mention included a keyword prefix
+      // (e.g. "decompose: …" → workflow_ref='coding/decompose-v1').
+      ...(event.workflow_ref && { workflow_ref: event.workflow_ref }),
     },
     {
       userId: platformUserId,
@@ -291,6 +334,155 @@ function parseRepoArg(arg: string): { repo: string | null; issueNumber?: number 
     repo: match[1],
     issueNumber: match[2] ? parseInt(match[2], 10) : undefined,
   };
+}
+
+// ─── Thread Reply ─────────────────────────────────────────────────────────────
+
+/**
+ * Handle a reply in an existing ABCA task thread.
+ *
+ * Three sub-cases, checked in order:
+ *
+ *   1. **Clarify-resume** — the originating task is a ``coding/new-task-v1``
+ *      that paused to ask a clarifying question (``code_changed===false``,
+ *      non-empty ``answer_text``, no PR). The user's reply is the answer;
+ *      dispatch a fresh ``new-task-v1`` with the resume description.
+ *
+ *   2. **PR-iteration** — the originating task has an open PR (``pr_number``
+ *      or parseable ``pr_url``). The user's reply is the iteration instruction;
+ *      dispatch a ``coding/pr-iteration-v1`` on that PR.
+ *
+ *   3. **Neither** — the task thread exists but the task has no actionable
+ *      state (e.g. it's still running, or it failed without a PR). Ignore
+ *      silently — reacting to every reply in a task thread would be noisy.
+ */
+async function handleThreadReply(event: ThreadReplyEvent): Promise<void> {
+  const { thread_task: task, reply_text, thread_ts } = event;
+
+  // Build a reply fn that posts in-thread under the root message.
+  const reply = async (text: string): Promise<void> => {
+    const botToken = await getBotToken(event.team_id);
+    if (!botToken) return;
+    await fetch('https://slack.com/api/chat.postMessage', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json; charset=utf-8',
+        'Authorization': `Bearer ${botToken}`,
+      },
+      body: JSON.stringify({
+        channel: event.channel_id,
+        text,
+        thread_ts,
+      }),
+    });
+  };
+
+  // Resolve the platform user.
+  const platformUserId = await lookupPlatformUser(event.team_id, event.user_id);
+  if (!platformUserId) {
+    await reply(':link: Your Slack account is not linked. Run `/bgagent link` first.');
+    return;
+  }
+
+  const channelMetadata: Record<string, string> = {
+    slack_team_id: event.team_id,
+    slack_channel_id: event.channel_id,
+    slack_user_id: event.user_id,
+    slack_thread_ts: thread_ts,
+  };
+
+  // 1. Clarify-resume — re-run new-task-v1 with the user's answer baked into
+  //    the description. Mirror the exact same predicate used by the Linear path.
+  const clarifyHoldRow = {
+    resolved_workflow: task.resolved_workflow_id
+      ? { id: task.resolved_workflow_id }
+      : undefined,
+    workflow_ref: task.workflow_ref,
+    code_changed: task.code_changed,
+    answer_text: task.answer_text,
+    task_description: task.task_description,
+    pr_url: task.pr_url,
+    pr_number: task.pr_number,
+  };
+  if (isClarifyHold(clarifyHoldRow)) {
+    const resumeDescription = buildClarifyResumeDescription(
+      task.task_description,
+      task.answer_text,
+      reply_text,
+    );
+    const result = await createTaskCore(
+      {
+        repo: task.repo,
+        task_description: resumeDescription,
+        workflow_ref: 'coding/new-task-v1',
+      },
+      {
+        userId: platformUserId,
+        channelSource: 'slack',
+        channelMetadata,
+      },
+      crypto.randomUUID(),
+    );
+    if (result.statusCode !== 201) {
+      const body = JSON.parse(result.body);
+      const errMsg = body.error?.message ?? 'Unknown error';
+      await reply(`:x: Failed to resume task: ${errMsg}`);
+      logger.warn('Slack clarify-resume task creation failed', {
+        status: result.statusCode,
+        task_id: task.task_id,
+        error: errMsg,
+      });
+    }
+    // On success the notify handler posts in-thread — don't duplicate.
+    return;
+  }
+
+  // 2. PR-iteration — the task opened a PR; the user's reply is the instruction.
+  const prNumber = prNumberFromSlackTask(task);
+  if (prNumber !== null && task.repo) {
+    // Extract file attachments if any.
+    const attachments = await extractSlackFileAttachments(
+      { ...event, files: event.files, source: 'mention', text: '', mention_thread_ts: thread_ts } as MentionEvent,
+      reply,
+    );
+    if (attachments === null) return; // validation error already replied
+
+    const result = await createTaskCore(
+      {
+        repo: task.repo,
+        pr_number: prNumber,
+        task_description: reply_text || undefined,
+        workflow_ref: 'coding/pr-iteration-v1',
+        ...(attachments.length > 0 && { attachments }),
+      },
+      {
+        userId: platformUserId,
+        channelSource: 'slack',
+        channelMetadata,
+      },
+      crypto.randomUUID(),
+    );
+    if (result.statusCode !== 201) {
+      const body = JSON.parse(result.body);
+      const errMsg = body.error?.message ?? 'Unknown error';
+      await reply(`:x: Failed to create PR iteration task: ${errMsg}`);
+      logger.warn('Slack PR-iteration task creation failed', {
+        status: result.statusCode,
+        task_id: task.task_id,
+        error: errMsg,
+      });
+    }
+    // On success the notify handler posts in-thread — don't duplicate.
+    return;
+  }
+
+  // 3. Neither — task thread but no actionable state. Log and silently ignore.
+  logger.info('Slack thread reply in non-actionable task thread — ignoring', {
+    task_id: task.task_id,
+    task_status: task.status,
+    has_pr: prNumber !== null,
+    is_clarify_hold: false,
+  });
 }
 
 // ─── Link ─────────────────────────────────────────────────────────────────────
