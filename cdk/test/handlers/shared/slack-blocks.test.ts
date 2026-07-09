@@ -18,7 +18,7 @@
  */
 
 import { TaskStatus, type TaskStatusType } from '../../../src/constructs/task-status';
-import { type ActionsBlock, renderSlackBlocks, type SlackBlock } from '../../../src/handlers/shared/slack-blocks';
+import { type ActionsBlock, repoPickerMessage, renderSlackBlocks, type SlackBlock, PendingTaskContext } from '../../../src/handlers/shared/slack-blocks';
 
 /** Narrow to a section block and return its text; throws if block isn't a section. */
 function sectionText(block: SlackBlock): string {
@@ -201,5 +201,62 @@ describe('renderSlackBlocks', () => {
     const text = sectionText(msg.blocks[0]);
     expect(text.length).toBeLessThan(400);
     expect(text).toContain('...');
+  });
+});
+
+describe('repoPickerMessage', () => {
+  const ctx: PendingTaskContext = {
+    description: 'fix the auth bug',
+    thread_ts: '1000.0001',
+    user_id: 'U1',
+    team_id: 'T1',
+    channel_id: 'C1',
+  };
+
+  test('produces one button per configured repo', () => {
+    const msg = repoPickerMessage(['org/frontend', 'org/backend'], ctx);
+    const actionsBlk = actionsBlock(msg.blocks.find(b => b.type === 'actions')!);
+    expect(actionsBlk.elements).toHaveLength(2);
+  });
+
+  test('each button action_id encodes the repo name', () => {
+    const msg = repoPickerMessage(['org/frontend', 'org/backend'], ctx);
+    const actionsBlk = actionsBlock(msg.blocks.find(b => b.type === 'actions')!);
+    const actionIds = actionsBlk.elements.map(e => (e as { action_id?: string }).action_id);
+    expect(actionIds).toContain('pick_repo:org/frontend');
+    expect(actionIds).toContain('pick_repo:org/backend');
+  });
+
+  test('each button value embeds the serialised PendingTaskContext', () => {
+    const msg = repoPickerMessage(['org/repo'], ctx);
+    const actionsBlk = actionsBlock(msg.blocks.find(b => b.type === 'actions')!);
+    const btnValue = (actionsBlk.elements[0] as { value?: string }).value;
+    const parsed = JSON.parse(btnValue ?? '{}') as PendingTaskContext;
+    expect(parsed.description).toBe('fix the auth bug');
+    expect(parsed.user_id).toBe('U1');
+    expect(parsed.channel_id).toBe('C1');
+  });
+
+  test('truncates repo labels longer than 30 characters', () => {
+    const longRepo = 'org/this-is-a-very-long-repo-name-that-exceeds-the-button-limit';
+    const msg = repoPickerMessage([longRepo], ctx);
+    const actionsBlk = actionsBlock(msg.blocks.find(b => b.type === 'actions')!);
+    const label = (actionsBlk.elements[0] as { text: { text: string } }).text.text;
+    expect(label.length).toBeLessThanOrEqual(30);
+  });
+
+  test('truncates to 25 buttons when more than 25 repos supplied', () => {
+    const repos = Array.from({ length: 30 }, (_, i) => `org/repo${i}`);
+    const msg = repoPickerMessage(repos, ctx);
+    const actionsBlk = actionsBlock(msg.blocks.find(b => b.type === 'actions')!);
+    expect(actionsBlk.elements).toHaveLength(25);
+  });
+
+  test('includes a section block describing the choice', () => {
+    const msg = repoPickerMessage(['org/a', 'org/b'], ctx);
+    const sectionBlk = msg.blocks.find(b => b.type === 'section');
+    expect(sectionBlk).toBeTruthy();
+    const text = sectionText(sectionBlk!);
+    expect(text).toMatch(/Multiple repos/);
   });
 });

@@ -17,10 +17,13 @@
  *  SOFTWARE.
  */
 
+import * as crypto from 'crypto';
 import { DynamoDBClient } from '@aws-sdk/client-dynamodb';
 import { DynamoDBDocumentClient, GetCommand, UpdateCommand } from '@aws-sdk/lib-dynamodb';
 import type { APIGatewayProxyEvent, APIGatewayProxyResult } from 'aws-lambda';
+import { createTaskCore } from './shared/create-task-core';
 import { logger } from './shared/logger';
+import type { PendingTaskContext } from './shared/slack-blocks';
 import { getSlackSecret, SLACK_SECRET_PREFIX, verifySlackRequest } from './shared/slack-verify';
 
 const ddb = DynamoDBDocumentClient.from(new DynamoDBClient({}));
@@ -29,17 +32,22 @@ const SIGNING_SECRET_ARN = process.env.SLACK_SIGNING_SECRET_ARN!;
 const TASK_TABLE = process.env.TASK_TABLE_NAME!;
 const USER_MAPPING_TABLE = process.env.SLACK_USER_MAPPING_TABLE_NAME!;
 
+interface SlackInteractionAction {
+  readonly action_id: string;
+  readonly block_id: string;
+  readonly value?: string;
+  /** Selected option value (for static_select elements). */
+  readonly selected_option?: { readonly value: string };
+}
+
 interface SlackInteractionPayload {
   readonly type: string;
   readonly user: { readonly id: string; readonly username: string; readonly team_id: string };
-  readonly actions?: ReadonlyArray<{
-    readonly action_id: string;
-    readonly block_id: string;
-    readonly value?: string;
-  }>;
+  readonly actions?: ReadonlyArray<SlackInteractionAction>;
   readonly response_url: string;
   readonly trigger_id: string;
   readonly channel?: { readonly id: string };
+  readonly container?: { readonly message_ts: string; readonly channel_id: string };
 }
 
 /**
@@ -83,6 +91,8 @@ export async function handler(event: APIGatewayProxyEvent): Promise<APIGatewayPr
       for (const action of payload.actions) {
         if (action.action_id.startsWith('cancel_task:')) {
           await handleCancelAction(payload, action.action_id);
+        } else if (action.action_id.startsWith('pick_repo:')) {
+          await handlePickRepoAction(payload, action);
         }
       }
     }
@@ -96,6 +106,98 @@ export async function handler(event: APIGatewayProxyEvent): Promise<APIGatewayPr
     return jsonResponse(200, {}); // Still return 200 to avoid Slack retries.
   }
 }
+
+// ─── Repo-picker callback ─────────────────────────────────────────────────────
+
+/**
+ * Handle the `pick_repo:<repo>` interactive button from the repo picker message.
+ *
+ * The button `value` field carries the serialised {@link PendingTaskContext}
+ * (description, thread_ts, user_id, team_id, channel_id) so we can reconstruct
+ * the task submission without a DynamoDB round-trip.
+ */
+async function handlePickRepoAction(
+  payload: SlackInteractionPayload,
+  action: SlackInteractionAction,
+): Promise<void> {
+  const repo = action.action_id.replace('pick_repo:', '');
+  const teamId = payload.user.team_id;
+  const userId = payload.user.id;
+
+  // Validate repo name to prevent injection via a crafted action_id.
+  // Use the same REPO_PATTERN as validation.ts: rejects dot-only path segments
+  // (e.g. `../injection` or `owner/..`) to prevent URL/key path traversal.
+  const REPO_PATTERN = /^(?!\.+\/)[a-zA-Z0-9._-]+\/(?!\.+$)[a-zA-Z0-9._-]+$/;
+  if (!REPO_PATTERN.test(repo)) {
+    await postToResponseUrl(payload.response_url, ':warning: Invalid repo name in picker action.');
+    return;
+  }
+
+  // Deserialise the pending task context from the button value.
+  let ctx: PendingTaskContext;
+  try {
+    ctx = JSON.parse(action.value ?? '{}') as PendingTaskContext;
+  } catch {
+    await postToResponseUrl(payload.response_url, ':warning: Could not parse task context. Please try again.');
+    return;
+  }
+
+  // Verify the picker was triggered by the same user who sent the @mention.
+  // Prevents other users from hijacking pending submissions.
+  if (ctx.user_id && ctx.user_id !== userId) {
+    await postToResponseUrl(payload.response_url, ':no_entry: Only the person who sent the original message can pick a repo.');
+    return;
+  }
+
+  // Look up the platform user.
+  const mappingResult = await ddb.send(new GetCommand({
+    TableName: USER_MAPPING_TABLE,
+    Key: { slack_identity: `${teamId}#${userId}` },
+  }));
+
+  if (!mappingResult.Item || mappingResult.Item.status === 'pending') {
+    await postToResponseUrl(payload.response_url, ':link: Your Slack account is not linked. Run `/bgagent link` first.');
+    return;
+  }
+
+  const platformUserId = mappingResult.Item.platform_user_id as string;
+
+  const channelId = ctx.channel_id || payload.channel?.id || payload.container?.channel_id || '';
+  const channelMetadata: Record<string, string> = {
+    slack_team_id: teamId,
+    slack_channel_id: channelId,
+    slack_user_id: userId,
+  };
+  if (ctx.thread_ts) {
+    channelMetadata.slack_thread_ts = ctx.thread_ts;
+  }
+
+  // Acknowledge immediately with an ephemeral message so the picker is dismissed.
+  await postToResponseUrl(payload.response_url, `:hourglass_flowing_sand: Submitting task against \`${repo}\`...`);
+
+  // Create the task.
+  const result = await createTaskCore(
+    {
+      repo,
+      task_description: ctx.description || undefined,
+    },
+    {
+      userId: platformUserId,
+      channelSource: 'slack',
+      channelMetadata,
+    },
+    crypto.randomUUID(),
+  );
+
+  const body = JSON.parse(result.body);
+  if (result.statusCode !== 201 || !body.data) {
+    const errMsg = body.error?.message ?? 'Unknown error';
+    await postToResponseUrl(payload.response_url, `:x: Failed to create task: ${errMsg}`);
+  }
+  // On success the notify handler posts the task_created message in-thread.
+}
+
+// ─── Cancel-task callback ─────────────────────────────────────────────────────
 
 async function handleCancelAction(payload: SlackInteractionPayload, actionId: string): Promise<void> {
   const taskId = actionId.replace('cancel_task:', '');
