@@ -34,6 +34,11 @@ jest.mock('@aws-sdk/client-secrets-manager', () => ({
   GetSecretValueCommand: jest.fn((input: unknown) => ({ _type: 'GetSecretValue', input })),
 }));
 
+const createTaskCoreMock = jest.fn();
+jest.mock('../../src/handlers/shared/create-task-core', () => ({
+  createTaskCore: (...args: unknown[]) => createTaskCoreMock(...args),
+}));
+
 const fetchMock = jest.fn();
 (global as unknown as { fetch: unknown }).fetch = fetchMock;
 
@@ -97,6 +102,7 @@ describe('slack-interactions handler', () => {
     ddbSend.mockReset();
     smSend.mockReset();
     fetchMock.mockReset();
+    createTaskCoreMock.mockReset();
     invalidateSlackSecretCache(process.env.SLACK_SIGNING_SECRET_ARN!);
     smSend.mockResolvedValue({ SecretString: SIGNING_SECRET });
     fetchMock.mockResolvedValue({ ok: true, json: () => Promise.resolve({ ok: true }) });
@@ -192,5 +198,130 @@ describe('slack-interactions handler', () => {
         isSlackHooksRequestUrl(url) && String((opts as { body: string }).body).includes('not linked'),
     );
     expect(posted).toBeTruthy();
+  });
+
+  // ─── Repo-picker callback ────────────────────────────────────────────────────
+
+  function pickRepoPayload(repo: string, ctxOverrides: object = {}, userId = 'U1', teamId = 'T1'): object {
+    const ctx = JSON.stringify({
+      description: 'fix the bug',
+      thread_ts: '1000.0001',
+      user_id: userId,
+      team_id: teamId,
+      channel_id: 'C1',
+      ...ctxOverrides,
+    });
+    return {
+      type: 'block_actions',
+      user: { id: userId, username: 'u', team_id: teamId },
+      response_url: 'https://hooks.slack.com/response/xyz',
+      trigger_id: 't.1',
+      actions: [{ action_id: `pick_repo:${repo}`, block_id: 'repo_picker', value: ctx }],
+      channel: { id: 'C1' },
+    };
+  }
+
+  test('pick_repo submits task against the selected repo', async () => {
+    // 1. user mapping lookup → linked
+    ddbSend.mockResolvedValueOnce({ Item: { platform_user_id: 'user-42' } });
+    createTaskCoreMock.mockResolvedValueOnce({
+      statusCode: 201,
+      body: JSON.stringify({ data: { task_id: 'T42', repo: 'org/backend', status: 'SUBMITTED' } }),
+    });
+
+    const event = makeInteractionEvent(pickRepoPayload('org/backend'));
+    const result = await handler(event);
+    expect(result.statusCode).toBe(200);
+    expect(createTaskCoreMock).toHaveBeenCalledTimes(1);
+    const [reqBody, ctx] = createTaskCoreMock.mock.calls[0];
+    expect(reqBody.repo).toBe('org/backend');
+    expect(reqBody.task_description).toBe('fix the bug');
+    expect(ctx.channelSource).toBe('slack');
+    expect(ctx.channelMetadata.slack_thread_ts).toBe('1000.0001');
+    // Should ack via response_url with "Submitting..."
+    const ack = fetchMock.mock.calls.find(
+      ([url, opts]) =>
+        isSlackHooksRequestUrl(url) && String((opts as { body: string }).body).includes('Submitting'),
+    );
+    expect(ack).toBeTruthy();
+  });
+
+  test('pick_repo rejects malformed repo name in action_id', async () => {
+    const event = makeInteractionEvent({
+      type: 'block_actions',
+      user: { id: 'U1', username: 'u', team_id: 'T1' },
+      response_url: 'https://hooks.slack.com/response/xyz',
+      trigger_id: 't.1',
+      actions: [{ action_id: 'pick_repo:../injection', block_id: 'repo_picker', value: '{}' }],
+    });
+    const result = await handler(event);
+    expect(result.statusCode).toBe(200);
+    expect(createTaskCoreMock).not.toHaveBeenCalled();
+    const reply = fetchMock.mock.calls.find(
+      ([url, opts]) =>
+        isSlackHooksRequestUrl(url) && String((opts as { body: string }).body).includes('Invalid repo name'),
+    );
+    expect(reply).toBeTruthy();
+  });
+
+  test('pick_repo rejects when picker was triggered by a different user', async () => {
+    // ctx.user_id = U1, but interaction user = U2
+    const event = makeInteractionEvent(pickRepoPayload('org/backend', { user_id: 'U1' }, 'U2'));
+    const result = await handler(event);
+    expect(result.statusCode).toBe(200);
+    expect(createTaskCoreMock).not.toHaveBeenCalled();
+    const reply = fetchMock.mock.calls.find(
+      ([url, opts]) =>
+        isSlackHooksRequestUrl(url) && String((opts as { body: string }).body).includes('Only the person'),
+    );
+    expect(reply).toBeTruthy();
+  });
+
+  test('pick_repo for unlinked user replies with link prompt', async () => {
+    ddbSend.mockResolvedValueOnce({ Item: { status: 'pending' } });
+    const event = makeInteractionEvent(pickRepoPayload('org/backend'));
+    const result = await handler(event);
+    expect(result.statusCode).toBe(200);
+    expect(createTaskCoreMock).not.toHaveBeenCalled();
+    const reply = fetchMock.mock.calls.find(
+      ([url, opts]) =>
+        isSlackHooksRequestUrl(url) && String((opts as { body: string }).body).includes('not linked'),
+    );
+    expect(reply).toBeTruthy();
+  });
+
+  test('pick_repo posts error reply when createTaskCore fails', async () => {
+    ddbSend.mockResolvedValueOnce({ Item: { platform_user_id: 'user-42' } });
+    createTaskCoreMock.mockResolvedValueOnce({
+      statusCode: 400,
+      body: JSON.stringify({ error: { message: 'Repo not found' } }),
+    });
+
+    const event = makeInteractionEvent(pickRepoPayload('org/backend'));
+    const result = await handler(event);
+    expect(result.statusCode).toBe(200);
+    const reply = fetchMock.mock.calls.find(
+      ([url, opts]) =>
+        isSlackHooksRequestUrl(url) && String((opts as { body: string }).body).includes('Repo not found'),
+    );
+    expect(reply).toBeTruthy();
+  });
+
+  test('pick_repo handles unparseable button value gracefully', async () => {
+    const event = makeInteractionEvent({
+      type: 'block_actions',
+      user: { id: 'U1', username: 'u', team_id: 'T1' },
+      response_url: 'https://hooks.slack.com/response/xyz',
+      trigger_id: 't.1',
+      actions: [{ action_id: 'pick_repo:org/backend', block_id: 'repo_picker', value: 'NOT_JSON' }],
+    });
+    const result = await handler(event);
+    expect(result.statusCode).toBe(200);
+    expect(createTaskCoreMock).not.toHaveBeenCalled();
+    const reply = fetchMock.mock.calls.find(
+      ([url, opts]) =>
+        isSlackHooksRequestUrl(url) && String((opts as { body: string }).body).includes('parse task context'),
+    );
+    expect(reply).toBeTruthy();
   });
 });

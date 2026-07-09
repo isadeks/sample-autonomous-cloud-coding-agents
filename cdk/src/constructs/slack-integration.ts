@@ -311,13 +311,18 @@ export class SlackIntegration extends Construct {
     commandProcessorFn.grantInvoke(slackEventsFn);
 
     // --- Slack Interactions (Block Kit button actions) ---
+    // The interactions Lambda handles both cancel_task and pick_repo callbacks.
+    // pick_repo requires createTaskCore, so it needs the same task-creation env
+    // vars and permissions as the command processor.
     const slackInteractionsFn = new lambda.NodejsFunction(this, 'SlackInteractionsFn', {
       entry: path.join(handlersDir, 'slack-interactions.ts'),
       handler: 'handler',
       runtime: Runtime.NODEJS_24_X,
       architecture: Architecture.ARM_64,
-      timeout: Duration.seconds(10),
+      timeout: Duration.seconds(COMMAND_PROCESSOR_TIMEOUT_SECONDS),
+      memorySize: COMMAND_PROCESSOR_MEMORY_MB,
       environment: {
+        ...createTaskEnv,
         SLACK_SIGNING_SECRET_ARN: this.signingSecret.secretArn,
         TASK_TABLE_NAME: props.taskTable.tableName,
         SLACK_USER_MAPPING_TABLE_NAME: this.userMappingTable.tableName,
@@ -327,7 +332,29 @@ export class SlackIntegration extends Construct {
     this.signingSecret.grantRead(slackInteractionsFn);
     slackInteractionsFn.addToRolePolicy(readSlackSecretsPolicy);
     props.taskTable.grantReadWriteData(slackInteractionsFn);
+    props.taskEventsTable.grantReadWriteData(slackInteractionsFn);
     this.userMappingTable.grantReadData(slackInteractionsFn);
+    if (props.repoTable) {
+      props.repoTable.grantReadData(slackInteractionsFn);
+    }
+    if (props.orchestratorFunctionArn) {
+      slackInteractionsFn.addToRolePolicy(new iam.PolicyStatement({
+        actions: ['lambda:InvokeFunction'],
+        resources: [props.orchestratorFunctionArn],
+      }));
+    }
+    if (props.guardrailId) {
+      slackInteractionsFn.addToRolePolicy(new iam.PolicyStatement({
+        actions: ['bedrock:ApplyGuardrail'],
+        resources: [
+          Stack.of(this).formatArn({
+            service: 'bedrock',
+            resource: 'guardrail',
+            resourceName: props.guardrailId,
+          }),
+        ],
+      }));
+    }
 
     // --- Slash Command Acknowledger ---
     const slackCommandsFn = new lambda.NodejsFunction(this, 'SlackCommandsFn', {

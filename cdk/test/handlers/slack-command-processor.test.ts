@@ -36,6 +36,15 @@ jest.mock('../../src/handlers/shared/create-task-core', () => ({
   createTaskCore: (...args: unknown[]) => createTaskCoreMock(...args),
 }));
 
+const getChannelReposMock = jest.fn();
+const addChannelRepoMock = jest.fn();
+const removeChannelRepoMock = jest.fn();
+jest.mock('../../src/handlers/shared/channel-config', () => ({
+  getChannelRepos: (...args: unknown[]) => getChannelReposMock(...args),
+  addChannelRepo: (...args: unknown[]) => addChannelRepoMock(...args),
+  removeChannelRepo: (...args: unknown[]) => removeChannelRepoMock(...args),
+}));
+
 const fetchMock = jest.fn();
 (global as unknown as { fetch: unknown }).fetch = fetchMock;
 
@@ -89,11 +98,16 @@ describe('slack-command-processor handler', () => {
     smSend.mockReset();
     fetchMock.mockReset();
     createTaskCoreMock.mockReset();
+    getChannelReposMock.mockReset();
+    addChannelRepoMock.mockReset();
+    removeChannelRepoMock.mockReset();
     smSend.mockResolvedValue({ SecretString: 'xoxb-bot' });
     fetchMock.mockResolvedValue({
       ok: true,
       json: () => Promise.resolve({ ok: true }),
     });
+    // Default: no channel repos configured
+    getChannelReposMock.mockResolvedValue([]);
   });
 
   test('slash command without source flag defaults to slash and falls through to default branch', async () => {
@@ -143,7 +157,7 @@ describe('slack-command-processor handler', () => {
 
   test('mention submit with no repo and no channel default replies with guidance', async () => {
     ddbSend.mockResolvedValueOnce({ Item: { status: 'active', platform_user_id: 'cognito-1' } });
-    // channel-default lookup returns a row without a repo → no default; then
+    // getChannelRepos returns [] (the default from beforeEach) → no default
     // swapReaction → getBotToken installation lookup.
     ddbSend.mockResolvedValue({ Item: { status: 'active' } });
     await handler(mention({ text: 'submit not-a-repo fix' }));
@@ -154,11 +168,11 @@ describe('slack-command-processor handler', () => {
     expect(createTaskCoreMock).not.toHaveBeenCalled();
   });
 
-  test('mention submit with no repo falls back to channel default and uses full text as description', async () => {
+  test('mention submit with no repo falls back to channel default when exactly one repo configured', async () => {
     // 1. user mapping → linked
     ddbSend.mockResolvedValueOnce({ Item: { status: 'active', platform_user_id: 'cognito-1' } });
-    // 2. channel-default lookup → active mapping to org/defaultrepo
-    ddbSend.mockResolvedValueOnce({ Item: { status: 'active', repo: 'org/defaultrepo' } });
+    // 2. getChannelRepos → single default
+    getChannelReposMock.mockResolvedValueOnce(['org/defaultrepo']);
     // 3. checkChannelAccess installation lookup (+ bot token secret)
     ddbSend.mockResolvedValue({ Item: { status: 'active' } });
     fetchMock.mockResolvedValueOnce({
@@ -180,8 +194,8 @@ describe('slack-command-processor handler', () => {
 
   test('mention submit with no repo fails open when the channel lookup throws', async () => {
     ddbSend.mockResolvedValueOnce({ Item: { status: 'active', platform_user_id: 'cognito-1' } });
-    // channel-default lookup throws → fail open → no default → guidance reply
-    ddbSend.mockRejectedValueOnce(new Error('ddb blip'));
+    // getChannelRepos → fail open (returns [])
+    getChannelReposMock.mockResolvedValueOnce([]);
     ddbSend.mockResolvedValue({ Item: { status: 'active' } });
     await handler(mention({ text: 'submit fix the bug' }));
     expect(createTaskCoreMock).not.toHaveBeenCalled();
@@ -189,6 +203,31 @@ describe('slack-command-processor handler', () => {
       ([url, opts]) => String(url).includes('chat.postMessage') && String((opts as { body: string }).body).includes('Please include a repo'),
     );
     expect(reply).toBeTruthy();
+  });
+
+  test('mention submit with no repo and multiple channel repos posts a repo picker', async () => {
+    // 1. user mapping → linked
+    ddbSend.mockResolvedValueOnce({ Item: { status: 'active', platform_user_id: 'cognito-1' } });
+    // 2. getChannelRepos → two defaults
+    getChannelReposMock.mockResolvedValueOnce(['org/frontend', 'org/backend']);
+    // 3. getBotToken installation lookup (for postEphemeral)
+    ddbSend.mockResolvedValue({ Item: { status: 'active' } });
+
+    await handler(mention({ text: 'submit fix the auth bug' }));
+
+    expect(createTaskCoreMock).not.toHaveBeenCalled();
+    // Should have posted a chat.postEphemeral with buttons
+    const picker = fetchMock.mock.calls.find(
+      ([url, opts]) =>
+        String(url).includes('chat.postEphemeral') &&
+        String((opts as { body: string }).body).includes('org/frontend'),
+    );
+    expect(picker).toBeTruthy();
+    // Should have action buttons for each repo
+    const pickerBody = JSON.parse((fetchMock.mock.calls.find(([url]) => String(url).includes('chat.postEphemeral'))![1] as { body: string }).body) as { blocks: Array<{ elements?: Array<{ action_id?: string }> }> };
+    const actionBlock = pickerBody.blocks.find(b => b.elements);
+    expect(actionBlock?.elements?.some(e => e.action_id?.includes('org/frontend'))).toBe(true);
+    expect(actionBlock?.elements?.some(e => e.action_id?.includes('org/backend'))).toBe(true);
   });
 
   test('mention submit creates task via createTaskCore', async () => {
@@ -375,6 +414,94 @@ describe('slack-command-processor handler', () => {
       expect(createTaskCoreMock).toHaveBeenCalledTimes(1);
       const [reqBody] = createTaskCoreMock.mock.calls[0];
       expect(reqBody.attachments).toBeUndefined();
+    });
+  });
+
+  // ─── set-repo / remove-repo / list-repos subcommands ────────────────────────
+
+  describe('set-repo', () => {
+    test('adds a default repo for the channel and replies with confirmation', async () => {
+      addChannelRepoMock.mockResolvedValueOnce(null); // success
+      await handler(slashCommand({ text: 'set-repo org/backend' }));
+      expect(addChannelRepoMock).toHaveBeenCalledWith(
+        expect.anything(), 'SlackChannelMap', 'T1', 'C1', 'org/backend',
+      );
+      const posted = fetchMock.mock.calls.find(
+        ([url, opts]) => String((opts as { body: string }).body).includes('added as a default repo'),
+      );
+      expect(posted).toBeTruthy();
+    });
+
+    test('replies with usage when no repo argument given', async () => {
+      await handler(slashCommand({ text: 'set-repo' }));
+      expect(addChannelRepoMock).not.toHaveBeenCalled();
+      const posted = fetchMock.mock.calls.find(
+        ([url, opts]) => String((opts as { body: string }).body).includes('Usage:'),
+      );
+      expect(posted).toBeTruthy();
+    });
+
+    test('relays error from addChannelRepo to user', async () => {
+      addChannelRepoMock.mockResolvedValueOnce('Invalid repo format — use `owner/repo`.');
+      await handler(slashCommand({ text: 'set-repo bad' }));
+      const posted = fetchMock.mock.calls.find(
+        ([url, opts]) => String((opts as { body: string }).body).includes('Invalid repo format'),
+      );
+      expect(posted).toBeTruthy();
+    });
+  });
+
+  describe('remove-repo', () => {
+    test('removes a default repo and replies with confirmation', async () => {
+      removeChannelRepoMock.mockResolvedValueOnce(null); // success
+      await handler(slashCommand({ text: 'remove-repo org/backend' }));
+      expect(removeChannelRepoMock).toHaveBeenCalledWith(
+        expect.anything(), 'SlackChannelMap', 'T1', 'C1', 'org/backend',
+      );
+      const posted = fetchMock.mock.calls.find(
+        ([url, opts]) => String((opts as { body: string }).body).includes('removed from this channel'),
+      );
+      expect(posted).toBeTruthy();
+    });
+
+    test('replies with usage when no repo argument given', async () => {
+      await handler(slashCommand({ text: 'remove-repo' }));
+      expect(removeChannelRepoMock).not.toHaveBeenCalled();
+      const posted = fetchMock.mock.calls.find(
+        ([url, opts]) => String((opts as { body: string }).body).includes('Usage:'),
+      );
+      expect(posted).toBeTruthy();
+    });
+
+    test('relays error from removeChannelRepo to user', async () => {
+      removeChannelRepoMock.mockResolvedValueOnce('`org/gone` is not configured for this channel.');
+      await handler(slashCommand({ text: 'remove-repo org/gone' }));
+      const posted = fetchMock.mock.calls.find(
+        ([url, opts]) => String((opts as { body: string }).body).includes('not configured'),
+      );
+      expect(posted).toBeTruthy();
+    });
+  });
+
+  describe('list-repos', () => {
+    test('lists configured repos', async () => {
+      getChannelReposMock.mockResolvedValueOnce(['org/a', 'org/b']);
+      await handler(slashCommand({ text: 'list-repos' }));
+      const posted = fetchMock.mock.calls.find(
+        ([url, opts]) =>
+          String((opts as { body: string }).body).includes('org/a') &&
+          String((opts as { body: string }).body).includes('org/b'),
+      );
+      expect(posted).toBeTruthy();
+    });
+
+    test('replies with guidance when no repos are configured', async () => {
+      getChannelReposMock.mockResolvedValueOnce([]);
+      await handler(slashCommand({ text: 'list-repos' }));
+      const posted = fetchMock.mock.calls.find(
+        ([url, opts]) => String((opts as { body: string }).body).includes('No default repos'),
+      );
+      expect(posted).toBeTruthy();
     });
   });
 });

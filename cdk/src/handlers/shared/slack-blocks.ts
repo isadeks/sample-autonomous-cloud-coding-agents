@@ -77,6 +77,29 @@ export interface ActionsBlock {
 /** Any Block Kit block this module renders. */
 export type SlackBlock = SectionBlock | ActionsBlock;
 
+/**
+ * Opaque pending-task context passed through the repo-picker interaction.
+ * Encoded as JSON in the action `value` field.
+ */
+export interface PendingTaskContext {
+  /** Task description text (trimmed, without any repo token). */
+  readonly description: string;
+  /** Original thread timestamp of the @mention. */
+  readonly thread_ts?: string;
+  /** Slack user ID who submitted the @mention. */
+  readonly user_id: string;
+  /** Slack team ID. */
+  readonly team_id: string;
+  /** Slack channel ID. */
+  readonly channel_id: string;
+}
+
+/** Max button label length (30 chars is the Slack limit for button text). */
+const BUTTON_LABEL_MAX = 30;
+
+/** Maximum interactive elements in a single Slack actions block. */
+const MAX_BUTTONS_PER_ACTIONS_BLOCK = 25;
+
 /** A Slack message payload suitable for chat.postMessage. */
 export interface SlackMessage {
   /** Fallback plain-text for notifications. */
@@ -294,4 +317,53 @@ function dangerButton(label: string, actionId: string): ActionButtonElement {
 function prLabel(prUrl: string): string {
   const match = prUrl.match(/\/pull\/(\d+)$/);
   return match ? `#${match[1]}` : 'Pull Request';
+}
+
+/**
+ * Build a Block Kit interactive message prompting the user to pick which
+ * configured repo their task should run against.
+ *
+ * Each button carries a `pick_repo:<repo>` action_id and embeds the pending
+ * task context as JSON in the button `value` so the interactions handler can
+ * reconstruct and submit the task without a DynamoDB round-trip.
+ *
+ * Buttons are limited to 25 per actions block (Slack maximum); repos beyond
+ * that are silently truncated (the channel-config helper caps at 10 anyway).
+ *
+ * @param repos      - ordered list of configured repos for the channel.
+ * @param ctx        - pending task context to embed in each button.
+ * @returns a SlackMessage payload.
+ */
+export function repoPickerMessage(repos: readonly string[], ctx: PendingTaskContext): SlackMessage {
+  const ctxValue = JSON.stringify(ctx);
+  const buttons: ActionButtonElement[] = repos.slice(0, MAX_BUTTONS_PER_ACTIONS_BLOCK).map(repo => ({
+    type: 'button',
+    text: {
+      type: 'plain_text',
+      text: repo.length > BUTTON_LABEL_MAX ? `…${repo.slice(-(BUTTON_LABEL_MAX - 1))}` : repo,
+      emoji: false,
+    },
+    action_id: `pick_repo:${repo}`,
+    value: ctxValue,
+  }));
+
+  const descPreview = ctx.description ? `: "${truncate(ctx.description, 60)}"` : '';
+
+  return {
+    text: `Which repo should I use for your task${descPreview}? Pick one:`,
+    blocks: [
+      {
+        type: 'section',
+        text: {
+          type: 'mrkdwn',
+          text: `Multiple repos are configured for this channel. Which repo should I use for your task${descPreview}?`,
+        },
+      },
+      {
+        type: 'actions',
+        block_id: 'repo_picker',
+        elements: buttons,
+      },
+    ],
+  };
 }
