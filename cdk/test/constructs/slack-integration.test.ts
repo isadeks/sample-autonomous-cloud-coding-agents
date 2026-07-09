@@ -67,6 +67,18 @@ describe('SlackIntegration construct', () => {
     });
   });
 
+  test('interactions handler receives the channel-mapping table and processor function for the repo picker', () => {
+    template.hasResourceProperties('AWS::Lambda::Function', {
+      Environment: {
+        Variables: Match.objectLike({
+          TASK_TABLE_NAME: Match.anyValue(),
+          SLACK_CHANNEL_MAPPING_TABLE_NAME: Match.anyValue(),
+          SLACK_COMMAND_PROCESSOR_FUNCTION_NAME: Match.anyValue(),
+        }),
+      },
+    });
+  });
+
   test('creates 6 Lambda functions', () => {
     // oauth-callback, events, commands, command-processor, link, interactions
     // (issue #64: notify migrated onto FanOutConsumer as a dispatcher)

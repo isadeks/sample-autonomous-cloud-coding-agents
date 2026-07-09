@@ -280,7 +280,9 @@ export class SlackIntegration extends Construct {
     });
     this.userMappingTable.grantReadWriteData(commandProcessorFn);
     this.installationTable.grantReadData(commandProcessorFn);
-    this.channelMappingTable.grantReadData(commandProcessorFn);
+    // Read defaults for @mention resolution AND write them via `/bgagent set-repo`
+    // (and store transient pending repo-pick records for the interactive picker).
+    this.channelMappingTable.grantReadWriteData(commandProcessorFn);
     commandProcessorFn.addToRolePolicy(readSlackSecretsPolicy);
     props.taskTable.grantReadWriteData(commandProcessorFn);
     props.taskEventsTable.grantReadWriteData(commandProcessorFn);
@@ -321,6 +323,8 @@ export class SlackIntegration extends Construct {
         SLACK_SIGNING_SECRET_ARN: this.signingSecret.secretArn,
         TASK_TABLE_NAME: props.taskTable.tableName,
         SLACK_USER_MAPPING_TABLE_NAME: this.userMappingTable.tableName,
+        SLACK_CHANNEL_MAPPING_TABLE_NAME: this.channelMappingTable.tableName,
+        SLACK_COMMAND_PROCESSOR_FUNCTION_NAME: commandProcessorFn.functionName,
       },
       bundling: commonBundling,
     });
@@ -328,6 +332,11 @@ export class SlackIntegration extends Construct {
     slackInteractionsFn.addToRolePolicy(readSlackSecretsPolicy);
     props.taskTable.grantReadWriteData(slackInteractionsFn);
     this.userMappingTable.grantReadData(slackInteractionsFn);
+    // Read/delete transient pending repo-pick records written by the picker.
+    this.channelMappingTable.grantReadWriteData(slackInteractionsFn);
+    // The repo-picker callback forwards the resolved submission back to the
+    // command processor so the existing submit path runs unchanged.
+    commandProcessorFn.grantInvoke(slackInteractionsFn);
 
     // --- Slash Command Acknowledger ---
     const slackCommandsFn = new lambda.NodejsFunction(this, 'SlackCommandsFn', {
