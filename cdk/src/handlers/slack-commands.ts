@@ -128,7 +128,11 @@ function slackResponse(text: string): APIGatewayProxyResult {
 }
 
 const ACK_MESSAGES: Record<string, string> = {
-  link: ':link: Generating link code...',
+  'link': ':link: Generating link code...',
+  'set-repo': ':gear: Setting the channel repo...',
+  'setup': ':gear: Setting the channel repo...',
+  'repos': ':mag: Looking up configured repos...',
+  'list-repos': ':mag: Looking up configured repos...',
 };
 
 const HELP_TEXT = `*Using Shoof*
@@ -136,6 +140,11 @@ const HELP_TEXT = `*Using Shoof*
 *Submit a task:* Mention \`@Shoof\` in any channel:
 > \`@Shoof fix the login bug in org/repo#42\`
 > \`@Shoof update the README in org/repo\`
+
+*Set a default repo for this channel:* \`/bgagent set-repo org/repo\`
+Once set, drop the repo name — \`@Shoof fix the login bug\` runs against the channel default. Add several repos and Shoof will ask which one to use.
+
+*See configured repos:* \`/bgagent repos\`
 
 *Private submissions:* DM Shoof directly.
 

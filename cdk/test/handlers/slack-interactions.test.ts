@@ -34,12 +34,20 @@ jest.mock('@aws-sdk/client-secrets-manager', () => ({
   GetSecretValueCommand: jest.fn((input: unknown) => ({ _type: 'GetSecretValue', input })),
 }));
 
+const lambdaSend = jest.fn();
+jest.mock('@aws-sdk/client-lambda', () => ({
+  LambdaClient: jest.fn(() => ({ send: lambdaSend })),
+  InvokeCommand: jest.fn((input: unknown) => ({ _type: 'Invoke', input })),
+}));
+
 const fetchMock = jest.fn();
 (global as unknown as { fetch: unknown }).fetch = fetchMock;
 
 process.env.SLACK_SIGNING_SECRET_ARN = 'arn:aws:secretsmanager:us-east-1:123:secret:bgagent/slack/signing-I';
 process.env.TASK_TABLE_NAME = 'Tasks';
 process.env.SLACK_USER_MAPPING_TABLE_NAME = 'SlackMap';
+process.env.SLACK_CHANNEL_MAPPING_TABLE_NAME = 'SlackChannelMap';
+process.env.SLACK_COMMAND_PROCESSOR_FUNCTION_NAME = 'CommandProcessorFn';
 
 import { invalidateSlackSecretCache } from '../../src/handlers/shared/slack-verify';
 import { handler } from '../../src/handlers/slack-interactions';
@@ -96,9 +104,11 @@ describe('slack-interactions handler', () => {
   beforeEach(() => {
     ddbSend.mockReset();
     smSend.mockReset();
+    lambdaSend.mockReset();
     fetchMock.mockReset();
     invalidateSlackSecretCache(process.env.SLACK_SIGNING_SECRET_ARN!);
     smSend.mockResolvedValue({ SecretString: SIGNING_SECRET });
+    lambdaSend.mockResolvedValue({});
     fetchMock.mockResolvedValue({ ok: true, json: () => Promise.resolve({ ok: true }) });
   });
 
@@ -192,5 +202,93 @@ describe('slack-interactions handler', () => {
         isSlackHooksRequestUrl(url) && String((opts as { body: string }).body).includes('not linked'),
     );
     expect(posted).toBeTruthy();
+  });
+
+  describe('repo picker (pick_repo)', () => {
+    const pendingRow = {
+      channel_id: 'pending#tok1',
+      kind: 'repo_pick',
+      description: 'fix the auth bug',
+      team_id: 'T1',
+      slack_channel_id: 'C1',
+      user_id: 'U1',
+      thread_ts: '1000.1',
+      ttl: Math.floor(Date.now() / 1000) + 600,
+    };
+
+    function repoPickPayload(actionId: string, value: string, userId = 'U1'): object {
+      return {
+        type: 'block_actions',
+        user: { id: userId, username: 'u', team_id: 'T1' },
+        response_url: 'https://hooks.slack.com/response/xyz',
+        trigger_id: 't.1',
+        actions: [{ action_id: actionId, block_id: 'tok1', value }],
+        channel: { id: 'C1' },
+      };
+    }
+
+    test('button click forwards an explicit-repo submit to the command processor', async () => {
+      // getPendingRepoPick
+      ddbSend.mockResolvedValueOnce({ Item: pendingRow });
+      // deletePendingRepoPick
+      ddbSend.mockResolvedValueOnce({});
+
+      const event = makeInteractionEvent(repoPickPayload('pick_repo:tok1#org/a', 'org/a'));
+      const result = await handler(event);
+      expect(result.statusCode).toBe(200);
+
+      expect(lambdaSend).toHaveBeenCalledTimes(1);
+      const invoke = lambdaSend.mock.calls[0][0];
+      expect(invoke.input.FunctionName).toBe('CommandProcessorFn');
+      const forwarded = JSON.parse(new TextDecoder().decode(invoke.input.Payload));
+      expect(forwarded.source).toBe('mention');
+      expect(forwarded.text).toBe('submit org/a fix the auth bug');
+      expect(forwarded.user_id).toBe('U1');
+      expect(forwarded.mention_thread_ts).toBe('1000.1');
+    });
+
+    test('static_select choice reads the repo from selected_option', async () => {
+      ddbSend.mockResolvedValueOnce({ Item: pendingRow });
+      ddbSend.mockResolvedValueOnce({});
+
+      const payload = {
+        type: 'block_actions',
+        user: { id: 'U1', username: 'u', team_id: 'T1' },
+        response_url: 'https://hooks.slack.com/response/xyz',
+        trigger_id: 't.1',
+        actions: [{ action_id: 'pick_repo:tok1', block_id: 'tok1', selected_option: { value: 'org/b' } }],
+        channel: { id: 'C1' },
+      };
+      const event = makeInteractionEvent(payload);
+      await handler(event);
+
+      expect(lambdaSend).toHaveBeenCalledTimes(1);
+      const forwarded = JSON.parse(new TextDecoder().decode(lambdaSend.mock.calls[0][0].input.Payload));
+      expect(forwarded.text).toBe('submit org/b fix the auth bug');
+    });
+
+    test('expired / missing pending pick warns the user and does not submit', async () => {
+      ddbSend.mockResolvedValueOnce({ Item: undefined });
+      const event = makeInteractionEvent(repoPickPayload('pick_repo:tok1#org/a', 'org/a'));
+      await handler(event);
+      expect(lambdaSend).not.toHaveBeenCalled();
+      const posted = fetchMock.mock.calls.find(
+        ([url, opts]) => isSlackHooksRequestUrl(url)
+          && String((opts as { body: string }).body).includes('expired'),
+      );
+      expect(posted).toBeTruthy();
+    });
+
+    test('a different user cannot resolve someone else\'s picker', async () => {
+      ddbSend.mockResolvedValueOnce({ Item: pendingRow });
+      const event = makeInteractionEvent(repoPickPayload('pick_repo:tok1#org/a', 'org/a', 'U2'));
+      await handler(event);
+      expect(lambdaSend).not.toHaveBeenCalled();
+      const posted = fetchMock.mock.calls.find(
+        ([url, opts]) => isSlackHooksRequestUrl(url)
+          && String((opts as { body: string }).body).includes('Only the person who asked'),
+      );
+      expect(posted).toBeTruthy();
+    });
   });
 });

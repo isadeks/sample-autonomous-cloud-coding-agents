@@ -196,6 +196,11 @@ export function makeSlackCommand(): Command {
           TableName: tableName,
           Item: {
             channel_id: `${teamId}#${channelId}`,
+            // Write both the multi-repo `repos` list (read by the Slack handlers'
+            // channel-config helper) and the legacy scalar `repo` mirror so older
+            // readers keep resolving a default. Members can grow the list further
+            // from Slack with `/bgagent set-repo`.
+            repos: [opts.repo],
             repo: opts.repo,
             status: 'active',
             onboarded_at: now,
