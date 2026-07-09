@@ -127,6 +127,16 @@ export interface TaskRecord {
    * (which keeps the GSI sparse).
    */
   readonly linear_issue_id?: string;
+  /**
+   * Slack thread timestamp, hoisted to the top level from
+   * ``channel_metadata.slack_thread_ts`` at task-create time (ABCA-661).
+   * Top-level because a DynamoDB GSI (``SlackThreadIndex``) cannot key off a
+   * nested map field — the thread-reply handler queries this index to resolve
+   * a Slack thread reply back to the originating task. Present only for
+   * Slack-origin tasks that have a ``slack_thread_ts`` in their metadata;
+   * absent for all other tasks (keeps the GSI sparse).
+   */
+  readonly slack_thread_ts?: string;
   readonly status_created_at: string;
   readonly created_at: string;
   readonly updated_at: string;

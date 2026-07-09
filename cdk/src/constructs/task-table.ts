@@ -88,6 +88,16 @@ export class TaskTable extends Construct {
   public static readonly LINEAR_ISSUE_INDEX = 'LinearIssueIndex';
 
   /**
+   * GSI name for resolving a Slack thread → its ABCA task (ABCA-661).
+   * PK: slack_thread_ts, SK: created_at (newest task wins). Sparse — only
+   * Slack-origin tasks with a ``slack_thread_ts`` carry the top-level
+   * attribute. Powers the Slack thread-reply handler, which maps a reply in
+   * an existing task thread back to that task's PR (for PR-iteration) or
+   * clarify-hold (for resume).
+   */
+  public static readonly SLACK_THREAD_INDEX = 'SlackThreadIndex';
+
+  /**
    * The underlying DynamoDB table. Use this to grant access or read the table name.
    */
   public readonly table: dynamodb.Table;
@@ -159,6 +169,20 @@ export class TaskTable extends Construct {
       // widening this projection. Keep this list as-is unless you create a NEW
       // index with a different name.
       nonKeyAttributes: ['pr_url', 'pr_number', 'status', 'repo', 'user_id', 'channel_metadata'],
+    });
+
+    // GSI: Slack thread → ABCA task (sparse — only Slack-origin tasks with a
+    // slack_thread_ts carry the top-level attribute). ABCA-661 thread-reply
+    // handler. INCLUDE-projects the fields the reply handler reads.
+    this.table.addGlobalSecondaryIndex({
+      indexName: TaskTable.SLACK_THREAD_INDEX,
+      partitionKey: { name: 'slack_thread_ts', type: dynamodb.AttributeType.STRING },
+      sortKey: { name: 'created_at', type: dynamodb.AttributeType.STRING },
+      projectionType: dynamodb.ProjectionType.INCLUDE,
+      nonKeyAttributes: [
+        'task_id', 'user_id', 'repo', 'pr_url', 'pr_number', 'status',
+        'resolved_workflow', 'workflow_ref', 'code_changed', 'answer_text', 'task_description',
+      ],
     });
   }
 }

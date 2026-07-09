@@ -23,6 +23,7 @@ jest.mock('@aws-sdk/lib-dynamodb', () => ({
   DynamoDBDocumentClient: { from: jest.fn(() => ({ send: ddbSend })) },
   GetCommand: jest.fn((input: unknown) => ({ _type: 'Get', input })),
   PutCommand: jest.fn((input: unknown) => ({ _type: 'Put', input })),
+  QueryCommand: jest.fn((input: unknown) => ({ _type: 'Query', input })),
 }));
 
 const smSend = jest.fn();
@@ -42,8 +43,10 @@ const fetchMock = jest.fn();
 process.env.SLACK_USER_MAPPING_TABLE_NAME = 'SlackMap';
 process.env.SLACK_INSTALLATION_TABLE_NAME = 'SlackInstall';
 process.env.SLACK_CHANNEL_MAPPING_TABLE_NAME = 'SlackChannelMap';
+process.env.TASK_TABLE_NAME = 'TaskTable';
 
-import { handler, type MentionEvent, type SlashCommandEvent } from '../../src/handlers/slack-command-processor';
+import type { SlackThreadTask } from '../../src/handlers/shared/slack-task-by-thread';
+import { handler, type MentionEvent, type SlashCommandEvent, type ThreadReplyEvent } from '../../src/handlers/slack-command-processor';
 
 function mention(overrides: Partial<MentionEvent> = {}): MentionEvent {
   return {
@@ -375,6 +378,190 @@ describe('slack-command-processor handler', () => {
       expect(createTaskCoreMock).toHaveBeenCalledTimes(1);
       const [reqBody] = createTaskCoreMock.mock.calls[0];
       expect(reqBody.attachments).toBeUndefined();
+    });
+  });
+
+  // ─── ABCA-661: workflow_ref from keyword prefix ──────────────────────────
+
+  describe('workflow_ref passthrough (ABCA-661)', () => {
+    test('mention with workflow_ref passes it through to createTaskCore', async () => {
+      ddbSend.mockResolvedValueOnce({ Item: { status: 'active', platform_user_id: 'cognito-1' } });
+      ddbSend.mockResolvedValue({ Item: { status: 'active' } });
+      fetchMock.mockResolvedValueOnce({
+        ok: true,
+        json: () => Promise.resolve({ ok: true, channel: { is_private: false, is_member: true } }),
+      });
+      createTaskCoreMock.mockResolvedValueOnce({
+        statusCode: 201,
+        body: JSON.stringify({ data: { task_id: 'T1' } }),
+      });
+
+      await handler(mention({
+        text: 'submit org/repo fix the auth bug',
+        workflow_ref: 'coding/decompose-v1',
+      }));
+
+      expect(createTaskCoreMock).toHaveBeenCalledTimes(1);
+      const [reqBody] = createTaskCoreMock.mock.calls[0];
+      expect(reqBody.workflow_ref).toBe('coding/decompose-v1');
+    });
+
+    test('mention without workflow_ref does not pass workflow_ref to createTaskCore', async () => {
+      ddbSend.mockResolvedValueOnce({ Item: { status: 'active', platform_user_id: 'cognito-1' } });
+      ddbSend.mockResolvedValue({ Item: { status: 'active' } });
+      fetchMock.mockResolvedValueOnce({
+        ok: true,
+        json: () => Promise.resolve({ ok: true, channel: { is_private: false, is_member: true } }),
+      });
+      createTaskCoreMock.mockResolvedValueOnce({
+        statusCode: 201,
+        body: JSON.stringify({ data: { task_id: 'T1' } }),
+      });
+
+      await handler(mention({ text: 'submit org/repo fix the auth bug' }));
+
+      expect(createTaskCoreMock).toHaveBeenCalledTimes(1);
+      const [reqBody] = createTaskCoreMock.mock.calls[0];
+      expect(reqBody.workflow_ref).toBeUndefined();
+    });
+  });
+
+  // ─── ABCA-661: ThreadReplyEvent handling ────────────────────────────────
+
+  describe('ThreadReplyEvent handling (ABCA-661)', () => {
+    function threadReplyEvent(taskOverrides: Partial<SlackThreadTask> = {}, replyText = 'please add a docstring'): ThreadReplyEvent {
+      const thread_task: SlackThreadTask = {
+        task_id: 'T99',
+        repo: 'org/repo',
+        pr_number: 7,
+        status: 'COMPLETED',
+        resolved_workflow_id: 'coding/new-task-v1',
+        code_changed: true,
+        ...taskOverrides,
+      };
+      return {
+        source: 'thread_reply',
+        text: replyText,
+        user_id: 'U1',
+        team_id: 'T1',
+        channel_id: 'C1',
+        thread_ts: '100.000',
+        reply_text: replyText,
+        thread_task,
+      };
+    }
+
+    beforeEach(() => {
+      // Default: linked user, active installation
+      ddbSend.mockResolvedValueOnce({ Item: { status: 'active', platform_user_id: 'cognito-1' } });
+      ddbSend.mockResolvedValue({ Item: { status: 'active' } });
+      fetchMock.mockResolvedValue({ ok: true, json: () => Promise.resolve({ ok: true }) });
+    });
+
+    test('PR-iteration: dispatches coding/pr-iteration-v1 when task has a pr_number', async () => {
+      createTaskCoreMock.mockResolvedValueOnce({
+        statusCode: 201,
+        body: JSON.stringify({ data: { task_id: 'T100' } }),
+      });
+
+      await handler(threadReplyEvent({ pr_number: 42, code_changed: true }, 'add a docstring'));
+
+      expect(createTaskCoreMock).toHaveBeenCalledTimes(1);
+      const [reqBody, ctx] = createTaskCoreMock.mock.calls[0];
+      expect(reqBody.workflow_ref).toBe('coding/pr-iteration-v1');
+      expect(reqBody.pr_number).toBe(42);
+      expect(reqBody.repo).toBe('org/repo');
+      expect(reqBody.task_description).toBe('add a docstring');
+      expect(ctx.channelSource).toBe('slack');
+      expect(ctx.channelMetadata.slack_thread_ts).toBe('100.000');
+    });
+
+    test('PR-iteration: falls back to parsing pr_url when pr_number absent', async () => {
+      createTaskCoreMock.mockResolvedValueOnce({
+        statusCode: 201,
+        body: JSON.stringify({ data: { task_id: 'T101' } }),
+      });
+
+      await handler(threadReplyEvent({
+        pr_number: undefined,
+        pr_url: 'https://github.com/org/repo/pull/99',
+        code_changed: true,
+      }));
+
+      expect(createTaskCoreMock).toHaveBeenCalledTimes(1);
+      const [reqBody] = createTaskCoreMock.mock.calls[0];
+      expect(reqBody.workflow_ref).toBe('coding/pr-iteration-v1');
+      expect(reqBody.pr_number).toBe(99);
+    });
+
+    test('clarify-resume: dispatches coding/new-task-v1 when task is in clarify-hold state', async () => {
+      createTaskCoreMock.mockResolvedValueOnce({
+        statusCode: 201,
+        body: JSON.stringify({ data: { task_id: 'T102' } }),
+      });
+
+      await handler(threadReplyEvent({
+        pr_number: undefined,
+        pr_url: undefined,
+        resolved_workflow_id: 'coding/new-task-v1',
+        code_changed: false,
+        answer_text: 'Should this target Node 18 or 20?',
+        task_description: 'upgrade the runtime',
+      }, 'Node 20 please'));
+
+      expect(createTaskCoreMock).toHaveBeenCalledTimes(1);
+      const [reqBody] = createTaskCoreMock.mock.calls[0];
+      expect(reqBody.workflow_ref).toBe('coding/new-task-v1');
+      // The resume description includes original task + question + answer
+      expect(reqBody.task_description).toContain('upgrade the runtime');
+      expect(reqBody.task_description).toContain('Node 20 please');
+    });
+
+    test('no actionable state (no PR, not clarify-hold) — silently ignored', async () => {
+      // Task is running (no PR, code_changed=undefined) — reply is not actionable.
+      await handler(threadReplyEvent({
+        pr_number: undefined,
+        pr_url: undefined,
+        resolved_workflow_id: 'coding/new-task-v1',
+        code_changed: undefined,
+        answer_text: undefined,
+      }));
+
+      expect(createTaskCoreMock).not.toHaveBeenCalled();
+      // No error reply posted
+      const errorReply = fetchMock.mock.calls.find(
+        ([url, opts]) => String(url).includes('chat.postMessage') && String((opts as { body: string }).body).includes(':x:'),
+      );
+      expect(errorReply).toBeFalsy();
+    });
+
+    test('unlinked user prompts /bgagent link', async () => {
+      // Override the first DDB mock to simulate no mapping
+      ddbSend.mockReset();
+      ddbSend.mockResolvedValueOnce({ Item: undefined });
+      ddbSend.mockResolvedValue({ Item: { status: 'active' } });
+
+      await handler(threadReplyEvent());
+
+      expect(createTaskCoreMock).not.toHaveBeenCalled();
+      const reply = fetchMock.mock.calls.find(
+        ([url, opts]) => String(url).includes('chat.postMessage') && String((opts as { body: string }).body).includes('not linked'),
+      );
+      expect(reply).toBeTruthy();
+    });
+
+    test('createTaskCore failure for PR-iteration posts error reply', async () => {
+      createTaskCoreMock.mockResolvedValueOnce({
+        statusCode: 400,
+        body: JSON.stringify({ error: { message: 'PR not found' } }),
+      });
+
+      await handler(threadReplyEvent({ pr_number: 1, code_changed: true }));
+
+      const errorReply = fetchMock.mock.calls.find(
+        ([url, opts]) => String(url).includes('chat.postMessage') && String((opts as { body: string }).body).includes('PR not found'),
+      );
+      expect(errorReply).toBeTruthy();
     });
   });
 });
