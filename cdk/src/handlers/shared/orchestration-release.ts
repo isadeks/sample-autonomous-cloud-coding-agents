@@ -423,9 +423,24 @@ export async function releaseReadyChildren(
       ...(releaseContext.channel_source !== undefined && {
         channelSource: releaseContext.channel_source as ChannelSource,
       }),
-      // Root → 'main' base, no merges (omit so today's off-main behavior
-      // is unchanged). Linear → predecessor branch. Diamond → main + merges.
-      ...(selection.shape !== 'root' && { baseBranch: selection.base_branch }),
+      // Linear (single predecessor) → pin the child's base to that
+      // predecessor's branch so it stacks and its PR shows only its OWN diff.
+      // Root AND diamond → DO NOT pin a base branch: omit it so the agent
+      // detects the repo's REAL default branch and branches off it.
+      //
+      // ABCA-688: pinning ``selection.base_branch`` (which is the hardcoded
+      // ``defaultBranch``, historically 'main') for the diamond / synthetic
+      // integration node was the epic-PR bloat bug. On a repo whose default
+      // branch is NOT 'main' (e.g. a fork whose default is an integration
+      // branch), the integration node branched off a stale 'main', merged the
+      // default-branch-based leaf branches into it, and opened its PR against
+      // 'main' — so the diff was the ENTIRE branch divergence (100 commits /
+      // 700+ files) rather than the handful of files actually changed. Roots
+      // already omitted the base (and produced correctly-scoped PRs), which is
+      // why single-issue tasks were fine and only the epic flow bloated. The
+      // diamond still sees every predecessor's code via ``mergeBranches`` (the
+      // agent merges them onto the detected-default HEAD).
+      ...(selection.shape === 'linear' && { baseBranch: selection.base_branch }),
       ...(selection.merge_branches.length > 0 && { mergeBranches: selection.merge_branches }),
       createTaskCore,
       now,

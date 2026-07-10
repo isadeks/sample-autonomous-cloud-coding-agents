@@ -262,9 +262,9 @@ def setup_repo(config: TaskConfig, progress: Any = None) -> RepoSetup:
         for pred_branch in config.merge_branches:
             _merge_predecessor_branch(repo_dir, pred_branch, notes)
     elif config.base_branch:
-        # #247 A4: stacked child. Branch from the predecessor's branch
-        # (linear) or from main (diamond) so the child sees predecessor
-        # code without waiting for a human merge. fetch the base first —
+        # #247 A4: LINEAR stacked child. Branch from the single predecessor's
+        # branch so the child sees the predecessor's code without waiting for a
+        # human merge, and its PR shows only its OWN diff. fetch the base first —
         # it is an unmerged sibling branch that the fresh clone may not
         # have locally.
         log("SETUP", f"Creating branch {branch} from base {config.base_branch}")
@@ -292,13 +292,27 @@ def setup_repo(config: TaskConfig, progress: Any = None) -> RepoSetup:
             log("SETUP", f"Base branch not found; creating {branch} off HEAD")
             run_cmd(["git", "checkout", "-b", branch], label="create-branch", cwd=repo_dir)
 
-        # Diamond: merge each predecessor branch into this child's branch
-        # so it sees ALL predecessors' code (the base only gave it one).
+        # A linear stack may still carry merge_branches on the restack path;
+        # merge each so the child sees ALL predecessors' code.
         for pred_branch in config.merge_branches:
             _merge_predecessor_branch(repo_dir, pred_branch, notes)
     else:
+        # Root OR diamond (#247 A4 / ABCA-688). Branch off the cloned HEAD,
+        # which is the repo's REAL default branch (``gh repo clone`` checks out
+        # the default). This is deliberately NOT pinned to 'main': pinning a
+        # stale 'main' as the diamond/integration base — on a repo whose default
+        # is a different branch — made the epic's integration PR diff the entire
+        # branch divergence (ABCA-688: 100 commits / 700+ files). Branching off
+        # the real default keeps the PR base correct so it shows only the
+        # actual changes.
         log("SETUP", f"Creating branch: {branch}")
         run_cmd(["git", "checkout", "-b", branch], label="create-branch", cwd=repo_dir)
+
+        # Diamond fan-in: merge each predecessor branch into this child's branch
+        # (off the real default) so it sees ALL predecessors' code. Empty for a
+        # true root — the loop is then a no-op and behavior is unchanged.
+        for pred_branch in config.merge_branches:
+            _merge_predecessor_branch(repo_dir, pred_branch, notes)
 
     # Trust mise config files in the cloned repo (required before mise install
     # AND before every `mise run <task>`). ``mise trust <dir>`` trusts only the

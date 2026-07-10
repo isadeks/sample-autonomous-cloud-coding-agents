@@ -469,6 +469,68 @@ describe('releaseReadyChildren — #331 concurrency throttle', () => {
   });
 });
 
+describe('releaseReadyChildren — ABCA-688: base branch threading by shape', () => {
+  function createOk() {
+    let i = 0;
+    return jest.fn().mockImplementation(() =>
+      Promise.resolve({ statusCode: 201, body: JSON.stringify({ data: { task_id: `T-${i++}` } }) }));
+  }
+
+  test('LINEAR child (one predecessor) pins its base to the predecessor branch', async () => {
+    const ddb = { send: jest.fn().mockResolvedValue({}) };
+    const createTaskCore = createOk();
+    const pred = makeRow({ sub_issue_id: 'A', child_status: 'succeeded', child_branch_name: 'bgagent/taskA/a' });
+    const child = makeRow({ sub_issue_id: 'B', depends_on: ['A'], child_status: 'ready' });
+    await releaseReadyChildren(
+      ddb as never, 'OrchTable', [child], { platform_user_id: 'u1' } as never,
+      createTaskCore as never, NOW, [pred, child], 'main', undefined,
+    );
+    const ctx = createTaskCore.mock.calls[0][1];
+    expect(ctx.channelMetadata.orchestration_base_branch).toBe('bgagent/taskA/a');
+    // Linear stack carries no merge list (it stacks directly).
+    expect(ctx.channelMetadata.orchestration_merge_branches).toBeUndefined();
+  });
+
+  test('DIAMOND / integration child (2+ predecessors) does NOT pin a base branch — regression for the huge epic PR', async () => {
+    // ABCA-688: pinning the hardcoded default ('main') as the diamond base made
+    // the integration PR diff the whole branch divergence on a repo whose real
+    // default is not 'main'. The diamond must OMIT the base so the agent
+    // branches off the repo's detected default, and merge predecessors instead.
+    const ddb = { send: jest.fn().mockResolvedValue({}) };
+    const createTaskCore = createOk();
+    const b = makeRow({ sub_issue_id: 'B', child_status: 'succeeded', child_branch_name: 'bgagent/taskB/b' });
+    const c = makeRow({ sub_issue_id: 'C', child_status: 'succeeded', child_branch_name: 'bgagent/taskC/c' });
+    const integration = makeRow({
+      sub_issue_id: 'orch_abc__integration', depends_on: ['B', 'C'], child_status: 'ready',
+    });
+    await releaseReadyChildren(
+      ddb as never, 'OrchTable', [integration], { platform_user_id: 'u1' } as never,
+      // A non-'main' default here mirrors the failing repo (default = a
+      // long-lived integration branch). The bug pinned this as the base.
+      createTaskCore as never, NOW, [b, c, integration], 'linear-vercel', undefined,
+    );
+    const ctx = createTaskCore.mock.calls[0][1];
+    // The key assertion: NO base branch pinned (agent detects the real default).
+    expect(ctx.channelMetadata.orchestration_base_branch).toBeUndefined();
+    // But it still sees every predecessor's code via the merge list.
+    expect(ctx.channelMetadata.orchestration_merge_branches)
+      .toBe(JSON.stringify(['bgagent/taskB/b', 'bgagent/taskC/c']));
+  });
+
+  test('ROOT child pins no base branch and carries no merges (unchanged)', async () => {
+    const ddb = { send: jest.fn().mockResolvedValue({}) };
+    const createTaskCore = createOk();
+    const root = makeRow({ sub_issue_id: 'R', depends_on: [], child_status: 'ready' });
+    await releaseReadyChildren(
+      ddb as never, 'OrchTable', [root], { platform_user_id: 'u1' } as never,
+      createTaskCore as never, NOW, [root], 'linear-vercel', undefined,
+    );
+    const ctx = createTaskCore.mock.calls[0][1];
+    expect(ctx.channelMetadata.orchestration_base_branch).toBeUndefined();
+    expect(ctx.channelMetadata.orchestration_merge_branches).toBeUndefined();
+  });
+});
+
 describe('readConcurrencyBudget — #331', () => {
   test('free budget = cap - active_count', async () => {
     const ddb = { send: jest.fn().mockResolvedValue({ Item: { active_count: 3 } }) };
