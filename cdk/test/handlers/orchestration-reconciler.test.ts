@@ -412,7 +412,9 @@ describe('reconcileDecomposePlan — idempotency (live-caught: ABCA-498 3 duplic
 /** Mock the GSI lookup + loadOrchestration Query for a child set. */
 function mockOrchestration(opts: {
   subIssueId: string;
-  children: Array<{ sub_issue_id: string; depends_on?: string[]; child_status: string }>;
+  children: Array<{ sub_issue_id: string; depends_on?: string[]; child_status: string; child_branch_name?: string }>;
+  /** ABCA-687: default_branch stamped on the meta row (epic PR base). */
+  defaultBranch?: string;
 }): void {
   // Stateful, query-type-aware mock (robust to the reconciler's read
   // pattern: GSI lookup + possibly-repeated loadOrchestration + status
@@ -427,6 +429,7 @@ function mockOrchestration(opts: {
     repo: 'o/r',
     child_count: opts.children.length,
     platform_user_id: 'user-1',
+    ...(opts.defaultBranch !== undefined && { default_branch: opts.defaultBranch }),
   };
   const rows: Record<string, Record<string, unknown>> = {};
   for (const c of opts.children) {
@@ -438,6 +441,7 @@ function mockOrchestration(opts: {
       repo: 'o/r',
       parent_linear_issue_id: 'PARENT',
       linear_workspace_id: 'WS',
+      ...(c.child_branch_name !== undefined && { child_branch_name: c.child_branch_name }),
     };
   }
   ddbSend.mockImplementation(async (cmd: { _type: string; input: Record<string, unknown> }) => {
@@ -483,6 +487,44 @@ describe('orchestration-reconciler handler', () => {
     expect(createTaskCoreMock).toHaveBeenCalledTimes(1);
     const ctx = createTaskCoreMock.mock.calls[0][1];
     expect(ctx.idempotencyKey).toBe('orch_1_B');
+  });
+
+  test('ABCA-687: threads the meta default_branch (not a literal main) into a diamond release base', async () => {
+    // D depends on two finished predecessors (A, C) with branches → diamond →
+    // selectBaseBranch returns base = the repo default branch (the epic PR
+    // base). The reconciler must pass meta.default_branch, not a hardcoded main.
+    mockOrchestration({
+      subIssueId: 'C',
+      defaultBranch: 'linear-vercel',
+      children: [
+        { sub_issue_id: 'A', child_status: 'succeeded', child_branch_name: 'bgagent/A' },
+        { sub_issue_id: 'C', child_status: 'released', child_branch_name: 'bgagent/C' },
+        { sub_issue_id: 'D', depends_on: ['A', 'C'], child_status: 'blocked' },
+      ],
+    });
+    await handler({ Records: [taskRecord({ task_id: 'TC', status: 'COMPLETED', orchestration_id: 'orch_1' })] } as never);
+
+    expect(createTaskCoreMock).toHaveBeenCalledTimes(1);
+    const ctx = createTaskCoreMock.mock.calls[0][1];
+    // Diamond base is the resolved trunk, NOT 'main'.
+    expect(ctx.channelMetadata.orchestration_base_branch).toBe('linear-vercel');
+  });
+
+  test('ABCA-687: a legacy meta with no default_branch degrades the diamond base to main', async () => {
+    mockOrchestration({
+      subIssueId: 'C',
+      // no defaultBranch on the meta row (seeded before ABCA-687)
+      children: [
+        { sub_issue_id: 'A', child_status: 'succeeded', child_branch_name: 'bgagent/A' },
+        { sub_issue_id: 'C', child_status: 'released', child_branch_name: 'bgagent/C' },
+        { sub_issue_id: 'D', depends_on: ['A', 'C'], child_status: 'blocked' },
+      ],
+    });
+    await handler({ Records: [taskRecord({ task_id: 'TC', status: 'COMPLETED', orchestration_id: 'orch_1' })] } as never);
+
+    expect(createTaskCoreMock).toHaveBeenCalledTimes(1);
+    const ctx = createTaskCoreMock.mock.calls[0][1];
+    expect(ctx.channelMetadata.orchestration_base_branch).toBe('main'); // last-resort fallback
   });
 
   test('A fails → no release, B skipped (createTaskCore not called)', async () => {

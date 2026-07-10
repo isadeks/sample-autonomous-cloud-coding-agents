@@ -93,6 +93,7 @@ import {
 import { DEFAULT_MAX_SUB_ISSUES, type DecompositionPlan, type PlannedSubIssue } from './shared/orchestration-decomposition-types';
 import { linearGraphqlFn } from './shared/orchestration-decomposition-writeback';
 import { discoverOrchestration } from './shared/orchestration-discovery';
+import { resolveRepoGithubToken } from './shared/orchestration-github-token';
 import { declarativeGraphSource } from './shared/orchestration-graph-source';
 import {
   parseParentNodeReference,
@@ -567,6 +568,11 @@ export async function handler(event: ProcessorEvent): Promise<void> {
       linear_project_id: projectId,
     };
 
+    // ABCA-687: resolve a GitHub token so discovery can look up the repo's
+    // real default branch (the epic PR base). Best-effort — undefined falls
+    // back to 'main' inside the resolver.
+    const githubToken = await resolveRepoGithubToken(repo);
+
     const discovery = await discoverOrchestration({
       ddb,
       tableName: ORCHESTRATION_TABLE,
@@ -576,6 +582,7 @@ export async function handler(event: ProcessorEvent): Promise<void> {
       repo,
       now: new Date().toISOString(),
       releaseContext,
+      ...(githubToken !== undefined && { githubToken }),
     });
 
     if (discovery.kind === 'rejected') {
@@ -625,9 +632,11 @@ export async function handler(event: ProcessorEvent): Promise<void> {
           snapshot.meta.release_context,
           createTaskCore,
           new Date().toISOString(),
-          // full child set for A4 base selection (roots have no preds → off-main)
+          // full child set for A4 base selection (roots have no preds → off-trunk)
           snapshot.children,
-          'main',
+          // ABCA-687: the resolved repo default branch (seeded on the meta row),
+          // not a hardcoded 'main'.
+          snapshot.meta.default_branch ?? 'main',
           budget,
         );
         releasedRoots = results.filter((r) => r.kind === 'released').length;
@@ -719,7 +728,8 @@ export async function handler(event: ProcessorEvent): Promise<void> {
             createTaskCore,
             new Date().toISOString(),
             snapshot.children, // full set → A4 base branch off finished predecessors
-            'main',
+            // ABCA-687: the resolved repo default branch, not a hardcoded 'main'.
+            snapshot.meta.default_branch ?? 'main',
             budget,
           );
           releasedAdded = results.filter((r) => r.kind === 'released').length;
@@ -1125,13 +1135,15 @@ async function maybeRetryTerminalEpic(
       .filter((c) => plan.toRelease.includes(c.sub_issue_id))
       .map((c) => ({ ...c, child_status: 'ready' as const }));
     if (releasableRows.length > 0) {
-      const releaseCtx = (fresh ?? snapshot).meta.release_context;
+      const releaseMeta = (fresh ?? snapshot).meta;
+      const releaseCtx = releaseMeta.release_context;
       const budget = USER_CONCURRENCY_TABLE
         ? await readConcurrencyBudget(ddb, USER_CONCURRENCY_TABLE, releaseCtx.platform_user_id, MAX_CONCURRENT)
         : undefined;
       await releaseReadyChildren(
         ddb, ORCHESTRATION_TABLE, releasableRows, releaseCtx,
-        createTaskCore, now, freshChildren, 'main', budget,
+        // ABCA-687: the resolved repo default branch, not a hardcoded 'main'.
+        createTaskCore, now, freshChildren, releaseMeta.default_branch ?? 'main', budget,
         // ABCA-659: salt the idempotency key with each child's prior (failed)
         // task id so the retry spawns a NEW task instead of idempotently
         // replaying the failed one. releasableRows carry the old child_task_id
@@ -1274,6 +1286,10 @@ async function seedAndReleaseFromGraph(args: {
     linear_project_id: projectId,
   };
 
+  // ABCA-687: resolve a GitHub token so discovery seeds the real default
+  // branch (best-effort → 'main' fallback).
+  const githubToken = await resolveRepoGithubToken(repo);
+
   const discovery = await discoverOrchestration({
     ddb,
     tableName: ORCHESTRATION_TABLE,
@@ -1285,6 +1301,7 @@ async function seedAndReleaseFromGraph(args: {
     now: new Date().toISOString(),
     releaseContext,
     graphSource: declarativeGraphSource(children),
+    ...(githubToken !== undefined && { githubToken }),
   });
 
   if (discovery.kind !== 'seeded') {
@@ -1305,7 +1322,9 @@ async function seedAndReleaseFromGraph(args: {
       : undefined;
     await releaseReadyChildren(
       ddb, ORCHESTRATION_TABLE, snapshot.children, snapshot.meta.release_context,
-      createTaskCore, new Date().toISOString(), snapshot.children, 'main', budget,
+      // ABCA-687: the resolved repo default branch, not a hardcoded 'main'.
+      createTaskCore, new Date().toISOString(), snapshot.children,
+      snapshot.meta.default_branch ?? 'main', budget,
     );
   }
   // Post the maturing panel (same as the native-graph seed path).

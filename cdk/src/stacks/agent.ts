@@ -854,6 +854,10 @@ export class AgentStack extends Stack {
       // Image attachments extracted from issue descriptions upload here
       // (otherwise createTaskCore 503s "Attachment storage is not configured").
       attachmentsBucket: attachmentsBucket.bucket,
+      // ABCA-687: the webhook processor resolves the seeded epic's repo default
+      // branch via the GitHub REST API before seeding, so child + integration
+      // PRs target the real trunk instead of a hardcoded 'main'.
+      githubTokenSecret,
     });
 
     // #247 Mode A: the reconciler consumes the TaskTable stream and
@@ -924,6 +928,15 @@ export class AgentStack extends Stack {
         }),
       ],
     }));
+    // ABCA-687: the :auto decompose seed path resolves the repo's default
+    // branch (the epic PR base) via the GitHub REST API before seeding, which
+    // needs the platform GitHub token. Surface the ARN + grant read so the
+    // seed stamps the real trunk instead of falling back to 'main'.
+    githubTokenSecret.grantRead(orchestrationReconciler.fn);
+    orchestrationReconciler.fn.addEnvironment(
+      'GITHUB_TOKEN_SECRET_ARN',
+      githubTokenSecret.secretArn,
+    );
     // #299 agent-native planning: a terminal ``coding/decompose-v1`` task lands
     // here (it's a TaskTable stream record like any other), and the reconciler
     // reads the plan artifact the agent uploaded to ``artifacts/<task_id>/`` to

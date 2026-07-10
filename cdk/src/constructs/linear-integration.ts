@@ -116,6 +116,15 @@ export interface LinearIntegrationProps {
   /** Task retention in days for TTL computation. */
   readonly taskRetentionDays?: number;
 
+  /**
+   * Platform GitHub token secret (ABCA-687). When provided alongside
+   * ``orchestrationTable``, the webhook processor resolves the seeded epic's
+   * repo default branch via the GitHub REST API before seeding, so child +
+   * integration PRs target the real trunk instead of a hardcoded ``main``.
+   * Omitted → the seed falls back to ``'main'`` (historical behaviour).
+   */
+  readonly githubTokenSecret?: secretsmanager.ISecret;
+
   /** Removal policy for Linear DynamoDB tables. */
   readonly removalPolicy?: RemovalPolicy;
 }
@@ -295,6 +304,14 @@ export class LinearIntegration extends Construct {
     props.taskEventsTable.grantReadWriteData(webhookProcessorFn);
     if (props.repoTable) {
       props.repoTable.grantReadData(webhookProcessorFn);
+    }
+    // ABCA-687: the orchestration seed path resolves the repo's default branch
+    // via the GitHub REST API (needs the platform token) before seeding, so
+    // epic child + integration PRs target the real trunk. Only wired when the
+    // orchestration path is active; the resolver degrades to 'main' otherwise.
+    if (props.orchestrationTable && props.githubTokenSecret) {
+      props.githubTokenSecret.grantRead(webhookProcessorFn);
+      webhookProcessorFn.addEnvironment('GITHUB_TOKEN_SECRET_ARN', props.githubTokenSecret.secretArn);
     }
     if (props.orchestratorFunctionArn) {
       webhookProcessorFn.addToRolePolicy(new iam.PolicyStatement({

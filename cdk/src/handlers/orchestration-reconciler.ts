@@ -60,6 +60,7 @@ import { getPendingPlan, putPendingPlan, replacePendingPlan } from './shared/orc
 import type { PlannedSubIssue, ProjectDecompositionCaps } from './shared/orchestration-decomposition-types';
 import { linearGraphqlFn } from './shared/orchestration-decomposition-writeback';
 import { discoverOrchestration } from './shared/orchestration-discovery';
+import { resolveRepoGithubToken } from './shared/orchestration-github-token';
 import { declarativeGraphSource } from './shared/orchestration-graph-source';
 import { isIntegrationNode } from './shared/orchestration-integration-node';
 import { ORCH_LOG } from './shared/orchestration-log-events';
@@ -583,7 +584,8 @@ async function reconcileTerminalChild(evt: TerminalTaskEvent): Promise<void> {
     .map((c) => ({ ...c, child_status: 'ready' as const }));
 
   if (releasableRows.length > 0) {
-    const releaseCtx = (fresh ?? snapshot).meta.release_context;
+    const releaseMeta = (fresh ?? snapshot).meta;
+    const releaseCtx = releaseMeta.release_context;
     // #331: throttle this pass to the user's free concurrency budget so a
     // wide fan-out doesn't over-release children that admission then
     // hard-fails (the cap is a throttle, not a guillotine). Leftover ready
@@ -603,7 +605,10 @@ async function reconcileTerminalChild(evt: TerminalTaskEvent): Promise<void> {
       // #247 A4: pass the full child set so each releasable child's base
       // branch can be derived from its predecessors' persisted branches.
       freshChildren,
-      'main',
+      // ABCA-687: the resolved repo default branch (roots + diamond bases),
+      // not a hardcoded 'main'. Falls back to 'main' only for meta rows seeded
+      // before this field existed.
+      releaseMeta.default_branch ?? 'main',
       budget,
     );
     logger.info('Reconciler released children', {
@@ -931,7 +936,8 @@ async function maybeRecoverFailedNode(
       .filter((c) => plan.toRelease.includes(c.sub_issue_id))
       .map((c) => ({ ...c, child_status: 'ready' as const }));
     if (releasableRows.length > 0) {
-      const releaseCtx = (fresh ?? snapshot).meta.release_context;
+      const releaseMeta = (fresh ?? snapshot).meta;
+      const releaseCtx = releaseMeta.release_context;
       const budget = USER_CONCURRENCY_TABLE
         ? await readConcurrencyBudget(ddb, USER_CONCURRENCY_TABLE, releaseCtx.platform_user_id, MAX_CONCURRENT)
         : undefined;
@@ -943,7 +949,8 @@ async function maybeRecoverFailedNode(
         createTaskCore,
         now,
         freshChildren,
-        'main',
+        // ABCA-687: the resolved repo default branch, not a hardcoded 'main'.
+        releaseMeta.default_branch ?? 'main',
         budget,
       );
       logger.info('A6 recovery: re-released children', {
@@ -1677,6 +1684,10 @@ async function seedDecomposedGraph(
     linear_workspace_slug: workspaceSlug,
     linear_project_id: evt.projectId,
   };
+  // ABCA-687: resolve a GitHub token so discovery seeds the repo's real
+  // default branch (the epic PR base). Best-effort → 'main' fallback.
+  const githubToken = await resolveRepoGithubToken(evt.repo);
+
   const discovery = await discoverOrchestration({
     ddb,
     tableName: ORCHESTRATION_TABLE,
@@ -1687,6 +1698,7 @@ async function seedDecomposedGraph(
     now: new Date().toISOString(),
     releaseContext,
     graphSource: declarativeGraphSource(children),
+    ...(githubToken !== undefined && { githubToken }),
   });
   if (discovery.kind !== 'seeded') {
     logger.info('Decompose :auto seed: discovery non-seeded', { parent_issue_id: evt.parentIssueId, kind: discovery.kind });
@@ -1699,7 +1711,10 @@ async function seedDecomposedGraph(
       : undefined;
     await releaseReadyChildren(
       ddb, ORCHESTRATION_TABLE, snapshot.children, snapshot.meta.release_context,
-      createTaskCore, new Date().toISOString(), snapshot.children, 'main', budget,
+      // ABCA-687: the resolved repo default branch (seeded on the meta row),
+      // not a hardcoded 'main'.
+      createTaskCore, new Date().toISOString(), snapshot.children,
+      snapshot.meta.default_branch ?? 'main', budget,
     );
   }
   if (WORKSPACE_REGISTRY_TABLE) {

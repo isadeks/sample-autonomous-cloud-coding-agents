@@ -195,7 +195,9 @@ async function reconcileOrchestration(orchestrationId: string): Promise<number> 
     ddb, ORCHESTRATION_TABLE, releasableRows, fresh.meta.release_context, createTaskCore, now,
     // #247 A4: full child set for predecessor-branch-derived base selection.
     fresh.children,
-    'main',
+    // ABCA-687: the resolved repo default branch (seeded on the meta row),
+    // not a hardcoded 'main'.
+    fresh.meta.default_branch ?? 'main',
     budget,
   );
   const released = results.filter((r) => r.kind === 'released').length;

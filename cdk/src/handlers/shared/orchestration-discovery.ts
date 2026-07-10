@@ -47,6 +47,7 @@ import type { DynamoDBDocumentClient } from '@aws-sdk/lib-dynamodb';
 import type { FetchSubIssueGraphOptions } from './linear-subissue-fetch';
 import { logger } from './logger';
 import { validateDag } from './orchestration-dag';
+import { resolveRepoDefaultBranch } from './orchestration-default-branch';
 import {
   linearGraphSource,
   type OrchestrationGraphSource,
@@ -83,6 +84,20 @@ export interface DiscoverOrchestrationParams {
    * graph produced any way.
    */
   readonly graphSource?: OrchestrationGraphSource;
+  /**
+   * ABCA-687: GitHub token used to resolve the repo's default branch before
+   * seeding, so the epic release path (child + integration PRs) targets the
+   * real trunk instead of a hardcoded ``main``. When absent (or resolution
+   * fails), the seed falls back to ``'main'`` — the last-resort base, never
+   * the primary base when the trunk is known.
+   */
+  readonly githubToken?: string;
+  /**
+   * ABCA-687: test seam for the default-branch resolver. Defaults to
+   * {@link resolveRepoDefaultBranch} (a live GitHub REST lookup). Injected in
+   * unit tests to avoid real HTTP.
+   */
+  readonly resolveDefaultBranch?: (repo: string, token?: string) => Promise<string>;
 }
 
 export type DiscoverOrchestrationResult =
@@ -115,7 +130,12 @@ export type DiscoverOrchestrationResult =
 export async function discoverOrchestration(
   params: DiscoverOrchestrationParams,
 ): Promise<DiscoverOrchestrationResult> {
-  const { ddb, tableName, accessToken, parentLinearIssueId, linearWorkspaceId, repo, now, ttl, releaseContext, fetchOptions, graphSource } = params;
+  const {
+    ddb, tableName, accessToken, parentLinearIssueId, linearWorkspaceId, repo,
+    now, ttl, releaseContext, fetchOptions, graphSource, githubToken,
+  } = params;
+  const resolveDefaultBranch = params.resolveDefaultBranch
+    ?? ((r: string, token?: string) => resolveRepoDefaultBranch({ repo: r, token }));
 
   // ── 1. Produce the orchestration graph ───────────────────────────
   // Default to the Linear native source (Mode A); a declarative / planner
@@ -175,6 +195,12 @@ export async function discoverOrchestration(
     }
   }
 
+  // ── 2c. ABCA-687: resolve the repo's default branch so the epic release
+  // path (child + integration PRs) targets the real trunk, not a hardcoded
+  // ``main``. Never throws — resolution failure degrades to ``'main'`` inside
+  // the resolver. Persisted on the meta row by seedOrchestration below.
+  const defaultBranch = await resolveDefaultBranch(repo, githubToken);
+
   // ── 3. Persist (idempotent on replay) ────────────────────────────
   let seedResult;
   try {
@@ -187,6 +213,7 @@ export async function discoverOrchestration(
       children: childrenToSeed,
       now,
       releaseContext,
+      defaultBranch,
       ...(ttl !== undefined && { ttl }),
     });
   } catch (err) {
