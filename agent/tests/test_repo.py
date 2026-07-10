@@ -118,6 +118,37 @@ class TestSetupRepoHappyPath:
         assert "head-sha-after-setup" not in fake.labels()
 
 
+class TestWarmDependencyCache:
+    """ABCA-691: setup_repo invokes the warm dependency cache after mise install
+    (and before the baseline build), and folds its notes into RepoSetup.notes.
+    The cache logic itself is unit-tested in test_dep_cache.py; here we assert the
+    wiring — setup_repo calls it exactly once with the clone dir and surfaces its
+    notes."""
+
+    def test_setup_repo_invokes_warm_cache_and_records_notes(self, monkeypatch):
+        fake = _fake_run_cmd()
+        _patch_common(monkeypatch, fake)
+        monkeypatch.setattr(repo, "detect_default_branch", lambda url, d: "main")
+
+        calls = []
+
+        import dep_cache
+
+        def fake_warm(repo_dir, **kwargs):
+            calls.append(repo_dir)
+            return ["dependency cache HIT: node_modules — skipped install"]
+
+        monkeypatch.setattr(dep_cache, "warm_dependency_cache", fake_warm)
+
+        setup = repo.setup_repo(_config())
+
+        # Called once, with the clone dir.
+        assert len(calls) == 1
+        assert calls[0].endswith("/task-abc")
+        # Its note is folded into the setup notes the PR/telemetry read.
+        assert any("dependency cache HIT" in n for n in setup.notes)
+
+
 class TestReadOnlyBaselineSkip:
     """#299 ECS_RIGHTSIZED_PLANNING: a read_only workflow (coding/decompose-v1)
     never edits code, runs the post-agent gate, or opens a PR, so the pre-agent

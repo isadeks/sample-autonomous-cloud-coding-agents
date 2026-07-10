@@ -339,6 +339,17 @@ def setup_repo(config: TaskConfig, progress: Any = None) -> RepoSetup:
     else:
         notes.append("mise install: OK")
 
+    # Warm dependency cache (ABCA-691): restore node_modules / .venv from the
+    # shared /cache volume when the target repo's lockfile hash matches a prior
+    # task's, else cold-install and populate the entry for the next task. Keyed on
+    # the lockfile hash (never the commit SHA) so a trunk dependency bump misses
+    # and reinstalls — impossible to build against stale deps. Best-effort: a
+    # missing/corrupt cache or an unmounted /cache volume degrades to the normal
+    # cold install and never fails the task.
+    from dep_cache import warm_dependency_cache
+
+    notes.extend(warm_dependency_cache(repo_dir))
+
     # Initial build (record whether the project builds before agent changes).
     # #1: use the repo's configured build command (default mise run build).
     from post_hooks import (
