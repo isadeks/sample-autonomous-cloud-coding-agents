@@ -459,6 +459,108 @@ describe('EcsAgentCluster construct', () => {
   });
 });
 
+describe('EcsAgentCluster warm dependency cache (ABCA-691)', () => {
+  let cacheTemplate: Template;
+
+  beforeAll(() => {
+    cacheTemplate = createStack().template;
+  });
+
+  test('creates an encrypted EFS filesystem with an access point', () => {
+    cacheTemplate.resourceCountIs('AWS::EFS::FileSystem', 1);
+    cacheTemplate.hasResourceProperties('AWS::EFS::FileSystem', {
+      Encrypted: true,
+    });
+    // An access point roots the container at /dep-cache with the agent's POSIX uid.
+    cacheTemplate.hasResourceProperties('AWS::EFS::AccessPoint', {
+      RootDirectory: {
+        Path: '/dep-cache',
+        CreationInfo: {
+          OwnerUid: '1000',
+          OwnerGid: '1000',
+          Permissions: '750',
+        },
+      },
+      PosixUser: { Uid: '1000', Gid: '1000' },
+    });
+  });
+
+  test('mounts the cache into the BUILD def at /cache with transit encryption + IAM auth', () => {
+    const taskDefs = cacheTemplate.findResources('AWS::ECS::TaskDefinition');
+    const buildDef = Object.values(taskDefs).find(
+      d => d.Properties.Cpu === '16384' && d.Properties.Memory === '122880',
+    );
+    expect(buildDef).toBeDefined();
+    // The task def declares the EFS volume with encryption + access-point IAM auth.
+    const volumes = buildDef!.Properties.Volumes ?? [];
+    const cacheVol = volumes.find((v: { Name: string }) => v.Name === 'dep-cache');
+    expect(cacheVol).toBeDefined();
+    expect(cacheVol.EFSVolumeConfiguration.TransitEncryption).toBe('ENABLED');
+    expect(cacheVol.EFSVolumeConfiguration.AuthorizationConfig.IAM).toBe('ENABLED');
+    expect(cacheVol.EFSVolumeConfiguration.AuthorizationConfig.AccessPointId).toBeDefined();
+    // The container mounts it read-write at /cache.
+    const mounts = buildDef!.Properties.ContainerDefinitions[0].MountPoints ?? [];
+    const cacheMount = mounts.find((m: { ContainerPath: string }) => m.ContainerPath === '/cache');
+    expect(cacheMount).toBeDefined();
+    expect(cacheMount.SourceVolume).toBe('dep-cache');
+    expect(cacheMount.ReadOnly).toBe(false);
+    // …and the agent is told where the cache is mounted.
+    const env = buildDef!.Properties.ContainerDefinitions[0].Environment ?? [];
+    expect(env.some((e: { Name: string; Value: string }) => e.Name === 'DEP_CACHE_DIR' && e.Value === '/cache')).toBe(true);
+  });
+
+  test('the read-only PLANNING def does NOT mount the cache (it never installs deps)', () => {
+    const taskDefs = cacheTemplate.findResources('AWS::ECS::TaskDefinition');
+    const planningDef = Object.values(taskDefs).find(
+      d => d.Properties.Cpu === '2048' && d.Properties.Memory === '8192',
+    );
+    expect(planningDef).toBeDefined();
+    const volumes = planningDef!.Properties.Volumes ?? [];
+    expect(volumes.some((v: { Name: string }) => v.Name === 'dep-cache')).toBe(false);
+    const mounts = planningDef!.Properties.ContainerDefinitions[0].MountPoints ?? [];
+    expect(mounts.some((m: { ContainerPath: string }) => m.ContainerPath === '/cache')).toBe(false);
+    const env = planningDef!.Properties.ContainerDefinitions[0].Environment ?? [];
+    expect(env.some((e: { Name: string }) => e.Name === 'DEP_CACHE_DIR')).toBe(false);
+  });
+
+  test('task role can mount + write the cache EFS, scoped to the access point (never ClientRootAccess)', () => {
+    const policies = cacheTemplate.findResources('AWS::IAM::Policy');
+    let efsStatement: { Action: string | string[]; Resource: unknown; Condition?: unknown } | undefined;
+    for (const p of Object.values(policies)) {
+      for (const s of p.Properties.PolicyDocument.Statement) {
+        const actions = Array.isArray(s.Action) ? s.Action : [s.Action];
+        if (actions.includes('elasticfilesystem:ClientMount')) efsStatement = s;
+      }
+    }
+    expect(efsStatement).toBeDefined();
+    const actions = Array.isArray(efsStatement!.Action) ? efsStatement!.Action : [efsStatement!.Action];
+    expect(actions).toContain('elasticfilesystem:ClientWrite');
+    // Never root access — the access point already pins the POSIX identity.
+    expect(actions).not.toContain('elasticfilesystem:ClientRootAccess');
+    // Gated on the access point ARN so the task can only touch /dep-cache.
+    const cond = JSON.stringify(efsStatement!.Condition ?? {});
+    expect(cond).toContain('elasticfilesystem:AccessPointArn');
+  });
+
+  test('the task security group can egress NFS (2049) to the cache filesystem', () => {
+    // The task SG is allowAllOutbound:false (HTTPS-only by default) — a 2049
+    // egress rule to the EFS mount targets must be added or the mount hangs.
+    const sgEgress = cacheTemplate.findResources('AWS::EC2::SecurityGroupEgress');
+    const has2049 = Object.values(sgEgress).some(
+      r => r.Properties.FromPort === 2049 && r.Properties.ToPort === 2049,
+    );
+    // CDK may inline the egress on the SG resource OR emit a separate
+    // SecurityGroupEgress; accept either.
+    const sgs = cacheTemplate.findResources('AWS::EC2::SecurityGroup');
+    const inline2049 = Object.values(sgs).some(sg =>
+      (sg.Properties.SecurityGroupEgress ?? []).some(
+        (e: { FromPort?: number; ToPort?: number }) => e.FromPort === 2049 && e.ToPort === 2049,
+      ),
+    );
+    expect(has2049 || inline2049).toBe(true);
+  });
+});
+
 describe('EcsAgentCluster payload bucket (#502)', () => {
   function createWithPayloadBucket(): Template {
     const app = new App();
