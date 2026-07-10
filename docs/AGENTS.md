@@ -12,6 +12,8 @@ mise //docs:build           # sync + Astro/Starlight build
 mise //docs:check           # sync + astro check (MDX/components)
 ```
 
+All commands are namespaced under `mise //docs:` and can be run from any directory in the repo.
+
 Pre-commit hook `docs-sync` runs sync automatically when prek hooks are installed.
 
 ## Testing
