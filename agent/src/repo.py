@@ -325,6 +325,19 @@ def setup_repo(config: TaskConfig, progress: Any = None) -> RepoSetup:
             check=False,
         )
 
+    # Warm dependency cache (ABCA-691): restore node_modules / .venv from the
+    # shared /cache volume BEFORE any install/build runs, keyed on the lockfile
+    # hash so a hit can only reuse artifacts built from the exact same lockfiles.
+    # The repo's own install (driven by the build command / mise install) still
+    # runs and validates the restored tree, so a hit produces the identical
+    # result a cold install would — it just skips the multi-minute network
+    # download. Best-effort: a miss / no cache volume leaves the clone untouched
+    # and the install runs cold. Populated at the END of setup (below), once the
+    # baseline build has produced the artifacts.
+    from dependency_cache import populate_dependency_cache, restore_dependency_cache
+
+    restore_dependency_cache(repo_dir, notes)
+
     # mise install (deterministic — not left to the LLM)
     log("SETUP", "Running mise install...")
     result = run_cmd(
@@ -536,6 +549,13 @@ def setup_repo(config: TaskConfig, progress: Any = None) -> RepoSetup:
         )
         if head_res.returncode == 0:
             head_sha_before = head_res.stdout.strip()
+
+    # Publish the freshly-installed dependency artifacts into the shared warm
+    # cache (ABCA-691) so the NEXT task on the same lockfiles hits. Runs after
+    # the install + baseline build have populated node_modules / .venv. Atomic
+    # write-to-temp-then-rename; a no-op when an entry already exists (this task
+    # hit, or a concurrent task won the publish race). Best-effort — never fails.
+    populate_dependency_cache(repo_dir, notes)
 
     return RepoSetup(
         repo_dir=repo_dir,

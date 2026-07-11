@@ -381,6 +381,122 @@ describe('EcsAgentCluster construct', () => {
     });
   });
 
+  // ABCA-691: warm dependency cache. An EFS filesystem + access point is mounted
+  // into the BUILD task def at /cache so consecutive tasks on the same lockfiles
+  // reuse node_modules / .venv instead of paying the cold install every time.
+  describe('warm dependency cache (ABCA-691)', () => {
+    test('creates one encrypted EFS filesystem', () => {
+      baseTemplate.resourceCountIs('AWS::EFS::FileSystem', 1);
+      baseTemplate.hasResourceProperties('AWS::EFS::FileSystem', {
+        Encrypted: true,
+      });
+    });
+
+    test('creates an EFS access point that squashes to the container POSIX user (uid/gid 1000)', () => {
+      baseTemplate.resourceCountIs('AWS::EFS::AccessPoint', 1);
+      baseTemplate.hasResourceProperties('AWS::EFS::AccessPoint', {
+        PosixUser: { Uid: '1000', Gid: '1000' },
+        RootDirectory: {
+          Path: '/dependency-cache',
+          CreationInfo: { OwnerUid: '1000', OwnerGid: '1000', Permissions: '0755' },
+        },
+      });
+    });
+
+    test('mounts the cache EFS volume into the BUILD def at /cache (read-write) but NOT the planning def', () => {
+      const taskDefs = baseTemplate.findResources('AWS::ECS::TaskDefinition');
+      const build = Object.values(taskDefs).find(
+        d => d.Properties.Cpu === '16384' && d.Properties.Memory === '122880',
+      );
+      const planning = Object.values(taskDefs).find(
+        d => d.Properties.Cpu === '2048' && d.Properties.Memory === '8192',
+      );
+      expect(build).toBeDefined();
+      expect(planning).toBeDefined();
+
+      // BUILD def carries the EFS volume + a /cache mount point.
+      const buildVolumes = build!.Properties.Volumes ?? [];
+      expect(buildVolumes.some((v: { EFSVolumeConfiguration?: unknown }) => v.EFSVolumeConfiguration)).toBe(true);
+      const buildMounts = build!.Properties.ContainerDefinitions[0].MountPoints ?? [];
+      expect(buildMounts.some((m: { ContainerPath: string; ReadOnly?: boolean }) =>
+        m.ContainerPath === '/cache' && !m.ReadOnly,
+      )).toBe(true);
+
+      // PLANNING def has NO EFS volume/mount — a read-only planner installs nothing.
+      const planningVolumes = planning!.Properties.Volumes ?? [];
+      expect(planningVolumes.some((v: { EFSVolumeConfiguration?: unknown }) => v.EFSVolumeConfiguration)).toBe(false);
+      const planningMounts = planning!.Properties.ContainerDefinitions[0].MountPoints ?? [];
+      expect(planningMounts.some((m: { ContainerPath: string }) => m.ContainerPath === '/cache')).toBe(false);
+    });
+
+    test('the EFS volume uses transit encryption + IAM authorization via the access point', () => {
+      const taskDefs = baseTemplate.findResources('AWS::ECS::TaskDefinition');
+      const build = Object.values(taskDefs).find(
+        d => d.Properties.Cpu === '16384' && d.Properties.Memory === '122880',
+      );
+      const efsVolume = (build!.Properties.Volumes ?? []).find(
+        (v: { EFSVolumeConfiguration?: unknown }) => v.EFSVolumeConfiguration,
+      );
+      expect(efsVolume.EFSVolumeConfiguration.TransitEncryption).toBe('ENABLED');
+      expect(efsVolume.EFSVolumeConfiguration.AuthorizationConfig.IAM).toBe('ENABLED');
+      expect(efsVolume.EFSVolumeConfiguration.AuthorizationConfig.AccessPointId).toBeDefined();
+    });
+
+    test('sets DEPENDENCY_CACHE_DIR=/cache on the BUILD def only (planning installs cold)', () => {
+      const taskDefs = baseTemplate.findResources('AWS::ECS::TaskDefinition');
+      const build = Object.values(taskDefs).find(
+        d => d.Properties.Cpu === '16384' && d.Properties.Memory === '122880',
+      );
+      const planning = Object.values(taskDefs).find(
+        d => d.Properties.Cpu === '2048' && d.Properties.Memory === '8192',
+      );
+      const buildEnv = build!.Properties.ContainerDefinitions[0].Environment ?? [];
+      expect(buildEnv.some((e: { Name: string; Value: string }) =>
+        e.Name === 'DEPENDENCY_CACHE_DIR' && e.Value === '/cache',
+      )).toBe(true);
+      const planningEnv = planning!.Properties.ContainerDefinitions[0].Environment ?? [];
+      expect(planningEnv.some((e: { Name: string }) => e.Name === 'DEPENDENCY_CACHE_DIR')).toBe(false);
+    });
+
+    test('grants the task role EFS client mount + write scoped to the cache filesystem (no ClientRootAccess, no wildcard)', () => {
+      const policies = baseTemplate.findResources('AWS::IAM::Policy');
+      const efsActions = new Set<string>();
+      let efsStatement: { Resource?: unknown } | undefined;
+      for (const p of Object.values(policies)) {
+        for (const s of p.Properties.PolicyDocument.Statement) {
+          const actions = Array.isArray(s.Action) ? s.Action : [s.Action];
+          for (const a of actions) {
+            if (typeof a === 'string' && a.startsWith('elasticfilesystem:')) {
+              efsActions.add(a);
+              efsStatement = s;
+            }
+          }
+        }
+      }
+      expect(efsActions.has('elasticfilesystem:ClientMount')).toBe(true);
+      expect(efsActions.has('elasticfilesystem:ClientWrite')).toBe(true);
+      // Least privilege: root access is squashed by the access point, never granted.
+      expect(efsActions.has('elasticfilesystem:ClientRootAccess')).toBe(false);
+      // Scoped to a concrete filesystem ARN, not a bare wildcard.
+      expect(efsStatement).toBeDefined();
+      expect(efsStatement!.Resource).not.toEqual('*');
+    });
+
+    test('opens NFS (2049) between the task SG and the EFS mount targets', () => {
+      // Ingress on the EFS SG from the task SG, and egress from the task SG.
+      baseTemplate.hasResourceProperties('AWS::EC2::SecurityGroupIngress', {
+        IpProtocol: 'tcp',
+        FromPort: 2049,
+        ToPort: 2049,
+      });
+      baseTemplate.hasResourceProperties('AWS::EC2::SecurityGroupEgress', {
+        IpProtocol: 'tcp',
+        FromPort: 2049,
+        ToPort: 2049,
+      });
+    });
+  });
+
   describe('with a SessionRole wired (#209)', () => {
     function createWithSessionRole(): Template {
       const app = new App();

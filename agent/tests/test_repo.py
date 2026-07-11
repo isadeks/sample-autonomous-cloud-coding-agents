@@ -5,9 +5,11 @@ seams they use — ``shell.run_cmd`` (logged commands) and ``subprocess.run``
 (detect_default_branch) — recording argv and returning scripted results.
 """
 
+import os
 import subprocess
 from types import SimpleNamespace
 
+import dependency_cache
 import repo
 from tests.conftest import FakeRunCmd, make_task_config
 
@@ -648,3 +650,285 @@ class TestSetupRepoDependencyUnreachable:
         assert "set-remote-url" not in labels
         assert "configure-git-credential-helper" not in labels
         assert "safe-directory" in labels  # only the pre-clone step ran
+
+
+# ---------------------------------------------------------------------------
+# ABCA-691: warm dependency cache (lockfile-keyed node_modules / .venv reuse)
+# ---------------------------------------------------------------------------
+
+
+def _write(path: str, content: str = "x") -> None:
+    """Create a file (and its parent dirs) with *content*."""
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w") as handle:
+        handle.write(content)
+
+
+def _make_dir_with_file(path: str, filename: str = "marker", content: str = "data") -> None:
+    """Create directory *path* containing one file (an artifact stand-in)."""
+    os.makedirs(path, exist_ok=True)
+    _write(os.path.join(path, filename), content)
+
+
+class TestHashLockfile:
+    """The cache key is the lockfile hash, NEVER the commit SHA — the crux of the
+    correctness invariant (a changed lockfile must miss)."""
+
+    def test_hash_is_stable_for_identical_bytes(self, tmp_path):
+        a = str(tmp_path / "yarn.a.lock")
+        b = str(tmp_path / "yarn.b.lock")
+        _write(a, "same bytes")
+        _write(b, "same bytes")
+        assert dependency_cache.hash_lockfile(a) == dependency_cache.hash_lockfile(b)
+
+    def test_changed_lockfile_changes_the_hash(self, tmp_path):
+        lock = str(tmp_path / "yarn.lock")
+        _write(lock, "dep@1.0.0")
+        before = dependency_cache.hash_lockfile(lock)
+        _write(lock, "dep@2.0.0")  # trunk bumped a dependency
+        after = dependency_cache.hash_lockfile(lock)
+        assert before != after
+
+    def test_missing_lockfile_returns_none(self, tmp_path):
+        assert dependency_cache.hash_lockfile(str(tmp_path / "nope.lock")) is None
+
+
+class TestCacheRoot:
+    def test_none_when_mount_absent(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("DEPENDENCY_CACHE_DIR", str(tmp_path / "does-not-exist"))
+        assert dependency_cache.cache_root() is None
+
+    def test_returns_writable_root(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("DEPENDENCY_CACHE_DIR", str(tmp_path))
+        assert dependency_cache.cache_root() == str(tmp_path)
+
+
+class TestRestoreAndPopulate:
+    """Hit/miss + atomic populate on the low-level artifact primitives."""
+
+    def test_populate_then_restore_roundtrips_identical_bytes(self, tmp_path):
+        root = str(tmp_path / "cache")
+        os.makedirs(root)
+        source = str(tmp_path / "node_modules")
+        _make_dir_with_file(source, "pkg.js", "installed-payload")
+
+        assert dependency_cache.populate_artifact(root, "node_modules", "abc123", source) is True
+
+        dest = str(tmp_path / "clone" / "node_modules")
+        assert dependency_cache.restore_artifact(root, "node_modules", "abc123", dest) is True
+        # A hit produces the identical tree a cold install would have.
+        with open(os.path.join(dest, "pkg.js")) as handle:
+            assert handle.read() == "installed-payload"
+
+    def test_restore_miss_when_key_absent(self, tmp_path):
+        root = str(tmp_path / "cache")
+        os.makedirs(root)
+        dest = str(tmp_path / "clone" / "node_modules")
+        assert dependency_cache.restore_artifact(root, "node_modules", "missing", dest) is False
+        assert not os.path.exists(dest)  # nothing restored → cold install
+
+    def test_populate_is_atomic_no_partial_entry_on_the_final_path(self, tmp_path, monkeypatch):
+        # The published entry only ever appears via an atomic rename: there is no
+        # window where <root>/<kind>/<digest> exists but is half-copied.
+        root = str(tmp_path / "cache")
+        os.makedirs(root)
+        source = str(tmp_path / "venv")
+        _make_dir_with_file(source, "python", "bin")
+
+        renames: list[tuple[str, str]] = []
+        real_rename = os.rename
+
+        def spy_rename(src, dst):
+            renames.append((src, dst))
+            return real_rename(src, dst)
+
+        monkeypatch.setattr(os, "rename", spy_rename)
+        assert dependency_cache.populate_artifact(root, "venv", "deadbeef", source) is True
+
+        entry = os.path.join(root, "venv", "deadbeef")
+        # Exactly one rename, and its destination is the final entry path — the
+        # temp was built elsewhere and moved into place in one atomic step.
+        assert any(dst == entry for _src, dst in renames)
+        assert os.path.isdir(entry)
+
+    def test_second_populate_same_key_is_noop(self, tmp_path):
+        root = str(tmp_path / "cache")
+        os.makedirs(root)
+        source = str(tmp_path / "node_modules")
+        _make_dir_with_file(source)
+        assert dependency_cache.populate_artifact(root, "node_modules", "k", source) is True
+        # A concurrent/second publish of the same key finds the entry present.
+        assert dependency_cache.populate_artifact(root, "node_modules", "k", source) is False
+
+    def test_concurrent_populate_race_leaves_one_valid_entry(self, tmp_path, monkeypatch):
+        # Simulate two tasks publishing the SAME key: the second's rename lands on
+        # a now-non-empty dir and fails; it must discard its temp and report False,
+        # leaving exactly one valid entry (no corruption, no leftover temp).
+        root = str(tmp_path / "cache")
+        os.makedirs(root)
+        source = str(tmp_path / "node_modules")
+        _make_dir_with_file(source, "pkg.js", "payload")
+
+        real_rename = os.rename
+
+        def racing_rename(src, dst):
+            # Before our rename runs, a concurrent task has already published the
+            # entry, so ``dst`` now exists and is non-empty → rename raises.
+            os.makedirs(dst, exist_ok=True)
+            _write(os.path.join(dst, "pkg.js"), "payload")
+            return real_rename(src, dst)  # onto non-empty → OSError
+
+        monkeypatch.setattr(os, "rename", racing_rename)
+        result = dependency_cache.populate_artifact(root, "node_modules", "shared", source)
+
+        assert result is False  # lost the race
+        entry = os.path.join(root, "node_modules", "shared")
+        assert os.path.isdir(entry)  # the winner's entry is intact
+        # No leftover temp dirs polluting the kind dir.
+        kind_dir = os.path.join(root, "node_modules")
+        leftovers = [d for d in os.listdir(kind_dir) if d.startswith(".tmp")]
+        assert leftovers == []
+
+    def test_restore_does_not_clobber_existing_dest(self, tmp_path):
+        root = str(tmp_path / "cache")
+        os.makedirs(root)
+        source = str(tmp_path / "src_nm")
+        _make_dir_with_file(source, "pkg.js", "cached")
+        dependency_cache.populate_artifact(root, "node_modules", "k", source)
+
+        dest = str(tmp_path / "clone" / "node_modules")
+        _make_dir_with_file(dest, "pkg.js", "already-present")
+        # dest exists → not a restore target; leave it untouched.
+        assert dependency_cache.restore_artifact(root, "node_modules", "k", dest) is False
+        with open(os.path.join(dest, "pkg.js")) as handle:
+            assert handle.read() == "already-present"
+
+
+class TestDiscoverArtifacts:
+    def test_discovers_root_yarn_lock_and_nested_uv_locks(self, tmp_path):
+        repo_dir = str(tmp_path / "clone")
+        _write(os.path.join(repo_dir, "yarn.lock"))
+        _write(os.path.join(repo_dir, "agent", "uv.lock"))
+        plan = dependency_cache.discover_artifacts(repo_dir)
+        kinds = {k for k, _lock, _art in plan}
+        assert dependency_cache.CACHE_KIND_NODE_MODULES in kinds
+        assert dependency_cache.CACHE_KIND_VENV in kinds
+        # node_modules maps to the ROOT (yarn workspaces install centrally).
+        nm = next(a for k, _l, a in plan if k == dependency_cache.CACHE_KIND_NODE_MODULES)
+        assert nm == os.path.join(repo_dir, "node_modules")
+        # .venv is the SIBLING of the uv.lock that keys it.
+        venv = next(a for k, _l, a in plan if k == dependency_cache.CACHE_KIND_VENV)
+        assert venv == os.path.join(repo_dir, "agent", ".venv")
+
+    def test_skips_vendored_and_build_dirs_for_uv_locks(self, tmp_path):
+        repo_dir = str(tmp_path / "clone")
+        _write(os.path.join(repo_dir, "agent", "uv.lock"))
+        _write(os.path.join(repo_dir, "node_modules", "pkg", "uv.lock"))
+        _write(os.path.join(repo_dir, "cdk.out", "asset", "uv.lock"))
+        plan = dependency_cache.discover_artifacts(repo_dir)
+        venvs = [a for k, _l, a in plan if k == dependency_cache.CACHE_KIND_VENV]
+        assert venvs == [os.path.join(repo_dir, "agent", ".venv")]
+
+    def test_no_lockfiles_returns_empty(self, tmp_path):
+        assert dependency_cache.discover_artifacts(str(tmp_path)) == []
+
+
+class TestRestoreAndPopulateHighLevel:
+    """The setup-facing helpers: end-to-end hit/miss keyed on lockfile hash."""
+
+    def test_changed_yarn_lock_is_a_miss_then_repopulates(self, tmp_path, monkeypatch):
+        # Two consecutive "tasks" with a CHANGED yarn.lock: the second must MISS
+        # (different lockfile hash) and cold-install — never reuse stale deps.
+        root = str(tmp_path / "cache")
+        os.makedirs(root)
+        monkeypatch.setenv("DEPENDENCY_CACHE_DIR", root)
+
+        # Task 1: lockfile v1, installs node_modules, populates cache.
+        repo1 = str(tmp_path / "task1")
+        _write(os.path.join(repo1, "yarn.lock"), "dep@1.0.0")
+        notes1: list[str] = []
+        dependency_cache.restore_dependency_cache(repo1, notes1)
+        assert any("cache MISS for node_modules" in n for n in notes1)
+        _make_dir_with_file(os.path.join(repo1, "node_modules"), "pkg.js", "v1")
+        dependency_cache.populate_dependency_cache(repo1, notes1)
+
+        # Task 2: SAME lockfile → HIT (restores identical tree).
+        repo2 = str(tmp_path / "task2")
+        _write(os.path.join(repo2, "yarn.lock"), "dep@1.0.0")
+        notes2: list[str] = []
+        dependency_cache.restore_dependency_cache(repo2, notes2)
+        assert any("cache HIT for node_modules" in n for n in notes2)
+        with open(os.path.join(repo2, "node_modules", "pkg.js")) as handle:
+            assert handle.read() == "v1"
+
+        # Task 3: trunk BUMPED the dependency → different hash → MISS (no stale reuse).
+        repo3 = str(tmp_path / "task3")
+        _write(os.path.join(repo3, "yarn.lock"), "dep@2.0.0")
+        notes3: list[str] = []
+        dependency_cache.restore_dependency_cache(repo3, notes3)
+        assert any("cache MISS for node_modules" in n for n in notes3)
+        assert not os.path.exists(os.path.join(repo3, "node_modules"))
+
+    def test_no_cache_volume_is_a_clean_cold_install(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("DEPENDENCY_CACHE_DIR", str(tmp_path / "absent"))
+        repo_dir = str(tmp_path / "clone")
+        _write(os.path.join(repo_dir, "yarn.lock"), "dep@1.0.0")
+        notes: list[str] = []
+        dependency_cache.restore_dependency_cache(repo_dir, notes)  # must not raise
+        assert any("unavailable" in n for n in notes)
+        # populate is likewise a safe no-op with no volume.
+        _make_dir_with_file(os.path.join(repo_dir, "node_modules"))
+        dependency_cache.populate_dependency_cache(repo_dir, notes)  # must not raise
+
+
+class TestSetupRepoWiresDependencyCache:
+    """setup_repo must restore before install and populate after — best-effort."""
+
+    def test_setup_calls_restore_then_populate(self, monkeypatch):
+        fake = _fake_run_cmd()
+        _patch_common(monkeypatch, fake)
+        monkeypatch.setattr(repo, "detect_default_branch", lambda url, d: "main")
+
+        calls: list[str] = []
+        monkeypatch.setattr(
+            "dependency_cache.restore_dependency_cache",
+            lambda repo_dir, notes: calls.append("restore"),
+        )
+        monkeypatch.setattr(
+            "dependency_cache.populate_dependency_cache",
+            lambda repo_dir, notes: calls.append("populate"),
+        )
+
+        repo.setup_repo(_config())
+
+        assert calls == ["restore", "populate"]
+
+    def test_setup_end_to_end_hit_across_two_runs(self, tmp_path, monkeypatch):
+        # End-to-end through the REAL cache helpers (only run_cmd + workspace
+        # faked): a first setup_repo populates the cache from an installed
+        # node_modules, and a second run on the same lockfile restores it (a HIT).
+        root = str(tmp_path / "cache")
+        os.makedirs(root)
+        monkeypatch.setenv("DEPENDENCY_CACHE_DIR", root)
+
+        fake = _fake_run_cmd()
+        _patch_common(monkeypatch, fake)
+        monkeypatch.setattr(repo, "detect_default_branch", lambda url, d: "main")
+        # Point the clone dir into tmp_path (not the real /workspace).
+        workspace = str(tmp_path / "ws")
+        monkeypatch.setattr(repo, "AGENT_WORKSPACE", workspace)
+
+        # Task 1: seed a yarn.lock + an "installed" node_modules so the post-setup
+        # populate publishes it.
+        repo_dir1 = os.path.join(workspace, "task-one")
+        _write(os.path.join(repo_dir1, "yarn.lock"), "dep@1.0.0")
+        _make_dir_with_file(os.path.join(repo_dir1, "node_modules"), "pkg.js", "payload")
+        setup1 = repo.setup_repo(_config(task_id="task-one"))
+        assert any("populated node_modules" in n for n in setup1.notes)
+
+        # Task 2: same lockfile, fresh clone dir → restore HIT.
+        repo_dir2 = os.path.join(workspace, "task-two")
+        _write(os.path.join(repo_dir2, "yarn.lock"), "dep@1.0.0")
+        setup2 = repo.setup_repo(_config(task_id="task-two"))
+        assert any("cache HIT for node_modules" in n for n in setup2.notes)
+        assert os.path.exists(os.path.join(repo_dir2, "node_modules", "pkg.js"))

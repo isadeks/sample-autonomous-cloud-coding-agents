@@ -22,6 +22,7 @@ import * as dynamodb from 'aws-cdk-lib/aws-dynamodb';
 import * as ec2 from 'aws-cdk-lib/aws-ec2';
 import * as ecr_assets from 'aws-cdk-lib/aws-ecr-assets';
 import * as ecs from 'aws-cdk-lib/aws-ecs';
+import * as efs from 'aws-cdk-lib/aws-efs';
 import * as iam from 'aws-cdk-lib/aws-iam';
 import * as logs from 'aws-cdk-lib/aws-logs';
 import * as s3 from 'aws-cdk-lib/aws-s3';
@@ -93,6 +94,22 @@ export interface EcsAgentClusterProps {
 
 /** HTTPS port — the only egress allowed from the agent task ENIs. */
 const HTTPS_PORT = 443;
+
+/** NFS port for EFS mounts — the warm dependency cache (ABCA-691). */
+const NFS_PORT = 2049;
+
+/**
+ * POSIX uid/gid the EFS Access Point enforces for the warm dependency cache
+ * (ABCA-691). The container runs as the non-root ``agent`` user (uid/gid 1000,
+ * created in the Dockerfile), so the access point owns its root dir and squashes
+ * all file ops to this identity — the task never touches raw EFS uids and reads/
+ * writes ``/cache`` as itself.
+ */
+const CACHE_POSIX_UID = 1000;
+const CACHE_POSIX_GID = 1000;
+
+/** Where the warm dependency cache EFS access point mounts in the BUILD task. */
+const CACHE_MOUNT_PATH = '/cache';
 
 /**
  * Fargate task sizes (vCPU units / MiB). The empirical sizing history that
@@ -168,6 +185,57 @@ export class EcsAgentCluster extends Construct {
       'Allow HTTPS egress (GitHub API, AWS services)',
     );
 
+    // Warm dependency cache (ABCA-691): an EFS filesystem shared across build
+    // tasks that persists the derived dependency artifacts (node_modules and the
+    // target-repo .venv) so a task on the same lockfiles skips the cold
+    // yarn install + uv sync (~3–5 min). Keyed by lockfile hash in the agent
+    // (dependency_cache.py); EFS just provides the durable shared bytes. Only
+    // the BUILD def mounts it — the read-only PLANNING def never installs deps.
+    //
+    // ENCRYPTED at rest; lifecycle policy reaps cold entries so a stale lockfile's
+    // artifacts don't accumulate cost forever. Mount targets land in the VPC's
+    // private subnets (one per AZ) so every Fargate task ENI can reach NFS.
+    const cacheFileSystem = new efs.FileSystem(this, 'DependencyCacheFs', {
+      vpc: props.vpc,
+      encrypted: true,
+      // Reap cache entries not accessed for 30 days (a lockfile no longer in use
+      // stops being restored, so its bytes are pure cost) and pull them back to
+      // primary storage on first access after a move to IA.
+      lifecyclePolicy: efs.LifecyclePolicy.AFTER_30_DAYS,
+      outOfInfrequentAccessPolicy: efs.OutOfInfrequentAccessPolicy.AFTER_1_ACCESS,
+      // Bursting throughput scales with stored size — right for an intermittent
+      // read-heavy cache without provisioning a fixed (billed) throughput floor.
+      throughputMode: efs.ThroughputMode.BURSTING,
+      // The cache is derived, reproducible artifacts — a cold install rebuilds it.
+      // DESTROY keeps teardown clean rather than orphaning a filesystem.
+      removalPolicy: RemovalPolicy.DESTROY,
+    });
+
+    // Access point: the container mounts THIS (not the raw filesystem root), so
+    // EFS owns/creates the cache dir with the container's non-root POSIX identity
+    // (uid/gid 1000 = the Dockerfile's ``agent`` user) and squashes all ops to it.
+    // The task therefore reads/writes /cache as itself without any chown dance.
+    const cacheAccessPoint = cacheFileSystem.addAccessPoint('DependencyCacheAp', {
+      path: '/dependency-cache',
+      createAcl: { ownerUid: String(CACHE_POSIX_UID), ownerGid: String(CACHE_POSIX_GID), permissions: '0755' },
+      posixUser: { uid: String(CACHE_POSIX_UID), gid: String(CACHE_POSIX_GID) },
+    });
+
+    // Allow the task ENIs to reach the EFS mount targets over NFS (2049). The
+    // filesystem's own SG is created by the FileSystem construct; open an ingress
+    // rule from the task SG so only agent tasks (443-egress-locked) can mount.
+    cacheFileSystem.connections.allowFrom(
+      this.securityGroup,
+      ec2.Port.tcp(NFS_PORT),
+      'Allow agent build tasks to mount the warm dependency cache over NFS',
+    );
+    // The task SG blocks all egress except 443; NFS to the cache needs 2049 out.
+    this.securityGroup.addEgressRule(
+      cacheFileSystem.connections.securityGroups[0],
+      ec2.Port.tcp(NFS_PORT),
+      'Allow NFS egress to the warm dependency cache EFS mount targets',
+    );
+
     // CloudWatch log group for agent task output
     const logGroup = new logs.LogGroup(this, 'TaskLogGroup', {
       retention: logs.RetentionDays.THREE_MONTHS,
@@ -219,12 +287,20 @@ export class EcsAgentCluster extends Construct {
       }),
     };
     const image = ecs.ContainerImage.fromDockerImageAsset(props.agentImageAsset);
+    // Logical name of the EFS-backed volume on the task def(s) that mount the
+    // warm dependency cache (ABCA-691).
+    const cacheVolumeName = 'DependencyCache';
     const makeTaskDef = (
       taskDefId: string,
       cpu: number,
       memoryLimitMiB: number,
       extraEnv: Record<string, string>,
       ephemeralStorageGiB?: number,
+      // Mount the warm dependency cache EFS volume at /cache (ABCA-691). Only the
+      // BUILD def sets this — the read-only PLANNING def never installs deps, so
+      // it neither needs nor gets the mount (keeps its ENI free of NFS + its task
+      // role identical by construction, just without the volume).
+      mountDependencyCache = false,
     ) => {
       const def = new ecs.FargateTaskDefinition(this, taskDefId, {
         cpu,
@@ -239,11 +315,40 @@ export class EcsAgentCluster extends Construct {
           operatingSystemFamily: ecs.OperatingSystemFamily.LINUX,
         },
       });
-      def.addContainer(this.containerName, {
+      if (mountDependencyCache) {
+        // EFS-backed volume via the access point (POSIX identity + squash). TLS
+        // encrypts the NFS traffic in transit; IAM authorization ties the mount
+        // to the task role's elasticfilesystem:ClientMount/Write grant below.
+        def.addVolume({
+          name: cacheVolumeName,
+          efsVolumeConfiguration: {
+            fileSystemId: cacheFileSystem.fileSystemId,
+            transitEncryption: 'ENABLED',
+            authorizationConfig: {
+              accessPointId: cacheAccessPoint.accessPointId,
+              iam: 'ENABLED',
+            },
+          },
+        });
+      }
+      const container = def.addContainer(this.containerName, {
         image,
         logging: ecs.LogDrivers.awsLogs({ logGroup, streamPrefix: 'agent' }),
-        environment: { ...baseEnvironment, ...extraEnv },
+        // Point the agent's dependency_cache at the mount only when it's present;
+        // absent → cache_root() returns None and every task installs cold.
+        environment: {
+          ...baseEnvironment,
+          ...(mountDependencyCache && { DEPENDENCY_CACHE_DIR: CACHE_MOUNT_PATH }),
+          ...extraEnv,
+        },
       });
+      if (mountDependencyCache) {
+        container.addMountPoints({
+          containerPath: CACHE_MOUNT_PATH,
+          sourceVolume: cacheVolumeName,
+          readOnly: false,
+        });
+      }
       return def;
     };
 
@@ -295,7 +400,10 @@ export class EcsAgentCluster extends Construct {
       // Propagates to both the platform push (post_hooks.py) and the agent's own
       // git-tool pushes via shell.py::_clean_env (blacklist — passes SKIP through).
       SKIP: 'monorepo-tests-pre-push',
-    }, BUILD_TASK_EPHEMERAL_STORAGE_GIB);
+      // Only the build def mounts the warm dependency cache (ABCA-691) — it is
+      // the def that runs installs. The final `true` turns on the /cache EFS
+      // mount + DEPENDENCY_CACHE_DIR env.
+    }, BUILD_TASK_EPHEMERAL_STORAGE_GIB, true);
 
     // PLANNING task def (#299 ECS_RIGHTSIZED_PLANNING) — for read-only workflows
     // (coding/decompose-v1) that clone + read + emit a plan artifact but NEVER
@@ -319,6 +427,21 @@ export class EcsAgentCluster extends Construct {
     // UserConcurrencyTable is user-scoped (not task_id leading-key-able) and is
     // touched by the reconciler/orchestrator path; keep it on the task role.
     props.userConcurrencyTable.grantReadWriteData(taskRole);
+
+    // Warm dependency cache (ABCA-691): the build task mounts the EFS access
+    // point with IAM authorization enabled, so the task role needs EFS client
+    // mount + read/write. ``grant`` scopes it to THIS filesystem's ARN
+    // (Condition on the access point) — no wildcard. Both task defs share the
+    // role, but only the build def carries the volume/mount, so the planning
+    // def's ENI never opens an NFS mount despite holding the (unused) grant.
+    // ClientMount + ClientWrite only — the access point squashes all ops to the
+    // container's non-root POSIX user (uid/gid 1000), so ClientRootAccess is
+    // neither needed nor granted (least privilege).
+    cacheFileSystem.grant(
+      taskRole,
+      'elasticfilesystem:ClientMount',
+      'elasticfilesystem:ClientWrite',
+    );
 
     // Secrets Manager read for GitHub token (read once at startup, before the
     // agent assumes the SessionRole — stays on the task role).
