@@ -230,6 +230,47 @@ describe('seedOrchestration — first write', () => {
     expect(meta.channel_source).toBe('linear');
   });
 
+  test('ABCA-687: persists default_branch on the meta row when supplied', async () => {
+    const ddb = makeDdb();
+    ddb.send.mockResolvedValueOnce({ Item: undefined }).mockResolvedValueOnce({});
+
+    await seedOrchestration({
+      ddb: ddb as never,
+      tableName: TABLE,
+      parentLinearIssueId: 'PARENT',
+      linearWorkspaceId: 'WS',
+      repo: 'o/r',
+      children: [child('A')],
+      now: NOW,
+      releaseContext: RC,
+      defaultBranch: 'linear-vercel',
+    });
+
+    const puts = ddb.send.mock.calls[1][0].input.RequestItems[TABLE] as Array<{ PutRequest: { Item: Record<string, unknown> } }>;
+    const meta = puts.find((p) => p.PutRequest.Item.sub_issue_id === '#meta')!.PutRequest.Item;
+    expect(meta.default_branch).toBe('linear-vercel');
+  });
+
+  test('ABCA-687: omits default_branch from the meta row when not supplied (back-compat)', async () => {
+    const ddb = makeDdb();
+    ddb.send.mockResolvedValueOnce({ Item: undefined }).mockResolvedValueOnce({});
+
+    await seedOrchestration({
+      ddb: ddb as never,
+      tableName: TABLE,
+      parentLinearIssueId: 'PARENT',
+      linearWorkspaceId: 'WS',
+      repo: 'o/r',
+      children: [child('A')],
+      now: NOW,
+      releaseContext: RC, // no defaultBranch
+    });
+
+    const puts = ddb.send.mock.calls[1][0].input.RequestItems[TABLE] as Array<{ PutRequest: { Item: Record<string, unknown> } }>;
+    const meta = puts.find((p) => p.PutRequest.Item.sub_issue_id === '#meta')!.PutRequest.Item;
+    expect(meta).not.toHaveProperty('default_branch');
+  });
+
   test('omits channel_source from the meta row when not supplied (back-compat)', async () => {
     const ddb = makeDdb();
     ddb.send.mockResolvedValueOnce({ Item: undefined }).mockResolvedValueOnce({});
@@ -361,6 +402,34 @@ describe('loadOrchestration — marker rows are not children (#247 UX.20)', () =
     expect(snap).not.toBeNull();
     const ids = snap!.children.map((c) => c.sub_issue_id).sort();
     expect(ids).toEqual(['orch_1__integration', 'uuid-A']); // ack# row excluded; integration kept
+  });
+
+  test('ABCA-687: hydrates default_branch onto meta when present on the row', async () => {
+    const ddb = {
+      send: jest.fn().mockResolvedValueOnce({
+        Items: [
+          { orchestration_id: 'orch_1', sub_issue_id: '#meta', parent_linear_issue_id: 'P', linear_workspace_id: 'WS', repo: 'o/r', platform_user_id: 'u1', child_count: 1, default_branch: 'linear-vercel' },
+          { orchestration_id: 'orch_1', sub_issue_id: 'uuid-A', depends_on: [], child_status: 'succeeded' },
+        ],
+      }),
+    };
+    const snap = await loadOrchestration(ddb as never, TABLE, 'orch_1');
+    expect(snap).not.toBeNull();
+    expect(snap!.meta.default_branch).toBe('linear-vercel');
+  });
+
+  test('ABCA-687: leaves default_branch undefined for rows seeded before the field existed', async () => {
+    const ddb = {
+      send: jest.fn().mockResolvedValueOnce({
+        Items: [
+          { orchestration_id: 'orch_1', sub_issue_id: '#meta', parent_linear_issue_id: 'P', linear_workspace_id: 'WS', repo: 'o/r', platform_user_id: 'u1', child_count: 1 },
+          { orchestration_id: 'orch_1', sub_issue_id: 'uuid-A', depends_on: [], child_status: 'succeeded' },
+        ],
+      }),
+    };
+    const snap = await loadOrchestration(ddb as never, TABLE, 'orch_1');
+    expect(snap).not.toBeNull();
+    expect(snap!.meta.default_branch).toBeUndefined();
   });
 
   test('paginates a multi-page Query so a large epic is NOT truncated to one 1MB page', async () => {

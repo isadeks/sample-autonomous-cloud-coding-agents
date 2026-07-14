@@ -181,6 +181,45 @@ describe('discoverOrchestration', () => {
     }
   });
 
+  // ABCA-687: the resolved repo default branch is threaded into the seed's
+  // meta row (so the epic release path targets the real trunk, not 'main').
+  describe('default-branch threading (ABCA-687)', () => {
+    test('stamps the resolved default branch on the seeded meta row', async () => {
+      const ddb = { send: jest.fn().mockResolvedValueOnce({ Item: undefined }).mockResolvedValueOnce({}) };
+      const resolveDefaultBranch = jest.fn(async () => 'linear-vercel');
+      const result = await discoverOrchestration({
+        ...base,
+        ddb: ddb as never,
+        githubToken: 'gh-tok',
+        resolveDefaultBranch,
+        fetchOptions: { fetchImpl: mockFetch([{ id: 'A' }, { id: 'B', blockedBy: ['A'] }]) },
+      });
+      expect(result.kind).toBe('seeded');
+      // Resolver was called with the repo + token (not a hardcoded literal).
+      expect(resolveDefaultBranch).toHaveBeenCalledWith('o/r', 'gh-tok');
+      // The BatchWrite meta row carries the resolved branch.
+      const puts = ddb.send.mock.calls[1][0].input.RequestItems.OrchestrationTable as Array<{ PutRequest: { Item: Record<string, unknown> } }>;
+      const meta = puts.find((p) => p.PutRequest.Item.sub_issue_id === '#meta')!.PutRequest.Item;
+      expect(meta.default_branch).toBe('linear-vercel');
+    });
+
+    test('falls back to main (resolver returns main) when resolution fails', async () => {
+      const ddb = { send: jest.fn().mockResolvedValueOnce({ Item: undefined }).mockResolvedValueOnce({}) };
+      // A resolver that degrades to 'main' (no token, unreachable, etc.).
+      const resolveDefaultBranch = jest.fn(async () => 'main');
+      const result = await discoverOrchestration({
+        ...base,
+        ddb: ddb as never,
+        resolveDefaultBranch,
+        fetchOptions: { fetchImpl: mockFetch([{ id: 'A' }]) },
+      });
+      expect(result.kind).toBe('seeded');
+      const puts = ddb.send.mock.calls[1][0].input.RequestItems.OrchestrationTable as Array<{ PutRequest: { Item: Record<string, unknown> } }>;
+      const meta = puts.find((p) => p.PutRequest.Item.sub_issue_id === '#meta')!.PutRequest.Item;
+      expect(meta.default_branch).toBe('main'); // last-resort fallback, still persisted
+    });
+  });
+
   // #247/#299 trigger-agnostic seam: a custom graphSource (declarative /
   // planner) drives the SAME validate→seed→reconcile pipeline, bypassing the
   // Linear fetch entirely.

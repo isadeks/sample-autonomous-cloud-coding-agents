@@ -135,6 +135,14 @@ export interface SeedOrchestrationParams {
   readonly ttl?: number;
   /** Release context stamped on the meta row for the reconciler. */
   readonly releaseContext: OrchestrationReleaseContext;
+  /**
+   * The repo's default branch (ABCA-687), resolved by the discovery path
+   * before seeding. Persisted on the parent-meta row so the epic release path
+   * (child + integration PRs) targets the real trunk instead of a hardcoded
+   * ``main``. Defaults to ``'main'`` when a real value wasn't resolved — the
+   * last-resort fallback, never the primary base when the trunk is known.
+   */
+  readonly defaultBranch?: string;
 }
 
 export interface SeedOrchestrationResult {
@@ -177,7 +185,7 @@ const PARENT_META_SK = '#meta';
 export async function seedOrchestration(
   params: SeedOrchestrationParams,
 ): Promise<SeedOrchestrationResult> {
-  const { ddb, tableName, parentLinearIssueId, linearWorkspaceId, repo, children, now, ttl, releaseContext } = params;
+  const { ddb, tableName, parentLinearIssueId, linearWorkspaceId, repo, children, now, ttl, releaseContext, defaultBranch } = params;
   const orchestrationId = deriveOrchestrationId(parentLinearIssueId);
 
   // Idempotency gate: a prior run for this parent already seeded rows.
@@ -216,6 +224,11 @@ export async function seedOrchestration(
     linear_workspace_id: linearWorkspaceId,
     repo,
     child_count: children.length,
+    // ABCA-687: the resolved repo default branch, so the epic release path
+    // (child + integration PRs) targets the real trunk. Only persisted when a
+    // real value was resolved; the loader + release path fall back to 'main'
+    // when absent (last resort, never the primary base for a known trunk).
+    ...(defaultBranch !== undefined && { default_branch: defaultBranch }),
     // Release context for the reconciler (downstream releases run off the
     // TaskTable stream with no Linear webhook payload to re-derive these).
     platform_user_id: releaseContext.platform_user_id,
@@ -528,6 +541,13 @@ export interface OrchestrationMeta {
   readonly child_count: number;
   readonly release_context: OrchestrationReleaseContext;
   /**
+   * The repo's default branch (ABCA-687), resolved + stamped at seed. The
+   * epic release path threads this into ``selectBaseBranch`` so child +
+   * integration PRs target the real trunk. Absent on rows seeded before this
+   * field existed (back-compat) — callers fall back to ``'main'`` only then.
+   */
+  readonly default_branch?: string;
+  /**
    * Linear comment id of the live status block (#247 #3), stamped at seed.
    * The reconciler edits this comment in place on each child transition and
    * one last time with the final rollup. Absent if the seed-time create
@@ -613,6 +633,9 @@ export async function loadOrchestration(
     linear_workspace_id: metaItem.linear_workspace_id as string,
     repo: metaItem.repo as string,
     child_count: (metaItem.child_count as number) ?? children.length,
+    ...(metaItem.default_branch !== undefined && {
+      default_branch: metaItem.default_branch as string,
+    }),
     release_context: {
       platform_user_id: metaItem.platform_user_id as string,
       ...(metaItem.channel_source !== undefined && {
