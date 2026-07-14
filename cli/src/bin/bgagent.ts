@@ -43,6 +43,7 @@ import { makeSlackCommand } from '../commands/slack';
 import { makeStatusCommand } from '../commands/status';
 import { makeSubmitCommand } from '../commands/submit';
 import { makeTraceCommand } from '../commands/trace';
+import { getCliVersion, makeVersionCommand } from '../commands/version';
 import { makeWatchCommand } from '../commands/watch';
 import { makeWebhookCommand } from '../commands/webhook';
 import { setVerbose } from '../debug';
@@ -53,7 +54,7 @@ const program = new Command();
 program
   .name('bgagent')
   .description('Background Agent CLI — submit and manage coding tasks')
-  .version('0.0.0')
+  .version(getCliVersion())
   .option('--verbose', 'Enable debug output')
   .hook('preAction', (_thisCommand, actionCommand) => {
     // Resolve --verbose from the root program, not the subcommand
@@ -86,6 +87,7 @@ program.addCommand(makeRuntimeCommand());
 program.addCommand(makeOpsCommand());
 program.addCommand(makeWatchCommand());
 program.addCommand(makeTraceCommand());
+program.addCommand(makeVersionCommand());
 program.addCommand(makeWebhookCommand());
 program.addCommand(makeAdminCommand());
 
