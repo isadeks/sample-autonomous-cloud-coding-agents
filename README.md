@@ -146,6 +146,8 @@ A documentation site is available containing design documents and guides to depl
 
 The example provided in this repository is for experimental and educational purposes only. It demonstrates concepts and techniques but is not intended for direct use in production environments.
 
+You are responsible for reviewing, testing, and validating any code, pull requests, or other output produced by the agents before merging or deploying it. ABCA operates autonomously and its output is not guaranteed to be correct, secure, or fit for any particular purpose.
+
 ## Operational Metrics Collection
 
 Autonomous Background Coding Agent samples may collect anonymous operational metrics, including: the region a construct is deployed, the name and version of the construct deployed, and related information. We may use the metrics to maintain, provide, develop, and improve the constructs and AWS services.
