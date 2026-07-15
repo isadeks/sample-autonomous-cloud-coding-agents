@@ -375,6 +375,60 @@ class TestDetectDefaultBranch:
         assert repo.detect_default_branch("owner/repo", "/tmp/x") == "main"
 
 
+class TestDiamondBranchesOffRealDefault:
+    """ABCA-688: the diamond / synthetic integration child must branch off the
+    repo's REAL default branch (the cloned HEAD), NOT a pinned 'main', and still
+    merge every predecessor. Pinning 'main' as the diamond base on a repo whose
+    default is a different long-lived branch made the epic's integration PR diff
+    the entire branch divergence (100 commits / 700+ files). The platform now
+    OMITS base_branch for the diamond and threads only merge_branches; repo.py
+    must fall into the off-HEAD branch AND run the predecessor merges there."""
+
+    def test_diamond_no_base_branch_branches_off_head_and_merges_preds(self, monkeypatch):
+        fake = _fake_run_cmd()
+        _patch_common(monkeypatch, fake)
+        # The repo's real default is NOT 'main' — mirrors the failing fork.
+        monkeypatch.setattr(repo, "detect_default_branch", lambda url, d: "linear-vercel")
+
+        setup = repo.setup_repo(
+            _config(
+                is_pr_workflow=False,
+                branch_name="bgagent/01INTTASK/orch-integration",
+                # Diamond: no base_branch, but predecessor branches to merge.
+                base_branch=None,
+                merge_branches=["bgagent/taskB/b", "bgagent/taskC/c"],
+            )
+        )
+
+        labels = fake.labels()
+        # Branched off the cloned HEAD (the real default) — NOT from a pinned base.
+        assert "create-branch" in labels
+        assert "create-branch-from-base" not in labels
+        # Every predecessor branch was fetched + merged so the child sees all code.
+        merge_cmds = [c["cmd"] for c in fake.calls if "merge-predecessor" in c["label"]]
+        merged_refs = {cmd[-1] for cmd in merge_cmds}
+        assert merged_refs == {"origin/bgagent/taskB/b", "origin/bgagent/taskC/c"}
+        # The PR base + commit-diff range is the real default, not 'main'.
+        assert setup.default_branch == "linear-vercel"
+
+    def test_linear_child_still_pins_predecessor_base(self, monkeypatch):
+        # A single-predecessor (linear) child keeps stacking on its predecessor's
+        # branch — that path is correct and unchanged by the ABCA-688 fix.
+        fake = _fake_run_cmd()
+        _patch_common(monkeypatch, fake)
+        setup = repo.setup_repo(
+            _config(
+                is_pr_workflow=False,
+                branch_name="bgagent/01CHILD/step-b",
+                base_branch="bgagent/taskA/step-a",
+            )
+        )
+        labels = fake.labels()
+        assert "create-branch-from-base" in labels
+        # base_branch wins as the PR base for a linear stack (no detection call).
+        assert setup.default_branch == "bgagent/taskA/step-a"
+
+
 class TestPlatformBranchNameVerbatim:
     """The agent MUST use the platform-provided ``config.branch_name`` verbatim
     when present, for EVERY workflow — never re-deriving its own slug. A
