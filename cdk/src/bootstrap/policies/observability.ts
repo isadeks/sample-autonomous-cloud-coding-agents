@@ -17,7 +17,6 @@
  *  SOFTWARE.
  */
 
-/* eslint-disable @cdklabs/no-literal-partition */
 // ARN partitions are intentionally literal — this policy is a bootstrap
 // template matching the exact resource patterns in DEPLOYMENT_ROLES.md.
 
@@ -80,6 +79,7 @@ export function observabilityPolicy(): iam.PolicyDocument {
           'cloudwatch:TagResource',
           'cloudwatch:UntagResource',
           'logs:CreateDelivery',
+          'logs:UpdateDeliveryConfiguration',
           'logs:DescribeDeliveries',
           'logs:GetDelivery',
           'logs:GetDeliveryDestination',
@@ -113,6 +113,31 @@ export function observabilityPolicy(): iam.PolicyDocument {
         resources: [
           'arn:aws:s3:::cdk-hnb659fds-assets-*',
           'arn:aws:s3:::cdk-hnb659fds-assets-*/*',
+        ],
+      }),
+
+      new iam.PolicyStatement({
+        sid: 'S3ApplicationBuckets',
+        effect: iam.Effect.ALLOW,
+        actions: [
+          's3:CreateBucket',
+          's3:DeleteBucket',
+          's3:PutBucketPolicy',
+          's3:DeleteBucketPolicy',
+          's3:PutBucketPublicAccessBlock',
+          's3:GetBucketPublicAccessBlock',
+          's3:PutEncryptionConfiguration',
+          's3:PutLifecycleConfiguration',
+          's3:PutBucketVersioning',
+          's3:GetBucketVersioning',
+          's3:GetBucketLocation',
+          's3:ListBucket',
+          's3:PutBucketTagging',
+          's3:GetBucketTagging',
+        ],
+        resources: [
+          'arn:aws:s3:::backgroundagent-dev-*',
+          'arn:aws:s3:::backgroundagent-dev-*/*',
         ],
       }),
 

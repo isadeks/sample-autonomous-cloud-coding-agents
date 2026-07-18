@@ -7,7 +7,7 @@ title: Compute
 Every task runs in an isolated cloud compute environment. Nothing runs on the user's machine. The agent clones the repo, writes code, runs tests, and opens a PR inside a MicroVM that is created for the task and destroyed when it ends.
 
 - **Use this doc for:** understanding the compute environment, agent harness, network architecture, and the constraints that shape the platform's design.
-- **Related docs:** [ORCHESTRATOR.md](/architecture/orchestrator) for session management and liveness monitoring, [SECURITY.md](/architecture/security) for isolation and egress controls, [REPO_ONBOARDING.md](/architecture/repo-onboarding) for per-repo compute configuration.
+- **Related docs:** [ORCHESTRATOR.md](/sample-autonomous-cloud-coding-agents/architecture/orchestrator) for session management and liveness monitoring, [SECURITY.md](/sample-autonomous-cloud-coding-agents/architecture/security) for isolation and egress controls, [REPO_ONBOARDING.md](/sample-autonomous-cloud-coding-agents/architecture/repo-onboarding) for per-repo compute configuration.
 
 ## Compute options
 
@@ -25,7 +25,7 @@ The default runtime is **Amazon Bedrock AgentCore Runtime**, which runs each ses
 | **Cost model** | vCPU-hrs + GB-hrs | vCPU + mem/sec | EC2 + EBS | EKS control + EC2 | Underlying compute | Request + duration | EC2 metal + your ops |
 | **Fit** | **Default choice** | Repos > 2 GB image | GPU, heavy toolchains | Max flexibility | Queued batch jobs | **Poor** (15 min cap) | Best potential, highest cost |
 
-The backend is selected per repo via `compute_type` in the Blueprint config. The orchestrator resolves the strategy and delegates session start, polling, and termination to the strategy implementation. See [REPO_ONBOARDING.md](/architecture/repo-onboarding) for the `ComputeStrategy` interface.
+The backend is selected per repo via `compute_type` in the Blueprint config. The orchestrator resolves the strategy and delegates session start, polling, and termination to the strategy implementation. See [REPO_ONBOARDING.md](/sample-autonomous-cloud-coding-agents/architecture/repo-onboarding) for the `ComputeStrategy` interface.
 
 ## What runs in the session
 
@@ -48,7 +48,7 @@ The most significant constraint. The image must fit the agent code, runtimes, an
 |-------|---------------|
 | Base OS (slim Linux) | ~50-100 MB |
 | Python 3.x + pip | ~100-150 MB |
-| Node.js 20.x + npm | ~100-150 MB |
+| Node.js 24.x + npm | ~100-150 MB |
 | Git + CLI tools | ~50-80 MB |
 | Agent code + SDK | ~100-200 MB |
 | **Available for repo deps** | **~1.3-1.6 GB** |
@@ -73,9 +73,22 @@ The platform works around this by splitting storage:
 | Limit | Value | Notes |
 |-------|-------|-------|
 | Max session duration | 8 hours | Hard limit enforced by AgentCore |
-| Idle timeout | 15 minutes | Agent must report `HealthyBusy` via `/ping` to stay alive |
+| Idle timeout | 8 hours (configured) | Overridden from the default via `idleRuntimeSessionTimeout: Duration.hours(8)` so sessions blocked on long approval waits or heavy builds are not evicted while idle. Agent reports `HealthyBusy` via `/ping` to stay alive |
 
-See [ORCHESTRATOR.md](/architecture/orchestrator) for how the orchestrator handles these timeouts.
+See [ORCHESTRATOR.md](/sample-autonomous-cloud-coding-agents/architecture/orchestrator) for how the orchestrator handles these timeouts.
+
+## ECS Fargate task sizing (build vs. planning)
+
+When a repo is `compute_type: ecs`, `EcsAgentCluster` provisions **two** Fargate task definitions, and the orchestrator picks between them per task by whether the resolved workflow is **read-only**:
+
+| Task def | Size | Runs | Selected when |
+|----------|------|------|---------------|
+| Build | 16 vCPU / 64 GB | Coding workflows (`new-task`, `pr-iteration`, …) that clone and run a full CI-parity build | `workflowIsReadOnly(workflow) === false` (the default) |
+| Planning | 2 vCPU / 8 GB | Read-only workflows (`coding/decompose-v1`) that clone, read/grep to explore, and emit a plan artifact — **never build** | `workflowIsReadOnly(workflow) === true` |
+
+The 64 GB build def is sized from empirical OOM history: ABCA's own parallel `mise run build` peaks ~31.6 GB and OOM-killed a 32 GB task, so the build tier needs 64 GB headroom. Running a read-only `:decompose` plan on that box is a large over-allocation, so planning gets its own right-sized 8 GB def.
+
+Both defs **share one task role, one execution role, one container image, and one base environment** (a single `makeTaskDef` helper + `baseEnvironment` object in `ecs-agent-cluster.ts`), so IAM grants and env vars cannot drift between them — a lesson from ECS-parity bugs (ABCA-488, #502) where a grant present on one path was missing on another. The only differences are `cpu`/`memoryLimitMiB` and the build-tier-only `BUILD_VERIFY_TIMEOUT_S`. Routing is a fallback-safe boolean: an older deploy without the planning def wired simply runs read-only workflows on the build def (never worse than before). Substrate **family** routing is unchanged — an ECS repo always plans on ECS (never silently downgraded to the AgentCore microVM, which a large repo could OOM just reading); this only picks *which ECS task def*. AgentCore has a single fixed MicroVM size and ignores the read-only flag. See [ECS_RIGHTSIZED_PLANNING.md](/sample-autonomous-cloud-coding-agents/architecture/ecs-rightsized-planning).
 
 ## Agent harness
 
@@ -87,9 +100,9 @@ The platform uses the [Claude Agent SDK](https://github.com/anthropics/claude-ag
 
 **Execution model:** Tasks are fully unattended and one-shot. The agent loop runs in a background thread so the FastAPI `/ping` endpoint stays responsive on the main thread. The agent thread uses `asyncio.run()` with the stdlib event loop (uvicorn is configured with `--loop asyncio` to avoid uvloop conflicts with subprocess SIGCHLD handling).
 
-**System prompt:** Selected by task type from a shared base template (`agent/prompts/base.py`) with per-task-type workflow sections (`new_task`, `pr_iteration`, `pr_review`). The platform defines what the agent should do; the harness executes it.
+**System prompt:** Selected by workflow from a shared base template (`agent/src/prompts/base.py`) with per-workflow sections (`coding/new-task-v1`, `coding/pr-iteration-v1`, `coding/pr-review-v1`). The platform defines what the agent should do; the harness executes it.
 
-**Result contract:** The agent does not call back to the platform. It follows the contract (push work, create PR) and exits. The orchestrator infers the outcome from GitHub state and the agent's poll response.
+**Result contract:** The agent does not call back to the platform. It follows the contract (push work, create PR) and exits. The orchestrator infers the outcome from GitHub state and the agent's poll response. When the agent is stopped by an *environmental* fault (missing secret, egress denial, unreachable dependency, fail-closed policy-engine error), it emits a typed `agent_blocked` event and carries a canonical `BLOCKED[<kind>]: …` reason in its terminal error so the orchestrator's classifier attaches a precise remedy — see [Cedar HITL gates §13.16](/sample-autonomous-cloud-coding-agents/architecture/cedar-hitl-gates#1316-observable-blocker-signal-251).
 
 ### Tool set
 
@@ -109,7 +122,7 @@ The harness enforces tool-call policy via Cedar-based hooks:
 - **PreToolUse** (`agent/src/hooks.py` + `agent/src/policy.py`) - Evaluates tool calls before execution. `pr_review` agents cannot use `Write`/`Edit`. Writes to `.git/*` are blocked. Destructive bash commands are denied. Fail-closed: if Cedar is unavailable, all calls are denied.
 - **PostToolUse** (`agent/src/hooks.py` + `agent/src/output_scanner.py`) - Screens tool outputs for secrets and redacts before re-entering agent context.
 
-Per-repo custom Cedar policies are supported via Blueprint `security.cedarPolicies`. See [SECURITY.md](/architecture/security) for the full policy enforcement model.
+Per-repo custom Cedar policies are supported via Blueprint `security.cedarPolicies`. See [SECURITY.md](/sample-autonomous-cloud-coding-agents/architecture/security) for the full policy enforcement model.
 
 ## Network architecture
 
@@ -202,5 +215,5 @@ Single NAT Gateway (~$32/month) provides internet egress for GitHub and package 
 | Interface endpoints (7x, 2 AZs) | ~$102 |
 | Flow logs (CloudWatch) | ~$3 |
 | DNS Firewall + query logs | ~$2-4 |
-| WAFv2 (3 rules) | ~$6 |
+| WAFv2 (4 rules) | ~$6 |
 | **Total** | **~$145-150** |

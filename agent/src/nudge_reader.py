@@ -76,14 +76,15 @@ def _get_table() -> Any | None:
         return None
 
     try:
-        import boto3
+        from aws_session import tenant_resource
 
         region = os.environ.get("AWS_REGION") or os.environ.get("AWS_DEFAULT_REGION")
-        dynamodb = boto3.resource("dynamodb", region_name=region)
+        dynamodb = tenant_resource("dynamodb", region_name=region)
         _TABLE_CACHE = dynamodb.Table(table_name)
         return _TABLE_CACHE
     except Exception as exc:
         log("WARN", f"Failed to init nudge DDB table: {type(exc).__name__}: {exc}")
+        # nosemgrep: py-silent-success-masking -- nudge table init failure; read_pending returns []
         return None
 
 
@@ -136,6 +137,7 @@ def read_pending(task_id: str, table: Any | None = None) -> list[PendingNudge]:
                 break
     except Exception as exc:
         log("WARN", f"Nudge DDB query failed: {type(exc).__name__}: {exc}")
+        # nosemgrep: py-silent-success-masking -- DDB query failure yields no pending nudges
         return []
 
     if truncated:
