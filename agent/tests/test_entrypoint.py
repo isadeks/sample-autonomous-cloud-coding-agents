@@ -374,20 +374,22 @@ class TestBuildSystemPrompt:
 
 
 # ---------------------------------------------------------------------------
-# build_config — task_type handling
+# build_config — workflow resolution
 # ---------------------------------------------------------------------------
 
 
-class TestBuildConfigTaskType:
+class TestBuildConfigWorkflow:
     def test_pr_iteration_with_pr_number(self):
         config = build_config(
             repo_url="owner/repo",
             github_token="ghp_test",
             aws_region="us-east-1",
-            task_type="pr_iteration",
+            resolved_workflow={"id": "coding/pr-iteration-v1", "version": "1.0.0"},
             pr_number="42",
         )
-        assert config.task_type == "pr_iteration"
+        assert config.resolved_workflow is not None
+        assert config.resolved_workflow["id"] == "coding/pr-iteration-v1"
+        assert config.is_pr_workflow is True
         assert config.pr_number == "42"
 
     def test_pr_iteration_without_pr_number_raises(self):
@@ -396,7 +398,7 @@ class TestBuildConfigTaskType:
                 repo_url="owner/repo",
                 github_token="ghp_test",
                 aws_region="us-east-1",
-                task_type="pr_iteration",
+                resolved_workflow={"id": "coding/pr-iteration-v1", "version": "1.0.0"},
             )
 
     def test_new_task_default(self):
@@ -406,17 +408,21 @@ class TestBuildConfigTaskType:
             github_token="ghp_test",
             aws_region="us-east-1",
         )
-        assert config.task_type == "new_task"
+        assert config.resolved_workflow is not None
+        assert config.resolved_workflow["id"] == "coding/new-task-v1"
+        assert config.policy_principal == "new_task"
 
     def test_pr_review_with_pr_number(self):
         config = build_config(
             repo_url="owner/repo",
             github_token="ghp_test",
             aws_region="us-east-1",
-            task_type="pr_review",
+            resolved_workflow={"id": "coding/pr-review-v1", "version": "1.0.0"},
             pr_number="55",
         )
-        assert config.task_type == "pr_review"
+        assert config.resolved_workflow is not None
+        assert config.resolved_workflow["id"] == "coding/pr-review-v1"
+        assert config.policy_principal == "pr_review"
         assert config.pr_number == "55"
 
     def test_pr_review_without_pr_number_raises(self):
@@ -425,22 +431,22 @@ class TestBuildConfigTaskType:
                 repo_url="owner/repo",
                 github_token="ghp_test",
                 aws_region="us-east-1",
-                task_type="pr_review",
+                resolved_workflow={"id": "coding/pr-review-v1", "version": "1.0.0"},
             )
 
 
 # ---------------------------------------------------------------------------
-# _build_system_prompt — task_type handling
+# _build_system_prompt — workflow-driven prompt selection
 # ---------------------------------------------------------------------------
 
 
-class TestBuildSystemPromptTaskType:
+class TestBuildSystemPromptWorkflow:
     def test_selects_new_task_prompt(self):
         config = TaskConfig(
             repo_url="owner/repo",
             task_id="test-123",
             max_turns=100,
-            task_type="new_task",
+            resolved_workflow={"id": "coding/new-task-v1", "version": "1.0.0"},
             github_token="ghp_test",
             aws_region="us-east-1",
         )
@@ -458,7 +464,7 @@ class TestBuildSystemPromptTaskType:
             repo_url="owner/repo",
             task_id="test-123",
             max_turns=100,
-            task_type="pr_iteration",
+            resolved_workflow={"id": "coding/pr-iteration-v1", "version": "1.0.0"},
             pr_number="42",
             github_token="ghp_test",
             aws_region="us-east-1",
@@ -479,7 +485,7 @@ class TestBuildSystemPromptTaskType:
             repo_url="owner/repo",
             task_id="test-123",
             max_turns=100,
-            task_type="pr_review",
+            resolved_workflow={"id": "coding/pr-review-v1", "version": "1.0.0"},
             pr_number="55",
             github_token="ghp_test",
             aws_region="us-east-1",
@@ -494,3 +500,148 @@ class TestBuildSystemPromptTaskType:
         assert "READ-ONLY" in prompt
         assert "must NOT modify" in prompt
         assert "55" in prompt
+
+
+# ---------------------------------------------------------------------------
+# _build_system_prompt — Linear channel addendum
+# ---------------------------------------------------------------------------
+
+
+class TestBuildSystemPromptLinearChannel:
+    """The Linear-channel addendum is appended only for channel_source=='linear'."""
+
+    def _setup(self) -> RepoSetup:
+        return RepoSetup(
+            repo_dir="/workspace/t1",
+            branch="b",
+            default_branch="main",
+            notes=[],
+        )
+
+    def test_no_addendum_when_channel_is_blank(self):
+        config = TaskConfig(
+            repo_url="o/r",
+            task_id="t1",
+            max_turns=10,
+            github_token="ghp_test",
+            aws_region="us-east-1",
+        )
+        prompt = _build_system_prompt(config, self._setup(), None, "")
+        assert "Linear issue progress updates" not in prompt
+        assert "Linear context discovery" not in prompt
+
+    def test_no_addendum_for_slack_channel(self):
+        config = TaskConfig(
+            repo_url="o/r",
+            task_id="t1",
+            max_turns=10,
+            github_token="ghp_test",
+            aws_region="us-east-1",
+            channel_source="slack",
+        )
+        prompt = _build_system_prompt(config, self._setup(), None, "")
+        assert "Linear issue progress updates" not in prompt
+        assert "Linear context discovery" not in prompt
+
+    def test_addendum_present_for_linear_channel(self):
+        config = TaskConfig(
+            repo_url="o/r",
+            task_id="t1",
+            max_turns=10,
+            github_token="ghp_test",
+            aws_region="us-east-1",
+            channel_source="linear",
+            channel_metadata={
+                "linear_issue_id": "issue-uuid-1",
+                "linear_issue_identifier": "ABC-42",
+                "linear_project_id": "project-uuid-1",
+            },
+        )
+        prompt = _build_system_prompt(config, self._setup(), None, "")
+        assert "Linear issue progress updates" in prompt
+        assert "Linear context discovery" in prompt
+        assert "ABC-42" in prompt
+
+    def test_linear_addendum_names_attachment_tools(self):
+        # The agent must know the exact MCP tool names — vague references
+        # would cause it to grope. Lock these in so a rename triggers the test.
+        config = TaskConfig(
+            repo_url="o/r",
+            task_id="t1",
+            max_turns=10,
+            github_token="ghp_test",
+            aws_region="us-east-1",
+            channel_source="linear",
+            channel_metadata={"linear_issue_id": "issue-uuid-1"},
+        )
+        prompt = _build_system_prompt(config, self._setup(), None, "")
+        for tool in (
+            "mcp__linear-server__get_issue",
+            "mcp__linear-server__get_attachment",
+            "mcp__linear-server__extract_images",
+            "mcp__linear-server__list_documents",
+            "mcp__linear-server__get_document",
+            "mcp__linear-server__list_comments",
+        ):
+            assert tool in prompt, f"expected {tool} to be named in the Linear addendum"
+
+    def test_linear_addendum_inlines_issue_id_and_project_id(self):
+        config = TaskConfig(
+            repo_url="o/r",
+            task_id="t1",
+            max_turns=10,
+            github_token="ghp_test",
+            aws_region="us-east-1",
+            channel_source="linear",
+            channel_metadata={
+                "linear_issue_id": "issue-uuid-deadbeef",
+                "linear_project_id": "project-uuid-cafebabe",
+            },
+        )
+        prompt = _build_system_prompt(config, self._setup(), None, "")
+        # The agent shouldn't have to guess the ids — they're in the metadata,
+        # so we surface them directly in the prompt.
+        assert "issue-uuid-deadbeef" in prompt
+        assert "project-uuid-cafebabe" in prompt
+
+    def test_linear_addendum_warns_save_issue_no_ops_on_unknown_state(self):
+        # Regression-guard: many Linear teams do NOT have an `In Review`
+        # state. When the agent passes a state name that doesn't exist,
+        # save_issue silently no-ops — the response shows the unchanged
+        # state, but the agent claimed success on DEM-9 (2026-05-27).
+        # The prompt must (a) tell the agent to cache list_issue_statuses,
+        # (b) check the cached map before each transition, and (c) verify
+        # the response state.name matches what was asked.
+        config = TaskConfig(
+            repo_url="o/r",
+            task_id="t1",
+            max_turns=10,
+            github_token="ghp_test",
+            aws_region="us-east-1",
+            channel_source="linear",
+            channel_metadata={"linear_issue_id": "i"},
+        )
+        prompt = _build_system_prompt(config, self._setup(), None, "")
+        assert "no-op" in prompt or "no op" in prompt
+        assert "cache" in prompt.lower()
+        # Must explicitly call out post-transition response verification.
+        assert "state.name" in prompt or "returned" in prompt.lower()
+
+    def test_linear_addendum_warns_against_embedding_uploads_linear_app_in_comments(self):
+        # Regression-guard: Linear's CDN signed URLs render fine in the
+        # original poster's context but show a broken-image icon when
+        # re-embedded by the bot in a comment. Hit on DEM-9 2026-05-27.
+        config = TaskConfig(
+            repo_url="o/r",
+            task_id="t1",
+            max_turns=10,
+            github_token="ghp_test",
+            aws_region="us-east-1",
+            channel_source="linear",
+            channel_metadata={"linear_issue_id": "i"},
+        )
+        prompt = _build_system_prompt(config, self._setup(), None, "")
+        assert "uploads.linear.app" in prompt
+        # The phrasing must be a prohibition for save_comment specifically,
+        # not just a passing mention — make sure we're forbidding the embed.
+        assert "Do NOT embed" in prompt or "do not embed" in prompt.lower()

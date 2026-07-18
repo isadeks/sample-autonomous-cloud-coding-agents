@@ -23,11 +23,17 @@ import { Template, Match } from 'aws-cdk-lib/assertions';
 import * as dynamodb from 'aws-cdk-lib/aws-dynamodb';
 import * as ec2 from 'aws-cdk-lib/aws-ec2';
 import * as ecr_assets from 'aws-cdk-lib/aws-ecr-assets';
+import * as iam from 'aws-cdk-lib/aws-iam';
+import * as s3 from 'aws-cdk-lib/aws-s3';
 import * as secretsmanager from 'aws-cdk-lib/aws-secretsmanager';
+import { AgentMemory } from '../../src/constructs/agent-memory';
+import { AgentSessionRole } from '../../src/constructs/agent-session-role';
 import { EcsAgentCluster } from '../../src/constructs/ecs-agent-cluster';
 
-function createStack(overrides?: { memoryId?: string }): { stack: Stack; template: Template } {
-  const app = new App();
+function createStack(overrides?: { memoryId?: string; bedrockModels?: string[]; withMemory?: boolean }): { stack: Stack; template: Template } {
+  const app = new App({
+    context: overrides?.bedrockModels ? { bedrockModels: overrides.bedrockModels } : undefined,
+  });
   const stack = new Stack(app, 'TestStack');
 
   const vpc = new ec2.Vpc(stack, 'Vpc', { maxAzs: 2 });
@@ -51,6 +57,8 @@ function createStack(overrides?: { memoryId?: string }): { stack: Stack; templat
 
   const githubTokenSecret = new secretsmanager.Secret(stack, 'GitHubTokenSecret');
 
+  const agentMemory = overrides?.withMemory ? new AgentMemory(stack, 'AgentMemory') : undefined;
+
   new EcsAgentCluster(stack, 'EcsAgentCluster', {
     vpc,
     agentImageAsset,
@@ -59,6 +67,7 @@ function createStack(overrides?: { memoryId?: string }): { stack: Stack; templat
     userConcurrencyTable,
     githubTokenSecret,
     memoryId: overrides?.memoryId,
+    agentMemory,
   });
 
   const template = Template.fromStack(stack);
@@ -66,9 +75,14 @@ function createStack(overrides?: { memoryId?: string }): { stack: Stack; templat
 }
 
 describe('EcsAgentCluster construct', () => {
+  let baseTemplate: Template;
+
+  beforeAll(() => {
+    baseTemplate = createStack().template;
+  });
+
   test('creates an ECS Cluster with container insights', () => {
-    const { template } = createStack();
-    template.hasResourceProperties('AWS::ECS::Cluster', {
+    baseTemplate.hasResourceProperties('AWS::ECS::Cluster', {
       ClusterSettings: Match.arrayWith([
         Match.objectLike({
           Name: 'containerInsights',
@@ -78,11 +92,10 @@ describe('EcsAgentCluster construct', () => {
     });
   });
 
-  test('creates a Fargate task definition with 2 vCPU and 4 GB', () => {
-    const { template } = createStack();
-    template.hasResourceProperties('AWS::ECS::TaskDefinition', {
-      Cpu: '2048',
-      Memory: '4096',
+  test('creates a Fargate task definition with 16 vCPU and 120 GB (ABCA-662: full parallel mise build OOM\'d at 64 GB → max Fargate RAM)', () => {
+    baseTemplate.hasResourceProperties('AWS::ECS::TaskDefinition', {
+      Cpu: '16384',
+      Memory: '122880',
       RequiresCompatibilities: ['FARGATE'],
       RuntimePlatform: {
         CpuArchitecture: 'ARM64',
@@ -91,9 +104,84 @@ describe('EcsAgentCluster construct', () => {
     });
   });
 
+  test('the BUILD def raises ephemeral storage past the 20 GiB Fargate default (ABCA-659 #2: concurrent builds → ENOSPC)', () => {
+    baseTemplate.hasResourceProperties('AWS::ECS::TaskDefinition', {
+      Cpu: '16384',
+      Memory: '122880',
+      EphemeralStorage: { SizeInGiB: 100 },
+    });
+  });
+
+  test('the PLANNING def keeps the 20 GiB default (no EphemeralStorage — a clone+read planner needs no extra disk)', () => {
+    const taskDefs = baseTemplate.findResources('AWS::ECS::TaskDefinition');
+    const planning = Object.values(taskDefs).find(
+      d => d.Properties.Cpu === '2048' && d.Properties.Memory === '8192',
+    );
+    expect(planning).toBeDefined();
+    expect(planning!.Properties.EphemeralStorage).toBeUndefined();
+  });
+
+  test('creates a second, smaller PLANNING task def (2 vCPU / 8 GB) for read-only workflows (#299 ECS_RIGHTSIZED_PLANNING)', () => {
+    // Two task defs now exist: the 64 GB build def (asserted above) and this
+    // 8 GB planning def. decompose-v1 (read_only) runs on the smaller one so a
+    // clone+read plan doesn't over-allocate the build box.
+    baseTemplate.resourceCountIs('AWS::ECS::TaskDefinition', 2);
+    baseTemplate.hasResourceProperties('AWS::ECS::TaskDefinition', {
+      Cpu: '2048',
+      Memory: '8192',
+      RequiresCompatibilities: ['FARGATE'],
+      RuntimePlatform: {
+        CpuArchitecture: 'ARM64',
+        OperatingSystemFamily: 'LINUX',
+      },
+    });
+  });
+
+  test('both task defs share ONE task role and ONE execution role (parity by construction — the ABCA-488/#502 lesson)', () => {
+    // The build and planning defs pass the SAME shared task+execution roles, so a
+    // grant added for one is present on the other by construction (no drift). The
+    // template therefore holds exactly two ECS roles (task + execution), each
+    // referenced by both defs' TaskRoleArn/ExecutionRoleArn.
+    const roles = baseTemplate.findResources('AWS::IAM::Role', {
+      Properties: {
+        AssumeRolePolicyDocument: {
+          Statement: Match.arrayWith([
+            Match.objectLike({
+              Principal: { Service: 'ecs-tasks.amazonaws.com' },
+            }),
+          ]),
+        },
+      },
+    });
+    expect(Object.keys(roles)).toHaveLength(2);
+
+    const taskDefs = baseTemplate.findResources('AWS::ECS::TaskDefinition');
+    const taskRoleRefs = new Set<string>();
+    const execRoleRefs = new Set<string>();
+    for (const def of Object.values(taskDefs)) {
+      taskRoleRefs.add(JSON.stringify(def.Properties.TaskRoleArn));
+      execRoleRefs.add(JSON.stringify(def.Properties.ExecutionRoleArn));
+    }
+    // Both defs point at the same single task role and same single exec role.
+    expect(taskRoleRefs.size).toBe(1);
+    expect(execRoleRefs.size).toBe(1);
+  });
+
+  test('the PLANNING def carries no BUILD_VERIFY_TIMEOUT_S (a read-only planner runs no build verify)', () => {
+    const taskDefs = baseTemplate.findResources('AWS::ECS::TaskDefinition');
+    const planningDef = Object.values(taskDefs).find(
+      d => d.Properties.Cpu === '2048' && d.Properties.Memory === '8192',
+    );
+    expect(planningDef).toBeDefined();
+    const env = planningDef!.Properties.ContainerDefinitions[0].Environment ?? [];
+    expect(env.some((e: { Name: string }) => e.Name === 'BUILD_VERIFY_TIMEOUT_S')).toBe(false);
+    // …but the shared env (Bedrock, task table) IS present on the planning def too.
+    expect(env.some((e: { Name: string }) => e.Name === 'CLAUDE_CODE_USE_BEDROCK')).toBe(true);
+    expect(env.some((e: { Name: string }) => e.Name === 'TASK_TABLE_NAME')).toBe(true);
+  });
+
   test('creates a security group with TCP 443 egress only', () => {
-    const { template } = createStack();
-    template.hasResourceProperties('AWS::EC2::SecurityGroup', {
+    baseTemplate.hasResourceProperties('AWS::EC2::SecurityGroup', {
       GroupDescription: 'ECS Agent Tasks - egress TCP 443 only',
       SecurityGroupEgress: Match.arrayWith([
         Match.objectLike({
@@ -107,20 +195,17 @@ describe('EcsAgentCluster construct', () => {
   });
 
   test('creates a CloudWatch log group with 3-month retention and CDK-generated name', () => {
-    const { template } = createStack();
-    template.hasResourceProperties('AWS::Logs::LogGroup', {
+    baseTemplate.hasResourceProperties('AWS::Logs::LogGroup', {
       RetentionInDays: 90,
     });
-    // Verify no hardcoded log group name — CDK auto-generates a unique name
-    const logGroups = template.findResources('AWS::Logs::LogGroup');
+    const logGroups = baseTemplate.findResources('AWS::Logs::LogGroup');
     for (const [, lg] of Object.entries(logGroups)) {
       expect((lg as any).Properties).not.toHaveProperty('LogGroupName');
     }
   });
 
   test('task role has DynamoDB read/write permissions', () => {
-    const { template } = createStack();
-    template.hasResourceProperties('AWS::IAM::Policy', {
+    baseTemplate.hasResourceProperties('AWS::IAM::Policy', {
       PolicyDocument: {
         Statement: Match.arrayWith([
           Match.objectLike({
@@ -136,8 +221,7 @@ describe('EcsAgentCluster construct', () => {
   });
 
   test('task role has Secrets Manager read permission', () => {
-    const { template } = createStack();
-    template.hasResourceProperties('AWS::IAM::Policy', {
+    baseTemplate.hasResourceProperties('AWS::IAM::Policy', {
       PolicyDocument: {
         Statement: Match.arrayWith([
           Match.objectLike({
@@ -151,27 +235,91 @@ describe('EcsAgentCluster construct', () => {
     });
   });
 
-  test('task role has Bedrock InvokeModel permissions', () => {
-    const { template } = createStack();
-    template.hasResourceProperties('AWS::IAM::Policy', {
-      PolicyDocument: {
-        Statement: Match.arrayWith([
-          Match.objectLike({
-            Action: [
-              'bedrock:InvokeModel',
-              'bedrock:InvokeModelWithResponseStream',
-            ],
-            Effect: 'Allow',
-            Resource: '*',
-          }),
-        ]),
-      },
-    });
+  test('task role can read the per-workspace Linear/Jira OAuth secrets (ABCA-488)', () => {
+    // REGRESSION: a Linear/Jira-channel task resolves its per-workspace OAuth
+    // token (bgagent-linear-oauth-<slug>) at startup to fire the 👀→✅ reaction
+    // and drive the channel MCP. Without a prefix grant on the ECS task role the
+    // fetch hit AccessDenied and reactions/MCP silently no-op'd on ECS (worked on
+    // AgentCore). Pin a GetSecretValue statement whose resource ARN names the
+    // bgagent-linear-oauth-* prefix.
+    const policies = baseTemplate.findResources('AWS::IAM::Policy');
+    let hasLinearOauthGrant = false;
+    for (const p of Object.values(policies)) {
+      for (const s of p.Properties.PolicyDocument.Statement) {
+        const actions = Array.isArray(s.Action) ? s.Action : [s.Action];
+        if (!actions.includes('secretsmanager:GetSecretValue')) continue;
+        if (JSON.stringify(s.Resource).includes('bgagent-linear-oauth-')) hasLinearOauthGrant = true;
+      }
+    }
+    expect(hasLinearOauthGrant).toBe(true);
+  });
+
+  test('task role Bedrock InvokeModel is scoped to explicit model/inference-profile ARNs (no wildcard)', () => {
+    const policies = baseTemplate.findResources('AWS::IAM::Policy');
+    let bedrockStatement: { Resource: unknown } | undefined;
+    for (const policy of Object.values(policies)) {
+      for (const s of policy.Properties.PolicyDocument.Statement) {
+        const actions = Array.isArray(s.Action) ? s.Action : [s.Action];
+        if (actions.includes('bedrock:InvokeModel')) {
+          bedrockStatement = s;
+        }
+      }
+    }
+    expect(bedrockStatement).toBeDefined();
+    // Must NOT be a bare wildcard.
+    expect(bedrockStatement!.Resource).not.toEqual('*');
+    const serialized = JSON.stringify(bedrockStatement!.Resource);
+    expect(serialized).toContain('foundation-model/anthropic.claude-sonnet-4-6');
+    expect(serialized).toContain('inference-profile/us.anthropic.claude-sonnet-4-6');
+    expect(serialized).toContain('anthropic.claude-opus-4-20250514-v1:0');
+    expect(serialized).toContain('anthropic.claude-haiku-4-5-20251001-v1:0');
+  });
+
+  test('task role can DescribeAvailabilityZones so a CDK target repo can `cdk synth` on a fresh clone (ECS-parity)', () => {
+    // REGRESSION: `mise run build` on a CDK-based target repo runs `cdk synth`,
+    // and a stack wired to a concrete env does a synth-time AZ context lookup
+    // (ec2:DescribeAvailabilityZones). A dev box caches the answer in the
+    // gitignored cdk.context.json; the agent clones fresh (no cache) → the live
+    // lookup fires. Without this grant the ECS task role hit AccessDenied →
+    // "Synthesis finished with errors" → a FALSE build-gate failure. Pin the
+    // read-only describe (Resource:* — EC2 describe has no resource scoping).
+    const policies = baseTemplate.findResources('AWS::IAM::Policy');
+    let azStatement: { Resource: unknown } | undefined;
+    for (const p of Object.values(policies)) {
+      for (const s of p.Properties.PolicyDocument.Statement) {
+        const actions = Array.isArray(s.Action) ? s.Action : [s.Action];
+        if (actions.includes('ec2:DescribeAvailabilityZones')) azStatement = s;
+      }
+    }
+    expect(azStatement).toBeDefined();
+    expect(azStatement!.Resource).toEqual('*');
+  });
+
+  test('bedrockModels context override changes the granted model ARNs (#433)', () => {
+    const template = createStack({ bedrockModels: ['anthropic.claude-opus-4-8'] }).template;
+    const policies = template.findResources('AWS::IAM::Policy');
+    let bedrockStatement: { Resource: unknown } | undefined;
+    for (const policy of Object.values(policies)) {
+      for (const s of policy.Properties.PolicyDocument.Statement) {
+        const actions = Array.isArray(s.Action) ? s.Action : [s.Action];
+        if (actions.includes('bedrock:InvokeModel')) {
+          bedrockStatement = s;
+        }
+      }
+    }
+    expect(bedrockStatement).toBeDefined();
+    const serialized = JSON.stringify(bedrockStatement!.Resource);
+    // The override model is granted...
+    expect(serialized).toContain('foundation-model/anthropic.claude-opus-4-8');
+    expect(serialized).toContain('inference-profile/us.anthropic.claude-opus-4-8');
+    // ...and the defaults are NOT (the override replaces, not appends).
+    expect(serialized).not.toContain('claude-sonnet-4-6');
+    // Still scoped, never a wildcard.
+    expect(bedrockStatement!.Resource).not.toEqual('*');
   });
 
   test('container has required environment variables', () => {
-    const { template } = createStack();
-    template.hasResourceProperties('AWS::ECS::TaskDefinition', {
+    baseTemplate.hasResourceProperties('AWS::ECS::TaskDefinition', {
       ContainerDefinitions: Match.arrayWith([
         Match.objectLike({
           Name: 'AgentContainer',
@@ -181,10 +329,34 @@ describe('EcsAgentCluster construct', () => {
             Match.objectLike({ Name: 'TASK_EVENTS_TABLE_NAME', Value: Match.anyValue() }),
             Match.objectLike({ Name: 'USER_CONCURRENCY_TABLE_NAME', Value: Match.anyValue() }),
             Match.objectLike({ Name: 'LOG_GROUP_NAME', Value: Match.anyValue() }),
+            // K14: ECS big-box substrate raises the build-verify cap so a
+            // slow-but-healthy CI-parity build isn't mis-flagged as a timeout.
+            Match.objectLike({ Name: 'BUILD_VERIFY_TIMEOUT_S', Value: '3600' }),
           ]),
         }),
       ]),
     });
+  });
+
+  test('build def caps build parallelism to prevent OOM (K14 / ABCA-691)', () => {
+    // The build task def serializes the mise DAG (MISE_JOBS=1) and pins the jest
+    // fleet (JEST_MAX_WORKERS=4) so the cross-package build storm can't OOM the
+    // box while the coding agent is still resident. Asserted per-var (one
+    // arrayWith objectLike each): a single arrayWith with multiple objectLike
+    // entries is matched unreliably by the CDK assertions matcher, so each env
+    // var gets its own hasResourceProperties call — which also pins each to the
+    // SAME build container (the one carrying BUILD_VERIFY_TIMEOUT_S).
+    const envHas = (name: string, value: string) =>
+      baseTemplate.hasResourceProperties('AWS::ECS::TaskDefinition', {
+        ContainerDefinitions: Match.arrayWith([
+          Match.objectLike({
+            Environment: Match.arrayWith([Match.objectLike({ Name: name, Value: value })]),
+          }),
+        ]),
+      });
+    envHas('MISE_JOBS', '1');
+    envHas('JEST_MAX_WORKERS', '4');
+    envHas('BUILD_VERIFY_TIMEOUT_S', '3600');
   });
 
   test('includes MEMORY_ID in container env when provided', () => {
@@ -198,5 +370,298 @@ describe('EcsAgentCluster construct', () => {
         }),
       ]),
     });
+  });
+
+  // F-2 ECS-parity regression guard. The task role must be able to WRITE cross-
+  // task memory (bedrock-agentcore:CreateEvent), or episodic/semantic writes fail
+  // closed on ECS (memory_written: false — live-caught on the fork). This
+  // regressed silently because MEMORY_ID was wired into the env WITHOUT the
+  // matching grant, so the agent attempted a write it had no permission for.
+  describe('AgentCore Memory grant (F-2)', () => {
+    test('grants the task role bedrock-agentcore write when agentMemory is passed', () => {
+      const { template } = createStack({ withMemory: true });
+      template.hasResourceProperties('AWS::IAM::Policy', {
+        PolicyDocument: {
+          Statement: Match.arrayWith([
+            Match.objectLike({
+              Effect: 'Allow',
+              Action: Match.arrayWith([Match.stringLikeRegexp('bedrock-agentcore:.*Event')]),
+            }),
+          ]),
+        },
+      });
+    });
+
+    test('does NOT grant bedrock-agentcore write when agentMemory is omitted', () => {
+      // Negative proof: the isolated-construct default (no memory) must not
+      // emit a memory grant — otherwise the positive test proves nothing.
+      const { stack } = createStack();
+      const policies = Template.fromStack(stack).findResources('AWS::IAM::Policy');
+      const asJson = JSON.stringify(policies);
+      expect(asJson).not.toMatch(/bedrock-agentcore:[A-Za-z]*Event/);
+    });
+  });
+
+  describe('with a SessionRole wired (#209)', () => {
+    function createWithSessionRole(): Template {
+      const app = new App();
+      const stack = new Stack(app, 'EcsSessionStack');
+      const vpc = new ec2.Vpc(stack, 'Vpc', { maxAzs: 2 });
+      const agentImageAsset = new ecr_assets.DockerImageAsset(stack, 'AgentImage', {
+        directory: path.join(__dirname, '..', '..', '..', 'agent'),
+      });
+      const mk = (id: string) =>
+        new dynamodb.Table(stack, id, {
+          partitionKey: { name: 'task_id', type: dynamodb.AttributeType.STRING },
+        });
+      const taskTable = mk('TaskTable');
+      const taskEventsTable = mk('TaskEventsTable');
+      const userConcurrencyTable = new dynamodb.Table(stack, 'UserConcurrencyTable', {
+        partitionKey: { name: 'user_id', type: dynamodb.AttributeType.STRING },
+      });
+      const githubTokenSecret = new secretsmanager.Secret(stack, 'GitHubTokenSecret');
+      const sessionRole = new AgentSessionRole(stack, 'AgentSessionRole', {
+        assumingRoles: [
+          new iam.Role(stack, 'AgentCoreRole', {
+            assumedBy: new iam.ServicePrincipal('bedrock-agentcore.amazonaws.com'),
+          }),
+        ],
+        taskScopedTables: [taskTable, taskEventsTable],
+        traceArtifactsBucket: new s3.Bucket(stack, 'TraceBucket'),
+        attachmentsBucket: new s3.Bucket(stack, 'AttachmentsBucket'),
+      });
+
+      new EcsAgentCluster(stack, 'EcsAgentCluster', {
+        vpc,
+        agentImageAsset,
+        taskTable,
+        taskEventsTable,
+        userConcurrencyTable,
+        githubTokenSecret,
+        agentSessionRole: sessionRole,
+      });
+      return Template.fromStack(stack);
+    }
+
+    test('injects AGENT_SESSION_ROLE_ARN into the container', () => {
+      createWithSessionRole().hasResourceProperties('AWS::ECS::TaskDefinition', {
+        ContainerDefinitions: Match.arrayWith([
+          Match.objectLike({
+            Environment: Match.arrayWith([
+              Match.objectLike({ Name: 'AGENT_SESSION_ROLE_ARN', Value: Match.anyValue() }),
+            ]),
+          }),
+        ]),
+      });
+    });
+
+    test('task role gets sts:AssumeRole on the SessionRole, not direct task-table DDB grants', () => {
+      const template = createWithSessionRole();
+      const policies = template.findResources('AWS::IAM::Policy');
+
+      // Identify the task role's own inline policy: it is the one carrying the
+      // sts:AssumeRole grant (only the compute role receives that), as opposed
+      // to the SessionRole's policy (which carries the conditioned DDB
+      // statements). The task-role policy must NOT contain any unconditioned
+      // task-table DDB grant — that access now lives only on the SessionRole.
+      const taskRolePolicies = Object.entries(policies).filter(([id, p]) =>
+        // #299 ECS_RIGHTSIZED_PLANNING: the task role is now a SHARED standalone
+        // `TaskRole` construct (was the auto-generated role nested under the single
+        // FargateTaskDefinition, id `...TaskDefTaskRole...`), so both the build and
+        // planning defs pass the same role — its logical id is `...TaskRole...` and
+        // `ExecutionRole` doesn't match this substring.
+        id.includes('TaskRole')
+        && p.Properties.PolicyDocument.Statement.some((s: { Action: string | string[] }) => {
+          const actions = Array.isArray(s.Action) ? s.Action : [s.Action];
+          return actions.includes('sts:AssumeRole');
+        }),
+      );
+      expect(taskRolePolicies).toHaveLength(1);
+
+      const taskRoleStatements = taskRolePolicies[0][1].Properties.PolicyDocument.Statement;
+      // No unconditioned dynamodb item grant on the task role (the only DDB the
+      // task role may touch directly is UserConcurrencyTable — assert that any
+      // DDB statement present is NOT a leading-key-less task-table grant by
+      // checking none grant dynamodb write actions without a condition beyond
+      // the concurrency table). Simplest robust check: the task role carries no
+      // dynamodb:GetItem/Query/BatchWriteItem statement at all for the task
+      // tables — grantReadWriteData on a removed table would have produced one.
+      const ddbItemStatements = taskRoleStatements.filter((s: { Action: string | string[] }) => {
+        const actions = Array.isArray(s.Action) ? s.Action : [s.Action];
+        return actions.some((a: string) =>
+          ['dynamodb:GetItem', 'dynamodb:Query', 'dynamodb:BatchWriteItem'].includes(a),
+        );
+      });
+      // The only permitted DDB item access on the task role is the
+      // UserConcurrencyTable grant. The two task-scoped tables (TaskTable,
+      // TaskEventsTable) must NOT appear — assert no statement references them.
+      const serialized = JSON.stringify(ddbItemStatements);
+      expect(serialized).not.toContain('TaskTable');
+      expect(serialized).not.toContain('TaskEventsTable');
+
+      // The conditioned (SessionRole) DDB statements still exist — exactly two
+      // task-scoped tables, each leading-key gated.
+      let conditioned = 0;
+      for (const policy of Object.values(policies)) {
+        for (const s of policy.Properties.PolicyDocument.Statement) {
+          if (s.Condition?.['ForAllValues:StringEquals']?.['dynamodb:LeadingKeys']) {
+            conditioned += 1;
+          }
+        }
+      }
+      expect(conditioned).toBe(2);
+    });
+  });
+});
+
+describe('EcsAgentCluster payload bucket (#502)', () => {
+  function createWithPayloadBucket(): Template {
+    const app = new App();
+    const stack = new Stack(app, 'TestStack');
+    const vpc = new ec2.Vpc(stack, 'Vpc', { maxAzs: 2 });
+    const agentImageAsset = new ecr_assets.DockerImageAsset(stack, 'AgentImage', {
+      directory: path.join(__dirname, '..', '..', '..', 'agent'),
+    });
+    const taskTable = new dynamodb.Table(stack, 'TaskTable', {
+      partitionKey: { name: 'task_id', type: dynamodb.AttributeType.STRING },
+    });
+    const taskEventsTable = new dynamodb.Table(stack, 'TaskEventsTable', {
+      partitionKey: { name: 'task_id', type: dynamodb.AttributeType.STRING },
+      sortKey: { name: 'event_id', type: dynamodb.AttributeType.STRING },
+    });
+    const userConcurrencyTable = new dynamodb.Table(stack, 'UserConcurrencyTable', {
+      partitionKey: { name: 'user_id', type: dynamodb.AttributeType.STRING },
+    });
+    const githubTokenSecret = new secretsmanager.Secret(stack, 'GitHubTokenSecret');
+    const payloadBucket = new s3.Bucket(stack, 'PayloadBucket');
+
+    new EcsAgentCluster(stack, 'EcsAgentCluster', {
+      vpc,
+      agentImageAsset,
+      taskTable,
+      taskEventsTable,
+      userConcurrencyTable,
+      githubTokenSecret,
+      payloadBucket,
+    });
+    return Template.fromStack(stack);
+  }
+
+  test('injects ECS_PAYLOAD_BUCKET into the container env', () => {
+    createWithPayloadBucket().hasResourceProperties('AWS::ECS::TaskDefinition', {
+      ContainerDefinitions: Match.arrayWith([
+        Match.objectLike({
+          Environment: Match.arrayWith([
+            Match.objectLike({ Name: 'ECS_PAYLOAD_BUCKET', Value: Match.anyValue() }),
+          ]),
+        }),
+      ]),
+    });
+  });
+
+  test('grants the task role READ on the payload bucket, never write/delete', () => {
+    const template = createWithPayloadBucket();
+    const policies = template.findResources('AWS::IAM::Policy');
+    const s3Actions = new Set<string>();
+    for (const policy of Object.values(policies)) {
+      for (const stmt of policy.Properties.PolicyDocument.Statement) {
+        const actions = Array.isArray(stmt.Action) ? stmt.Action : [stmt.Action];
+        for (const a of actions) {
+          if (typeof a === 'string' && a.startsWith('s3:')) s3Actions.add(a);
+        }
+      }
+    }
+    // Read actions present...
+    expect([...s3Actions].some(a => a === 's3:GetObject' || a === 's3:GetObject*')).toBe(true);
+    // ...and NO write/delete on the payload bucket from the task role.
+    expect(s3Actions.has('s3:PutObject')).toBe(false);
+    expect(s3Actions.has('s3:DeleteObject')).toBe(false);
+    expect([...s3Actions].some(a => a.startsWith('s3:Put') || a.startsWith('s3:Delete'))).toBe(false);
+  });
+
+  test('omits ECS_PAYLOAD_BUCKET when no payload bucket is provided', () => {
+    const { template } = createStack();
+    const taskDefs = template.findResources('AWS::ECS::TaskDefinition');
+    for (const def of Object.values(taskDefs)) {
+      const env = def.Properties.ContainerDefinitions[0].Environment ?? [];
+      expect(env.some((e: { Name: string }) => e.Name === 'ECS_PAYLOAD_BUCKET')).toBe(false);
+    }
+  });
+});
+
+describe('EcsAgentCluster artifacts bucket (#299 ECS-parity)', () => {
+  function createWithArtifactsBucket(): Template {
+    const app = new App();
+    const stack = new Stack(app, 'TestStack');
+    const vpc = new ec2.Vpc(stack, 'Vpc', { maxAzs: 2 });
+    const agentImageAsset = new ecr_assets.DockerImageAsset(stack, 'AgentImage', {
+      directory: path.join(__dirname, '..', '..', '..', 'agent'),
+    });
+    const taskTable = new dynamodb.Table(stack, 'TaskTable', {
+      partitionKey: { name: 'task_id', type: dynamodb.AttributeType.STRING },
+    });
+    const taskEventsTable = new dynamodb.Table(stack, 'TaskEventsTable', {
+      partitionKey: { name: 'task_id', type: dynamodb.AttributeType.STRING },
+      sortKey: { name: 'event_id', type: dynamodb.AttributeType.STRING },
+    });
+    const userConcurrencyTable = new dynamodb.Table(stack, 'UserConcurrencyTable', {
+      partitionKey: { name: 'user_id', type: dynamodb.AttributeType.STRING },
+    });
+    const githubTokenSecret = new secretsmanager.Secret(stack, 'GitHubTokenSecret');
+    const artifactsBucket = new s3.Bucket(stack, 'ArtifactsBucket');
+
+    new EcsAgentCluster(stack, 'EcsAgentCluster', {
+      vpc,
+      agentImageAsset,
+      taskTable,
+      taskEventsTable,
+      userConcurrencyTable,
+      githubTokenSecret,
+      artifactsBucket,
+    });
+    return Template.fromStack(stack);
+  }
+
+  test('injects ARTIFACTS_BUCKET_NAME into the container env (parity with the AgentCore runtime)', () => {
+    createWithArtifactsBucket().hasResourceProperties('AWS::ECS::TaskDefinition', {
+      ContainerDefinitions: Match.arrayWith([
+        Match.objectLike({
+          Environment: Match.arrayWith([
+            Match.objectLike({ Name: 'ARTIFACTS_BUCKET_NAME', Value: Match.anyValue() }),
+          ]),
+        }),
+      ]),
+    });
+  });
+
+  test('does NOT grant the task role write on the artifacts bucket (the scoped SessionRole owns delivery)', () => {
+    // #596 review B1: coding/decompose-v1 delivers via the assumed SessionRole
+    // (scoped to artifacts/${task_id}/*), exactly like the AgentCore runtime —
+    // whose task role likewise has no direct artifacts grant. A whole-bucket
+    // grantReadWrite here would over-privilege the untrusted-code role and break
+    // cross-task isolation. The task role gets only the ARTIFACTS_BUCKET_NAME env.
+    const template = createWithArtifactsBucket();
+    const policies = template.findResources('AWS::IAM::Policy');
+    const s3WriteActions = new Set<string>();
+    for (const policy of Object.values(policies)) {
+      for (const stmt of policy.Properties.PolicyDocument.Statement) {
+        const actions = Array.isArray(stmt.Action) ? stmt.Action : [stmt.Action];
+        for (const a of actions) {
+          // Only true S3 mutations — Put*/Delete*. The read-only payload bucket
+          // (#502) legitimately grants GetObject*/List* on the task role.
+          if (typeof a === 'string' && /^s3:(Put|Delete)/.test(a)) s3WriteActions.add(a);
+        }
+      }
+    }
+    expect([...s3WriteActions]).toEqual([]);
+  });
+
+  test('omits ARTIFACTS_BUCKET_NAME when no artifacts bucket is provided', () => {
+    const { template } = createStack();
+    const taskDefs = template.findResources('AWS::ECS::TaskDefinition');
+    for (const def of Object.values(taskDefs)) {
+      const env = def.Properties.ContainerDefinitions[0].Environment ?? [];
+      expect(env.some((e: { Name: string }) => e.Name === 'ARTIFACTS_BUCKET_NAME')).toBe(false);
+    }
   });
 });
