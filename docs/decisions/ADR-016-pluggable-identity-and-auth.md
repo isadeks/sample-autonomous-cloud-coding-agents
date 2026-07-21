@@ -62,15 +62,28 @@ Two sub-decisions:
 
    **Verified constraint (the crux):** a Gateway MCP-server target always **consents and vaults the outbound OAuth token under the *gateway's own* workload identity** — `CreateGatewayTarget`'s OAuth config exposes only `{providerArn, scopes, customParameters, grantType}` (no `workloadIdentity` / `userId` / vault-reuse field, confirmed in the API reference), and the vault is keyed per `(workload_identity, user_id)`. So the gateway and the agent **cannot share one consent / one vault entry** — each consumer that needs the token consents once under its own workload identity. Sharing a single consent across the gateway MCP leg *and* the agent's direct API leg is **not a mode AgentCore offers**. OBO/`TOKEN_EXCHANGE` does not bridge this for every vendor: it re-mints via the provider's own client and requires the **downstream** IdP to implement RFC 8693 or RFC 7523 — which Microsoft Entra does (see the aws-samples OBO reference, which uses **three** app registrations, one per layer) but **Linear does not** (Linear's token endpoint supports only `authorization_code` / `refresh_token` / `client_credentials`, verified against Linear's own OAuth docs).
 
-   **Per-surface transport decision:**
+   **Transport is DERIVED, not enumerated — no per-vendor branching.** To avoid a lookup table of hardcoded vendor→mode assignments, each surface's descriptor carries two **capability flags**, and the transport is *computed* from them. Adding a vendor = filling in its flags; there is no new `if (surface === …)` code path. The two flags (both are facts about the vendor, discoverable at onboard time, not choices):
 
-   | Surface | Transport mode | MCP tool-use | Lifecycle ops (reactions / comments / status) | Consents on one app |
+   - `lifecycleViaGateway` — can the vendor's lifecycle ops (comment / react / status) be expressed as gateway tools? True iff an AgentCore built-in template covers them **or** the vendor's MCP exposes those tools.
+   - `gatewayOAuthOk` — can the gateway obtain the token for its MCP target under this vendor's OAuth? True for any grant AgentCore drives (auth-code with `prompt=consent`, client-creds, or OBO when the vendor implements RFC 8693/7523).
+
+   Derivation (the entire decision, one function, no vendor names):
+
+   ```
+   if (!gatewayOAuthOk)                    → Identity-direct   (agent holds MCP + all lifecycle; 1 consent)
+   else if (lifecycleViaGateway)           → Gateway-fronted   (gateway holds everything;         1 consent)
+   else                                    → Hybrid            (gateway=MCP, agent=lifecycle;     2 consents)
+   ```
+
+   The table below is **the output of that function for today's surfaces**, not hand-assigned modes — it's here to show the derivation is correct, and it must stay in sync with the flags (a drift check, like the other contract tables in this repo):
+
+   | Surface | `lifecycleViaGateway` | `gatewayOAuthOk` | ⇒ Derived transport | Consents |
    |---|---|---|---|---|
-   | **Jira** and other **built-in-template** vendors (Slack, Confluence, ServiceNow, Salesforce, Zendesk, …) | Gateway-fronted | Gateway MCP target | **Also gateway** — the built-in Jira template exposes `addComment`/`updateComment`/`getTransitions`/`DoTransition` as REST-API tools, so lifecycle ops need no separate path | 1 |
-   | **Linear** | **Hybrid (Option A)** — Linear has **no** built-in template and its hosted MCP exposes **no reaction tool** (verified live: 52 tools, zero reaction tools) | Gateway MCP target (its own 3LO consent; `prompt=consent` lets the same one app re-consent — proven live, target reached `READY`) | **Agent-direct GraphQL** via an Identity-vaulted token (its own consent) — `reactionCreate` / `issueUpdate`, exactly today's `linear_reactions.py`, re-sourced off the vault | 2 |
-   | **GitHub** | (separate track, per #249 P1) shared-PAT → per-user `GithubOauth2` | agent-direct | n/a (git/`gh`) | — |
+   | Jira, Slack, Confluence, ServiceNow, Salesforce, Zendesk, … | ✅ (built-in template exposes `addComment`/`DoTransition`/…) | ✅ | **Gateway-fronted** | 1 |
+   | Linear | ❌ (no template; MCP has no reaction tool — verified live: 52 tools, 0 reaction tools) | ✅ (`prompt=consent`, proven live to `READY`) | **Hybrid** | 2 |
+   | GitHub | ❌ (git/`gh`, not MCP lifecycle) | — | Identity-direct (separate track, #249 P1) | — |
 
-   All modes keep **one OAuth app per vendor + Identity-owned refresh + zero manual rotation**. Linear costs **two** one-time admin consents on its one app (gateway's MCP consent + agent's GraphQL consent) rather than one; that is the price of keeping the managed MCP endpoint for a vendor whose MCP lacks reaction tools and whose OAuth can't feed the gateway via OBO. The single-shared-token model the vault docs describe ("multiple workload identities, one provider") is real but does **not** extend to a gateway target reusing the agent's consent — hence two consents, not one.
+   So **Linear is not a special case in code** — it is the surface whose flags happen to be `(❌, ✅)`, which the derivation maps to Hybrid. If Linear's MCP later adds a reaction tool, its flag flips to `✅` and it becomes Gateway-fronted with **no ADR or code change** — the derivation does it. All modes keep **one OAuth app per vendor + Identity-owned refresh + zero manual rotation**; the only variable is consent count (1 or 2), itself derived. The single-shared-token vault model ("multiple workload identities, one provider") is real for readers that share a workload identity, but a gateway target cannot reuse another plane's consent (the crux above) — which is *why* the Hybrid branch needs 2 consents, not a design choice.
 
 ### Why a seam, not a rewrite
 
@@ -83,6 +96,7 @@ The abstraction is intentionally a contract, not a forklift of credential handli
 ## Consequences
 
 - (+) **One credential abstraction, not N resolvers.** New integrations register an adapter against one contract instead of re-implementing fetch + refresh + race handling per provider.
+- (+) **Transport is derived, not enumerated.** The Identity-direct / Gateway-fronted / Hybrid choice is computed from two per-surface capability flags (`lifecycleViaGateway`, `gatewayOAuthOk`), so there is no per-vendor branching and no "special case" for Linear — a new surface (or a vendor gaining an MCP reaction tool) changes flags, not code. A drift check keeps the example table in sync with the flags.
 - (+) **Per-user, per-repo scoping replaces the shared PAT.** Tokens bind to `(workload_identity, user_id)`, so the single GitHub PAT covering every repo and user gives way to scoped, short-lived credentials.
 - (+) **Cryptographic attribution, not asserted attribution.** OBO delegation carries an `act` claim (RFC 8693 delegation mode, `user ← agent`), which is joinable to #245's `trace_id` and #237's `correlation` block. The *who acted* is verifiable, not inferred from a webhook payload.
 - (+) **Operators can bring their own IdP.** The inbound descriptor lets a deployment run on Okta, Entra, or Keycloak without forking handler code.
