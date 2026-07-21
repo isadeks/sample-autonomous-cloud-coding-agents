@@ -49,6 +49,10 @@
  */
 
 import {
+  BedrockAgentCoreClient,
+  CompleteResourceTokenAuthCommand,
+} from '@aws-sdk/client-bedrock-agentcore';
+import {
   BedrockAgentCoreControlClient,
   CreateGatewayCommand,
   CreateGatewayTargetCommand,
@@ -64,14 +68,32 @@ import { LINEAR_AUTHORIZE_ENDPOINT, LINEAR_TOKEN_ENDPOINT, LINEAR_OAUTH_SCOPES }
 export const LINEAR_MCP_ENDPOINT = 'https://mcp.linear.app/mcp';
 
 /**
- * OAuth scopes requested for the gateway target. Matches the existing Linear
- * OAuth app scopes (read/write + app-actor scopes). `actor=app` (passed via
- * customParameters) is what makes the app:* scopes valid.
+ * OAuth scopes requested for the gateway target when `actor=app` — matches the
+ * existing Linear OAuth app scopes (read/write + app-actor scopes). `actor=app`
+ * (passed via customParameters) is what makes the app:* scopes valid.
  */
 export const GATEWAY_LINEAR_SCOPES = LINEAR_OAUTH_SCOPES;
 
+/**
+ * OAuth scopes for the `actor=user` path. Linear rejects the app-actor scopes
+ * (`app:assignable`/`app:mentionable`) in user actor mode with "The scopes
+ * requested are not valid for this actor mode.", so request only read+write.
+ * Used by the `--no-actor-app` diagnostic/non-app path.
+ */
+export const GATEWAY_LINEAR_USER_SCOPES = ['read', 'write'] as const;
+
 /** Prefix for the per-workspace resource names so they're greppable + sortable. */
 export const GATEWAY_NAME_PREFIX = 'bgagent-linear';
+
+/**
+ * Benign landing page AgentCore redirects the operator's browser to AFTER the
+ * token exchange completes. This is the OAuth target's `defaultReturnUrl`, and
+ * it must NOT be the provider callback URL: pointing it at the callback makes
+ * the browser re-hit `/identities/oauth2/callback/<uuid>` with no code/state,
+ * which returns "authorizationCode must not be null; state must not be null".
+ * Linear's own site is a safe, always-reachable landing spot.
+ */
+export const GATEWAY_POST_AUTH_LANDING_URL = 'https://linear.app/';
 
 /** Poll interval (ms) when waiting for a gateway/target to become ready. */
 const POLL_INTERVAL_MS = 4000;
@@ -106,8 +128,10 @@ export function cognitoDiscoveryUrl(region: string, userPoolId: string): string 
 
 export interface GatewayClientDeps {
   readonly region: string;
-  /** Injectable for tests; defaults to a real client. */
+  /** Control-plane client; injectable for tests, defaults to a real client. */
   readonly client?: BedrockAgentCoreControlClient;
+  /** Data-plane client (CompleteResourceTokenAuth); injectable for tests. */
+  readonly dataClient?: BedrockAgentCoreClient;
 }
 
 function makeClient(deps: GatewayClientDeps): BedrockAgentCoreControlClient {
@@ -213,8 +237,13 @@ export interface ProvisionPhase2Input {
   readonly slug: string;
   readonly gatewayId: string;
   readonly providerArn: string;
-  /** Where Linear redirects after consent. Registered on the Linear app too. */
-  readonly returnUrl: string;
+  /**
+   * Benign landing page AgentCore redirects the browser to AFTER the token
+   * exchange (the target's `defaultReturnUrl`). MUST NOT be the provider
+   * callback URL — see {@link GATEWAY_POST_AUTH_LANDING_URL}. Defaults to that
+   * landing URL when omitted.
+   */
+  readonly returnUrl?: string;
   readonly actorApp?: boolean;
 }
 
@@ -243,6 +272,13 @@ export async function provisionGatewayPhase2(
   const customParameters: Record<string, string> = { prompt: 'consent' };
   if (useActorApp) customParameters.actor = 'app';
 
+  // Scopes must match the actor mode: the app:* scopes are only valid with
+  // actor=app; requesting them in user mode makes Linear reject the consent
+  // ("scopes not valid for this actor mode").
+  const scopes = useActorApp
+    ? [...GATEWAY_LINEAR_SCOPES]
+    : [...GATEWAY_LINEAR_USER_SCOPES];
+
   const target = await client.send(new CreateGatewayTargetCommand({
     gatewayIdentifier: input.gatewayId,
     name: names.targetName,
@@ -260,9 +296,9 @@ export async function provisionGatewayPhase2(
         credentialProvider: {
           oauthCredentialProvider: {
             providerArn: input.providerArn,
-            scopes: [...GATEWAY_LINEAR_SCOPES],
+            scopes,
             grantType: 'AUTHORIZATION_CODE',
-            defaultReturnUrl: input.returnUrl,
+            defaultReturnUrl: input.returnUrl ?? GATEWAY_POST_AUTH_LANDING_URL,
             customParameters,
           },
         },
@@ -323,4 +359,42 @@ export async function waitForGatewayReady(
     await new Promise(r => setTimeout(r, intervalMs));
   }
   return 'CREATING';
+}
+
+/**
+ * Extract the OAuth2 PAR session URI from a target's authorization URL. The
+ * `authorizationUrl` returned by CreateGatewayTarget carries the session as a
+ * `request_uri=urn:ietf:params:oauth:request_uri:<handle>` query param; this is
+ * the exact `sessionUri` {@link completeResourceTokenAuth} needs to finalize.
+ */
+export function sessionUriFromAuthorizationUrl(authorizationUrl: string): string | undefined {
+  try {
+    const requestUri = new URL(authorizationUrl).searchParams.get('request_uri');
+    return requestUri ?? undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Finalize the browser consent by confirming the auth session on the DATA
+ * plane. **This call is mandatory** — the OAuth callback does NOT auto-complete
+ * the token vault, so without it the target sits in CREATE_PENDING_AUTH until it
+ * times out to FAILED. Live-verified 2026-07-20: one call flips the target
+ * CREATE_PENDING_AUTH → CREATING → READY in ~15s.
+ *
+ * @param userId       the `authorizationData.oauth2.userId` from Phase 2.
+ * @param sessionUri   the PAR `request_uri` from the authorization URL — see
+ *                     {@link sessionUriFromAuthorizationUrl}.
+ */
+export async function completeResourceTokenAuth(
+  deps: GatewayClientDeps,
+  userId: string,
+  sessionUri: string,
+): Promise<void> {
+  const client = deps.dataClient ?? new BedrockAgentCoreClient({ region: deps.region });
+  await client.send(new CompleteResourceTokenAuthCommand({
+    userIdentifier: { userId },
+    sessionUri,
+  }));
 }

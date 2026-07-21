@@ -36,8 +36,10 @@ import { loadConfig, loadCredentials } from '../config';
 import { CliError } from '../errors';
 import { formatJson } from '../format';
 import {
+  completeResourceTokenAuth,
   provisionGatewayPhase1,
   provisionGatewayPhase2,
+  sessionUriFromAuthorizationUrl,
   waitForGatewayReady,
   waitForTargetReady,
 } from '../linear-gateway';
@@ -1144,12 +1146,13 @@ export function makeLinearCommand(): Command {
 
         // ─── Find the existing registry row for this slug ──────────────
         // slug is not the PK (linear_workspace_id is), so scan for it — the
-        // registry is one small row per workspace.
+        // registry is one small row per workspace. NOTE: do NOT set Limit —
+        // DynamoDB applies Limit BEFORE the FilterExpression, so Limit:1 would
+        // examine a single (arbitrary) row and filter it out, missing the match.
         const found = await ddb.send(new ScanCommand({
           TableName: workspaceRegistryTable,
           FilterExpression: 'workspace_slug = :slug',
           ExpressionAttributeValues: { ':slug': slug },
-          Limit: 1,
         }));
         const row = found.Items?.[0];
         if (!row) {
@@ -1749,14 +1752,15 @@ async function runGatewayProvisioning(input: {
     return null;
   }
 
-  // Phase 2 — Linear MCP target (3LO / authorization-code), returns the consent URL.
+  // Phase 2 — Linear MCP target (3LO / authorization-code), returns the consent
+  // URL. defaultReturnUrl is intentionally NOT set to the callback (it's a
+  // post-exchange landing page; the module supplies a benign default).
   const p2 = await provisionGatewayPhase2(
     { region: input.region },
     {
       slug: input.slug,
       gatewayId: p1.gatewayId,
       providerArn: p1.providerArn,
-      returnUrl: p1.callbackUrl,
       actorApp: input.actorApp,
     },
   );
@@ -1768,6 +1772,22 @@ async function runGatewayProvisioning(input: {
     console.log('    Approve the Linear consent screen; you can close the tab after the redirect.');
     console.log();
     await promptLine('  Press Enter once you have completed the consent');
+
+    // Finalize the auth session on the data plane. This is MANDATORY: the OAuth
+    // callback does not auto-complete the vault, so without this the target
+    // stays in CREATE_PENDING_AUTH until it times out to FAILED.
+    const sessionUri = sessionUriFromAuthorizationUrl(p2.authorizationUrl);
+    if (p2.userId && sessionUri) {
+      try {
+        await completeResourceTokenAuth({ region: input.region }, p2.userId, sessionUri);
+      } catch (err) {
+        console.log();
+        console.log(`  ⚠ Could not finalize the auth session: ${err instanceof Error ? err.message : String(err)}`);
+        console.log('    (Session may have expired — re-run with --gateway to retry consent.)');
+      }
+    } else {
+      console.log('  ⚠ Missing userId/session — cannot finalize the auth session automatically.');
+    }
   }
 
   process.stdout.write('  → Waiting for the gateway target to become ready...');

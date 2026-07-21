@@ -17,15 +17,19 @@
  *  SOFTWARE.
  */
 
+import type { BedrockAgentCoreClient } from '@aws-sdk/client-bedrock-agentcore';
 import type { BedrockAgentCoreControlClient } from '@aws-sdk/client-bedrock-agentcore-control';
 
 import { CliError } from '../src/errors';
 import {
   cognitoDiscoveryUrl,
+  completeResourceTokenAuth,
   gatewayResourceNames,
+  GATEWAY_POST_AUTH_LANDING_URL,
   LINEAR_MCP_ENDPOINT,
   provisionGatewayPhase1,
   provisionGatewayPhase2,
+  sessionUriFromAuthorizationUrl,
   waitForTargetReady,
 } from '../src/linear-gateway';
 
@@ -134,10 +138,9 @@ describe('provisionGatewayPhase2', () => {
     slug: 'acme',
     gatewayId: 'gw-1',
     providerArn: 'arn:prov',
-    returnUrl: 'https://localhost:8080/oauth/callback',
   };
 
-  test('creates a 3LO Linear target (DEFAULT listing, actor=app + prompt=consent) and returns the auth URL', async () => {
+  test('creates a 3LO Linear target (DEFAULT listing, actor=app + prompt=consent, app scopes) and returns the auth URL', async () => {
     const { client, sent } = fakeClient({
       CreateGatewayTargetCommand: {
         targetId: 't-1',
@@ -150,6 +153,7 @@ describe('provisionGatewayPhase2', () => {
     expect(out.targetId).toBe('t-1');
     expect(out.status).toBe('CREATE_PENDING_AUTH');
     expect(out.authorizationUrl).toBe('https://consent');
+    expect(out.userId).toBe('u-1');
 
     const tgt = sent[0].input as any;
     expect(tgt.targetConfiguration.mcp.mcpServer.endpoint).toBe(LINEAR_MCP_ENDPOINT);
@@ -157,10 +161,32 @@ describe('provisionGatewayPhase2', () => {
     const oc = tgt.credentialProviderConfigurations[0].credentialProvider.oauthCredentialProvider;
     expect(oc.grantType).toBe('AUTHORIZATION_CODE');
     expect(oc.customParameters).toEqual({ actor: 'app', prompt: 'consent' });
-    expect(oc.defaultReturnUrl).toBe('https://localhost:8080/oauth/callback');
+    // app-actor requests the full scope set incl. the app:* scopes
+    expect(oc.scopes).toEqual(['read', 'write', 'app:assignable', 'app:mentionable']);
   });
 
-  test('--no-actor-app drops actor=app but keeps prompt=consent', async () => {
+  test('defaultReturnUrl falls back to the benign landing page, NOT the callback', async () => {
+    // Regression: setting defaultReturnUrl to the callback URL makes the browser
+    // re-hit /callback with no code/state → "authorizationCode must not be null".
+    const { client, sent } = fakeClient({
+      CreateGatewayTargetCommand: { targetId: 't-1', status: 'CREATE_PENDING_AUTH', authorizationData: { oauth2: {} } },
+    });
+    await provisionGatewayPhase2({ region: 'us-east-1', client }, base);
+    const oc = (sent[0].input as any).credentialProviderConfigurations[0].credentialProvider.oauthCredentialProvider;
+    expect(oc.defaultReturnUrl).toBe(GATEWAY_POST_AUTH_LANDING_URL);
+    expect(oc.defaultReturnUrl).not.toContain('/callback/');
+  });
+
+  test('an explicit returnUrl is honored when provided', async () => {
+    const { client, sent } = fakeClient({
+      CreateGatewayTargetCommand: { targetId: 't-1', status: 'CREATE_PENDING_AUTH', authorizationData: { oauth2: {} } },
+    });
+    await provisionGatewayPhase2({ region: 'us-east-1', client }, { ...base, returnUrl: 'https://example.com/done' });
+    const oc = (sent[0].input as any).credentialProviderConfigurations[0].credentialProvider.oauthCredentialProvider;
+    expect(oc.defaultReturnUrl).toBe('https://example.com/done');
+  });
+
+  test('--no-actor-app drops actor=app AND requests only user scopes (app:* invalid in user actor mode)', async () => {
     const { client, sent } = fakeClient({
       CreateGatewayTargetCommand: { targetId: 't-2', status: 'CREATE_PENDING_AUTH', authorizationData: { oauth2: {} } },
     });
@@ -168,6 +194,51 @@ describe('provisionGatewayPhase2', () => {
     const oc = (sent[0].input as any).credentialProviderConfigurations[0].credentialProvider.oauthCredentialProvider;
     expect(oc.customParameters).toEqual({ prompt: 'consent' });
     expect(oc.customParameters.actor).toBeUndefined();
+    expect(oc.scopes).toEqual(['read', 'write']);
+  });
+});
+
+describe('sessionUriFromAuthorizationUrl', () => {
+  test('extracts the PAR request_uri from the authorization URL', () => {
+    const url = 'https://bedrock-agentcore.us-east-1.amazonaws.com/identities/oauth2/authorize'
+      + '?request_uri=urn%3Aietf%3Aparams%3Aoauth%3Arequest_uri%3AABC123';
+    expect(sessionUriFromAuthorizationUrl(url)).toBe('urn:ietf:params:oauth:request_uri:ABC123');
+  });
+
+  test('returns undefined when there is no request_uri', () => {
+    expect(sessionUriFromAuthorizationUrl('https://consent.example/authorize')).toBeUndefined();
+  });
+
+  test('returns undefined for a malformed URL', () => {
+    expect(sessionUriFromAuthorizationUrl('not a url')).toBeUndefined();
+  });
+});
+
+describe('completeResourceTokenAuth', () => {
+  function fakeDataClient(): { client: BedrockAgentCoreClient; sent: { name: string; input: unknown }[] } {
+    const sent: { name: string; input: unknown }[] = [];
+    const client = {
+      send: (cmd: { constructor: { name: string }; input: unknown }) => {
+        sent.push({ name: cmd.constructor.name, input: cmd.input });
+        return Promise.resolve({});
+      },
+    } as unknown as BedrockAgentCoreClient;
+    return { client, sent };
+  }
+
+  test('finalizes the auth session on the data plane with userId + sessionUri', async () => {
+    const { client, sent } = fakeDataClient();
+    await completeResourceTokenAuth(
+      { region: 'us-east-1', dataClient: client },
+      'u-1',
+      'urn:ietf:params:oauth:request_uri:ABC123',
+    );
+    expect(sent).toHaveLength(1);
+    expect(sent[0].name).toBe('CompleteResourceTokenAuthCommand');
+    expect(sent[0].input).toEqual({
+      userIdentifier: { userId: 'u-1' },
+      sessionUri: 'urn:ietf:params:oauth:request_uri:ABC123',
+    });
   });
 });
 
