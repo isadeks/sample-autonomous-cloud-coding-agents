@@ -161,6 +161,7 @@ def _build_linear_entry(channel_metadata: dict[str, str] | None) -> dict[str, An
     gateway_url = (channel_metadata or {}).get(GATEWAY_URL_METADATA_KEY, "")
     if gateway_url:
         from gateway_auth import get_gateway_bearer_token
+
         bearer = get_gateway_bearer_token()
         if bearer:
             log("TASK", f"Linear MCP routed through AgentCore Gateway ({gateway_url})")

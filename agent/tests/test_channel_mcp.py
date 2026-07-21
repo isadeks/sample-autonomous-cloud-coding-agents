@@ -218,6 +218,7 @@ class TestLinearGatewayRouting:
 
     def _entry(self, tmp_path):
         from channel_mcp import LINEAR_MCP_SERVER_KEY
+
         return _read_mcp(str(tmp_path))["mcpServers"][LINEAR_MCP_SERVER_KEY]
 
     def test_routes_through_gateway_when_url_and_token_present(self, tmp_path, monkeypatch):
