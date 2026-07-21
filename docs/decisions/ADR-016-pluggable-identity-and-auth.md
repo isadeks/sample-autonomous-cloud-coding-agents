@@ -48,6 +48,20 @@ Two sub-decisions:
 
    **Linear is `CustomOauth2`, verified.** There is no `LinearOauth2` built-in vendor in the `credentialProviderVendor` enum — confirmed against the bedrock-agentcore-control service model (API version 2023-06-05), with zero drift across all 25 enum values. Linear is wired through `oauth2ProviderConfigInput.customOauth2ProviderConfig`: set `oauthDiscovery` (or explicit `authorizationEndpoint=https://linear.app/oauth/authorize` + `tokenEndpoint=https://api.linear.app/oauth/token`), `clientId`, `clientSecret`, and `clientAuthenticationMethod` (`CLIENT_SECRET_BASIC` or `CLIENT_SECRET_POST`). Linear's authorize URL takes `actor=app` (and `prompt=consent`) for workspace-actor tokens, passed as an extra authorization-request parameter — the same `actor=app` flow `linear-oauth-resolver.ts` already runs. Use `auth_flow=USER_FEDERATION` for per-workspace consent and copy `provider['callbackUrl']` into Linear's OAuth app redirect URIs. This is the same `CustomOauth2` shape the deep-dive uses for its M2M data-api example.
 
+3. **The outbound seam has TWO transport modes: Identity-direct and Gateway-fronted.** The resolver contract above answers *"where does the token come from"* (the vault). A separate, orthogonal question is *"who holds the MCP connection"* — the agent (writing `.mcp.json` straight to the vendor MCP) or an **AgentCore Gateway** fronting the vendor MCP as a managed endpoint. Both are legitimate; the descriptor picks one per surface. This was investigated live + against the API/CFN references and the AWS samples repo on 2026-07-21 (recorded below), because it materially changes what infra each surface needs.
+
+   **Verified constraint (the crux):** a Gateway MCP-server target always **consents and vaults the outbound OAuth token under the *gateway's own* workload identity** — `CreateGatewayTarget`'s OAuth config exposes only `{providerArn, scopes, customParameters, grantType}` (no `workloadIdentity` / `userId` / vault-reuse field, confirmed in the API reference), and the vault is keyed per `(workload_identity, user_id)`. So the gateway and the agent **cannot share one consent / one vault entry** — each consumer that needs the token consents once under its own workload identity. Sharing a single consent across the gateway MCP leg *and* the agent's direct API leg is **not a mode AgentCore offers**. OBO/`TOKEN_EXCHANGE` does not bridge this for every vendor: it re-mints via the provider's own client and requires the **downstream** IdP to implement RFC 8693 or RFC 7523 — which Microsoft Entra does (see the aws-samples OBO reference, which uses **three** app registrations, one per layer) but **Linear does not** (Linear's token endpoint supports only `authorization_code` / `refresh_token` / `client_credentials`, verified against Linear's own OAuth docs).
+
+   **Per-surface transport decision:**
+
+   | Surface | Transport mode | MCP tool-use | Lifecycle ops (reactions / comments / status) | Consents on one app |
+   |---|---|---|---|---|
+   | **Jira** and other **built-in-template** vendors (Slack, Confluence, ServiceNow, Salesforce, Zendesk, …) | Gateway-fronted | Gateway MCP target | **Also gateway** — the built-in Jira template exposes `addComment`/`updateComment`/`getTransitions`/`DoTransition` as REST-API tools, so lifecycle ops need no separate path | 1 |
+   | **Linear** | **Hybrid (Option A)** — Linear has **no** built-in template and its hosted MCP exposes **no reaction tool** (verified live: 52 tools, zero reaction tools) | Gateway MCP target (its own 3LO consent; `prompt=consent` lets the same one app re-consent — proven live, target reached `READY`) | **Agent-direct GraphQL** via an Identity-vaulted token (its own consent) — `reactionCreate` / `issueUpdate`, exactly today's `linear_reactions.py`, re-sourced off the vault | 2 |
+   | **GitHub** | (separate track, per #249 P1) shared-PAT → per-user `GithubOauth2` | agent-direct | n/a (git/`gh`) | — |
+
+   All modes keep **one OAuth app per vendor + Identity-owned refresh + zero manual rotation**. Linear costs **two** one-time admin consents on its one app (gateway's MCP consent + agent's GraphQL consent) rather than one; that is the price of keeping the managed MCP endpoint for a vendor whose MCP lacks reaction tools and whose OAuth can't feed the gateway via OBO. The single-shared-token model the vault docs describe ("multiple workload identities, one provider") is real but does **not** extend to a gateway target reusing the agent's consent — hence two consents, not one.
+
 ### Why a seam, not a rewrite
 
 The abstraction is intentionally a contract, not a forklift of credential handling onto AgentCore:
@@ -72,9 +86,12 @@ The abstraction is intentionally a contract, not a forklift of credential handli
 | Phase | Action | Gate |
 |---|---|---|
 | P0 ✅ | Re-validate `USER_FEDERATION` / OBO post-GA against the live service. | **Done 2026-06-14 (`us-east-1`): GO-LIKELY** — parked PAR bug does not reproduce (see [#249](https://github.com/aws-samples/sample-autonomous-cloud-coding-agents/issues/249)). Full GO pending one human consent click. |
-| P1 | Route GitHub through the vault `GithubOauth2` provider behind a flag; retire the shared PAT. | Flag-gated; PAT fallback retained until green. |
-| P2 | Move Linear onto the vault (`CustomOauth2`); delete the manual-refresh logic in `linear-oauth-resolver.ts`. | Per-workspace token isolation preserved. |
-| P3 | OBO `act`-claim delegation feeding #237's `correlation` block. | Delegation chain visible in audit. |
+| P1 | **Linear first (chosen 2026-07-21).** Build the outbound resolver seam + Identity-direct mode on Linear: agent pulls the vaulted `CustomOauth2` token (`GetResourceOauth2Token`, USER_FEDERATION) and uses it for the direct GraphQL lifecycle path (`linear_reactions.py`), while the gateway keeps the Linear MCP endpoint (Option A hybrid). Identity-first with the Secrets-Manager resolver as fallback; cut over once verified off SM. | Flag-gated; SM fallback retained until green; per-workspace isolation preserved. |
+| P2 | Jira gateway-fronted: MCP + REST lifecycle (`addComment`/`DoTransition`) both as gateway targets via the built-in template (or an OpenAPI target for API/CDK automation, since templates are Console-only). | One app, gateway-managed, Identity refresh. |
+| P3 | GitHub through the vault `GithubOauth2` provider behind a flag; retire the shared PAT. | Flag-gated; PAT fallback retained until green. |
+| P4 | OBO `act`-claim delegation feeding #237's `correlation` block. | Delegation chain visible in audit. |
+
+**Substrate independence (verified 2026-07-21, both proven live):** the vault path works on any compute. AgentCore Runtime injects the Workload Access Token as the `WorkloadAccessToken` header; ECS/Fargate/Lambda bootstrap it via `GetWorkloadAccessTokenForJWT(workloadName, userToken=<Cognito M2M JWT>)` against a **standalone** (non-service-linked) workload identity, then call `GetResourceOauth2Token`. Runtime-managed (service-linked) workload identities cannot self-vend, so the ECS path needs a manually-created workload identity. The runtime execution role today has `GetWorkloadAccessToken*` but **not** `GetResourceOauth2Token` — P1 adds it (+ `GetSecretValue` on `bedrock-agentcore-identity!*`), mirroring the gateway service role.
 
 ## Out of scope (this ADR)
 
