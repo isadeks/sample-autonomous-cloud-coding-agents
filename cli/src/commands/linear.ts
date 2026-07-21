@@ -801,6 +801,12 @@ export function makeLinearCommand(): Command {
       .option('--no-browser', 'Print the authorization URL instead of opening a browser (for SSH/headless)')
       .option('--no-actor-app', 'Drop actor=app from the OAuth flow (diagnostic)')
       .option('--gateway', 'Also federate this workspace\'s Linear MCP behind a per-workspace AgentCore Gateway (managed OAuth refresh; needs the stack deployed with --context linearGateway=true)')
+      // See enable-gateway: the gateway wants its OWN Linear app so its
+      // actor=app consent is a clean fresh install. add-workspace's main-app
+      // creds just got installed in THIS flow, so reusing them dead-ends the
+      // gateway's actor=app consent. Prefer a dedicated gateway app.
+      .option('--gateway-client-id <id>', 'Client ID of a DEDICATED Linear OAuth app for the gateway (recommended with --gateway; else reuses the main app and may dead-end on actor=app)')
+      .option('--gateway-client-secret <secret>', 'Client Secret for the dedicated gateway OAuth app (else prompted when --gateway-client-id is set)')
       .action(async (slug: string, opts) => {
         if (!SLUG_RE.test(slug)) {
           throw new CliError(
@@ -1015,12 +1021,34 @@ export function makeLinearCommand(): Command {
         // to record on the registry row so the agent routes MCP through it.
         let gatewayInfo: { gatewayId: string; gatewayUrl: string } | null = null;
         if (opts.gateway) {
+          // Prefer a dedicated gateway app so its actor=app consent is a fresh
+          // install (the main app was just installed above → reusing it would
+          // dead-end actor=app). Fall back to the main app with a warning.
+          let gwClientId = clientId;
+          let gwClientSecret = clientSecret;
+          if (opts.gatewayClientId) {
+            gwClientId = String(opts.gatewayClientId).trim();
+            gwClientSecret = (opts.gatewayClientSecret
+              ? String(opts.gatewayClientSecret)
+              : await promptSecret('  Dedicated gateway app Client Secret: ')).trim();
+            if (!gwClientSecret) {
+              throw new CliError('A gateway Client Secret is required when --gateway-client-id is set.');
+            }
+            console.log('  Using a DEDICATED gateway OAuth app (fresh install → actor=app consent works).');
+          } else if (useActorApp) {
+            console.log();
+            console.log('  ⚠ No --gateway-client-id: reusing the main Linear app for the gateway.');
+            console.log('    That app was just installed, so Linear will dead-end the actor=app consent');
+            console.log('    ("already installed") and only an actor=user token vaults — which FAILS');
+            console.log('    Linear MCP data reads. Prefer a separate gateway app via --gateway-client-id.');
+            console.log();
+          }
           gatewayInfo = await runGatewayProvisioning({
             region,
             stackName,
             slug,
-            clientId,
-            clientSecret,
+            clientId: gwClientId,
+            clientSecret: gwClientSecret,
             userPoolId: config.user_pool_id,
             actorApp: useActorApp,
           });
@@ -1120,11 +1148,22 @@ export function makeLinearCommand(): Command {
 
   linear.addCommand(
     new Command('enable-gateway')
-      .description('Enable AgentCore Gateway federation for an ALREADY-onboarded Linear workspace (managed OAuth refresh) — reuses stored creds, no re-onboarding')
+      .description('Enable AgentCore Gateway federation for an ALREADY-onboarded Linear workspace (managed OAuth refresh) — no re-onboarding of the main app')
       .argument('<slug>', 'Linear workspace urlKey of an already-onboarded workspace')
       .option('--region <region>', 'AWS region (defaults to configured region)')
       .option('--stack-name <name>', 'CloudFormation stack name', 'backgroundagent-dev')
       .option('--no-actor-app', 'Drop actor=app from the OAuth flow (diagnostic)')
+      // A DEDICATED Linear OAuth app for the gateway (distinct client_id) is
+      // STRONGLY recommended: the gateway's actor=app consent is a fresh
+      // *install* of that app in the workspace. If it reuses the main app's
+      // client_id (the fallback below), the main app is ALREADY installed, so
+      // Linear dead-ends the consent ("already installed") and only an
+      // actor=user token can be vaulted — which fails Linear MCP data reads.
+      // A separate gateway app installs cleanly ALONGSIDE the main app, so both
+      // the direct integration AND the gateway keep working. See
+      // docs/design/AGENTCORE_GATEWAY_MCP_SPIKE.md (F14 + the two-app model).
+      .option('--gateway-client-id <id>', 'Client ID of a DEDICATED Linear OAuth app for the gateway (recommended; else reuses the main app and may dead-end on actor=app)')
+      .option('--gateway-client-secret <secret>', 'Client Secret for the dedicated gateway OAuth app (else prompted when --gateway-client-id is set)')
       .action(async (slug: string, opts) => {
         if (!SLUG_RE.test(slug)) {
           throw new CliError(`Invalid workspace slug '${slug}'. Must be 4-50 chars matching [a-zA-Z0-9_-].`);
@@ -1168,23 +1207,54 @@ export function makeLinearCommand(): Command {
           );
         }
 
-        // ─── Reuse the stored OAuth app creds (no re-auth) ─────────────
-        const secretArn = row.oauth_secret_arn as string | undefined;
-        if (!secretArn) {
-          throw new CliError(`Workspace '${slug}' registry row has no oauth_secret_arn.`);
-        }
-        const secretVal = await sm.send(new GetSecretValueCommand({ SecretId: secretArn }));
-        if (!secretVal.SecretString) {
-          throw new CliError(`Workspace '${slug}' OAuth secret ${secretArn} has no value.`);
-        }
-        let stored: Partial<StoredLinearOauthToken>;
-        try {
-          stored = JSON.parse(secretVal.SecretString) as Partial<StoredLinearOauthToken>;
-        } catch (err) {
-          throw new CliError(`Workspace '${slug}' OAuth secret is not valid JSON: ${err instanceof Error ? err.message : String(err)}`);
-        }
-        if (!stored.client_id || !stored.client_secret) {
-          throw new CliError(`Workspace '${slug}' OAuth secret is missing client_id/client_secret.`);
+        // ─── Choose the gateway's OAuth app creds ──────────────────────
+        // Prefer a DEDICATED gateway app (distinct client_id) so its
+        // actor=app consent is a clean fresh install alongside the main app.
+        // Fall back to the workspace's stored main-app creds only if none is
+        // given — with a loud warning, because that path dead-ends actor=app
+        // on an already-installed main app (see the option help above).
+        let gatewayClientId: string;
+        let gatewayClientSecret: string;
+        if (opts.gatewayClientId) {
+          gatewayClientId = String(opts.gatewayClientId).trim();
+          gatewayClientSecret = (opts.gatewayClientSecret
+            ? String(opts.gatewayClientSecret)
+            : await promptSecret('  Dedicated gateway app Client Secret: ')).trim();
+          if (!gatewayClientSecret) {
+            throw new CliError('A gateway Client Secret is required when --gateway-client-id is set.');
+          }
+          console.log('  Using a DEDICATED gateway OAuth app (fresh install → actor=app consent works).');
+        } else {
+          // Fallback: reuse the workspace's stored main-app creds.
+          const secretArn = row.oauth_secret_arn as string | undefined;
+          if (!secretArn) {
+            throw new CliError(`Workspace '${slug}' registry row has no oauth_secret_arn.`);
+          }
+          const secretVal = await sm.send(new GetSecretValueCommand({ SecretId: secretArn }));
+          if (!secretVal.SecretString) {
+            throw new CliError(`Workspace '${slug}' OAuth secret ${secretArn} has no value.`);
+          }
+          let stored: Partial<StoredLinearOauthToken>;
+          try {
+            stored = JSON.parse(secretVal.SecretString) as Partial<StoredLinearOauthToken>;
+          } catch (err) {
+            throw new CliError(`Workspace '${slug}' OAuth secret is not valid JSON: ${err instanceof Error ? err.message : String(err)}`);
+          }
+          if (!stored.client_id || !stored.client_secret) {
+            throw new CliError(`Workspace '${slug}' OAuth secret is missing client_id/client_secret.`);
+          }
+          gatewayClientId = stored.client_id;
+          gatewayClientSecret = stored.client_secret;
+          if (opts.actorApp !== false) {
+            console.log();
+            console.log('  ⚠ No --gateway-client-id given: reusing the MAIN Linear app.');
+            console.log('    Because that app is ALREADY installed in this workspace, Linear will');
+            console.log('    dead-end the actor=app consent ("already installed") and only an');
+            console.log('    actor=user token can be vaulted — which FAILS Linear MCP data reads.');
+            console.log('    Strongly recommended: create a separate Linear OAuth app for the gateway');
+            console.log('    and pass --gateway-client-id/--gateway-client-secret. Continuing anyway.');
+            console.log();
+          }
         }
 
         // ─── Provision the gateway (interactive: callback + consent) ───
@@ -1192,8 +1262,8 @@ export function makeLinearCommand(): Command {
           region,
           stackName,
           slug,
-          clientId: stored.client_id,
-          clientSecret: stored.client_secret,
+          clientId: gatewayClientId,
+          clientSecret: gatewayClientSecret,
           userPoolId: config.user_pool_id,
           actorApp: opts.actorApp !== false,
         });
