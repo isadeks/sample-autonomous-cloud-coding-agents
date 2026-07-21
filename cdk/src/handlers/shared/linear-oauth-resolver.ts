@@ -64,6 +64,11 @@ export interface RegistryRow {
   readonly workspace_slug: string;
   readonly oauth_secret_arn: string;
   readonly status: RegistryRowStatus;
+  /** Per-workspace AgentCore Gateway MCP URL, present once the workspace has
+   *  been gateway-enabled (`bgagent linear enable-gateway` / `add-workspace
+   *  --gateway`). When set, the agent routes the Linear MCP through the gateway
+   *  instead of the direct `mcp.linear.app` path. */
+  readonly gateway_url?: string;
 }
 
 export interface StoredOauthToken {
@@ -144,6 +149,10 @@ export interface ResolvedLinearToken {
   readonly scope: string;
   readonly workspaceSlug: string;
   readonly oauthSecretArn: string;
+  /** Per-workspace AgentCore Gateway MCP URL (from the registry row), present
+   *  only for gateway-enabled workspaces. Callers stamp this into the task's
+   *  `channel_metadata.gateway_url` so the agent routes Linear MCP through it. */
+  readonly gatewayUrl?: string;
 }
 
 export async function resolveLinearOauthToken(
@@ -206,6 +215,7 @@ export async function resolveLinearOauthToken(
     scope: token.scope,
     workspaceSlug: token.workspace_slug,
     oauthSecretArn: row.oauth_secret_arn,
+    ...(row.gateway_url ? { gatewayUrl: row.gateway_url } : {}),
   };
 }
 
@@ -300,6 +310,11 @@ function parseRegistryRow(rawItem: unknown, linearWorkspaceId: string): Registry
     workspace_slug: item.workspace_slug,
     oauth_secret_arn: item.oauth_secret_arn,
     status,
+    // Optional: only present on gateway-enabled workspaces. A non-string value
+    // (corrupt row) is dropped so downstream routing falls back to direct.
+    ...(typeof item.gateway_url === 'string' && item.gateway_url
+      ? { gateway_url: item.gateway_url }
+      : {}),
   };
   registryCache.set(linearWorkspaceId, { value: row, expiresAt: Date.now() + REGISTRY_CACHE_TTL_MS });
   return row;

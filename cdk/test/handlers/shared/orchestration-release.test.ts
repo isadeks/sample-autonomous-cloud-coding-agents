@@ -103,6 +103,43 @@ describe('releaseChild — idempotency key is accepted by the REAL validator', (
   });
 });
 
+describe('releaseChild — gateway_url routing', () => {
+  test('stamps gateway_url into the child channel_metadata when provided', async () => {
+    const createTaskCore = created('T-1');
+    await releaseChild({
+      ddb: { send: jest.fn().mockResolvedValue({}) } as never,
+      tableName: 'OrchestrationTable',
+      row: makeRow(),
+      platformUserId: 'user-1',
+      linearOauthSecretArn: 'arn:secret:acme',
+      linearWorkspaceSlug: 'acme',
+      gatewayUrl: 'https://gw-acme.gateway.bedrock-agentcore.us-east-1.amazonaws.com/mcp',
+      createTaskCore: createTaskCore as never,
+      now: NOW,
+    });
+    const ctx = createTaskCore.mock.calls[0][1];
+    expect(ctx.channelMetadata.gateway_url).toBe(
+      'https://gw-acme.gateway.bedrock-agentcore.us-east-1.amazonaws.com/mcp',
+    );
+  });
+
+  test('omits gateway_url for a non-gateway-enabled workspace', async () => {
+    const createTaskCore = created('T-1');
+    await releaseChild({
+      ddb: { send: jest.fn().mockResolvedValue({}) } as never,
+      tableName: 'OrchestrationTable',
+      row: makeRow(),
+      platformUserId: 'user-1',
+      linearOauthSecretArn: 'arn:secret:acme',
+      linearWorkspaceSlug: 'acme',
+      createTaskCore: createTaskCore as never,
+      now: NOW,
+    });
+    const ctx = createTaskCore.mock.calls[0][1];
+    expect(ctx.channelMetadata.gateway_url).toBeUndefined();
+  });
+});
+
 describe('releaseChild — ABCA-659 retry salts the idempotency key with the prior task id', () => {
   test('retry=true + a prior child_task_id → key salted so a NEW task is created', async () => {
     const createTaskCore = created('T-new');

@@ -249,6 +249,27 @@ describe('seedOrchestration — first write', () => {
     const meta = puts.find((p) => p.PutRequest.Item.sub_issue_id === '#meta')!.PutRequest.Item;
     expect(meta.channel_source).toBeUndefined();
   });
+
+  test('persists gateway_url on the meta row so released children route through the gateway', async () => {
+    const ddb = makeDdb();
+    ddb.send.mockResolvedValueOnce({ Item: undefined }).mockResolvedValueOnce({});
+
+    const gatewayUrl = 'https://gw-acme.gateway.bedrock-agentcore.us-east-1.amazonaws.com/mcp';
+    await seedOrchestration({
+      ddb: ddb as never,
+      tableName: TABLE,
+      parentLinearIssueId: 'PARENT',
+      linearWorkspaceId: 'WS',
+      repo: 'o/r',
+      children: [child('A')],
+      now: NOW,
+      releaseContext: { platform_user_id: 'u1', gateway_url: gatewayUrl },
+    });
+
+    const puts = ddb.send.mock.calls[1][0].input.RequestItems[TABLE] as Array<{ PutRequest: { Item: Record<string, unknown> } }>;
+    const meta = puts.find((p) => p.PutRequest.Item.sub_issue_id === '#meta')!.PutRequest.Item;
+    expect(meta.gateway_url).toBe(gatewayUrl);
+  });
 });
 
 describe('seedOrchestration — idempotent replay', () => {
@@ -361,6 +382,21 @@ describe('loadOrchestration — marker rows are not children (#247 UX.20)', () =
     expect(snap).not.toBeNull();
     const ids = snap!.children.map((c) => c.sub_issue_id).sort();
     expect(ids).toEqual(['orch_1__integration', 'uuid-A']); // ack# row excluded; integration kept
+  });
+
+  test('rehydrates release_context.gateway_url from the meta row', async () => {
+    const gatewayUrl = 'https://gw-acme.gateway.bedrock-agentcore.us-east-1.amazonaws.com/mcp';
+    const ddb = {
+      send: jest.fn().mockResolvedValueOnce({
+        Items: [
+          { orchestration_id: 'orch_1', sub_issue_id: '#meta', parent_linear_issue_id: 'P', linear_workspace_id: 'WS', repo: 'o/r', platform_user_id: 'u1', child_count: 1, gateway_url: gatewayUrl },
+          { orchestration_id: 'orch_1', sub_issue_id: 'uuid-A', depends_on: [], child_status: 'ready' },
+        ],
+      }),
+    };
+    const snap = await loadOrchestration(ddb as never, TABLE, 'orch_1');
+    expect(snap).not.toBeNull();
+    expect(snap!.meta.release_context.gateway_url).toBe(gatewayUrl);
   });
 
   test('paginates a multi-page Query so a large epic is NOT truncated to one 1MB page', async () => {

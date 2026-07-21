@@ -127,6 +127,38 @@ describe('resolveLinearOauthToken', () => {
       workspaceSlug: 'acme',
       oauthSecretArn: 'arn:secret:acme',
     });
+    // Non-gateway workspace: gatewayUrl must be absent (agent uses direct path).
+    expect(result?.gatewayUrl).toBeUndefined();
+  });
+
+  test('surfaces gatewayUrl for a gateway-enabled workspace', async () => {
+    const clients = makeFakeClients({
+      registryItem: {
+        workspace_slug: 'acme',
+        oauth_secret_arn: 'arn:secret:acme',
+        status: 'active',
+        gateway_url: 'https://gw-acme.gateway.bedrock-agentcore.us-east-1.amazonaws.com/mcp',
+      },
+      storedToken: makeStoredToken(),
+    });
+
+    const result = await resolveLinearOauthToken('ws-uuid-1', REGISTRY_TABLE, clients);
+    expect(result?.gatewayUrl).toBe('https://gw-acme.gateway.bedrock-agentcore.us-east-1.amazonaws.com/mcp');
+  });
+
+  test('drops a non-string gateway_url (corrupt row) so routing falls back to direct', async () => {
+    const clients = makeFakeClients({
+      registryItem: {
+        workspace_slug: 'acme',
+        oauth_secret_arn: 'arn:secret:acme',
+        status: 'active',
+        gateway_url: 12345 as unknown as string,
+      },
+      storedToken: makeStoredToken(),
+    });
+
+    const result = await resolveLinearOauthToken('ws-uuid-1', REGISTRY_TABLE, clients);
+    expect(result?.gatewayUrl).toBeUndefined();
   });
 
   test('returns null when workspace is not in the registry', async () => {

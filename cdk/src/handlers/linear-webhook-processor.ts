@@ -529,6 +529,10 @@ export async function handler(event: ProcessorEvent): Promise<void> {
     }
     channelMetadata.linear_oauth_secret_arn = resolved.oauthSecretArn;
     channelMetadata.linear_workspace_slug = resolved.workspaceSlug;
+    // Gateway-enabled workspaces: route the agent's Linear MCP through the
+    // per-workspace AgentCore Gateway (channel_mcp.py reads this key). Absent
+    // when the workspace hasn't been gateway-enabled → agent uses direct path.
+    if (resolved.gatewayUrl) channelMetadata.gateway_url = resolved.gatewayUrl;
     resolvedAccessToken = resolved.accessToken;
     // Best-effort presence probe: ask Linear once whether the issue has
     // paperclip attachments or sits in a project with documents. The agent
@@ -563,6 +567,9 @@ export async function handler(event: ProcessorEvent): Promise<void> {
       }),
       ...(channelMetadata.linear_workspace_slug && {
         linear_workspace_slug: channelMetadata.linear_workspace_slug,
+      }),
+      ...(channelMetadata.gateway_url && {
+        gateway_url: channelMetadata.gateway_url,
       }),
       linear_project_id: projectId,
     };
@@ -1484,6 +1491,7 @@ async function handleCommentTrigger(payload: LinearCommentEvent): Promise<void> 
     const verdictChannelMetadata: Record<string, string> = {
       linear_oauth_secret_arn: resolved.oauthSecretArn,
       linear_workspace_slug: resolved.workspaceSlug,
+      ...(resolved.gatewayUrl ? { gateway_url: resolved.gatewayUrl } : {}),
     };
     const verdictProjectId = pending.linear_project_id ?? '';
 

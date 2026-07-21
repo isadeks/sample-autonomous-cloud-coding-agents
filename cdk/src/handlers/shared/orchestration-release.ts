@@ -111,6 +111,9 @@ export interface ReleaseChildParams {
   readonly linearOauthSecretArn?: string;
   readonly linearWorkspaceSlug?: string;
   readonly linearProjectId?: string;
+  /** Per-workspace AgentCore Gateway MCP URL — routes the child's Linear MCP
+   *  through the gateway. Absent for non-gateway-enabled workspaces. */
+  readonly gatewayUrl?: string;
   /** The base branch this child stacks on (#247 A4). Absent → root (off main). */
   readonly baseBranch?: string;
   /**
@@ -211,6 +214,7 @@ export async function releaseChild(params: ReleaseChildParams): Promise<ReleaseC
   if (params.linearProjectId) channelMetadata.linear_project_id = params.linearProjectId;
   if (params.linearOauthSecretArn) channelMetadata.linear_oauth_secret_arn = params.linearOauthSecretArn;
   if (params.linearWorkspaceSlug) channelMetadata.linear_workspace_slug = params.linearWorkspaceSlug;
+  if (params.gatewayUrl) channelMetadata.gateway_url = params.gatewayUrl;
   // #247 A4: stacked base branch + (diamond) predecessor merge-list. The
   // orchestrator reads these to set the agent payload's base_branch +
   // merge_branches. Absent for roots (agent branches off main as today).
@@ -414,6 +418,9 @@ export async function releaseReadyChildren(
       }),
       ...(releaseContext.linear_workspace_slug !== undefined && {
         linearWorkspaceSlug: releaseContext.linear_workspace_slug,
+      }),
+      ...(releaseContext.gateway_url !== undefined && {
+        gatewayUrl: releaseContext.gateway_url,
       }),
       ...(releaseContext.linear_project_id !== undefined && {
         linearProjectId: releaseContext.linear_project_id,

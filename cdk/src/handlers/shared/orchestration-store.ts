@@ -120,6 +120,10 @@ export interface OrchestrationReleaseContext {
   readonly linear_oauth_secret_arn?: string;
   readonly linear_workspace_slug?: string;
   readonly linear_project_id?: string;
+  /** Per-workspace AgentCore Gateway MCP URL — stamped onto child tasks'
+   *  channel_metadata.gateway_url so released children route Linear MCP through
+   *  the gateway. Absent for non-gateway-enabled workspaces. */
+  readonly gateway_url?: string;
 }
 
 export interface SeedOrchestrationParams {
@@ -227,6 +231,9 @@ export async function seedOrchestration(
     }),
     ...(releaseContext.linear_workspace_slug !== undefined && {
       linear_workspace_slug: releaseContext.linear_workspace_slug,
+    }),
+    ...(releaseContext.gateway_url !== undefined && {
+      gateway_url: releaseContext.gateway_url,
     }),
     ...(releaseContext.linear_project_id !== undefined && {
       linear_project_id: releaseContext.linear_project_id,
@@ -623,6 +630,9 @@ export async function loadOrchestration(
       }),
       ...(metaItem.linear_workspace_slug !== undefined && {
         linear_workspace_slug: metaItem.linear_workspace_slug as string,
+      }),
+      ...(metaItem.gateway_url !== undefined && {
+        gateway_url: metaItem.gateway_url as string,
       }),
       ...(metaItem.linear_project_id !== undefined && {
         linear_project_id: metaItem.linear_project_id as string,
