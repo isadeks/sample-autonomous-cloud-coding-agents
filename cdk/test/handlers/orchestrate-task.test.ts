@@ -70,6 +70,7 @@ process.env.MEMORY_ID = 'mem-test-default';
 import {
   admissionControl,
   emitTaskEvent,
+  envelopeFor,
   failTask,
   finalizeTask,
   hydrateAndTransition,
@@ -170,11 +171,11 @@ describe('hydrateAndTransition', () => {
     expect(payload.max_turns).toBe(50);
   });
 
-  test('defaults max_turns to 100 when not on task record and no blueprint config', async () => {
+  test('defaults max_turns to 200 when not on task record and no blueprint config', async () => {
     mockDdbSend.mockResolvedValue({});
     mockHydrateContext.mockResolvedValueOnce(mockHydratedContext);
     const payload = await hydrateAndTransition(baseTask as any);
-    expect(payload.max_turns).toBe(100);
+    expect(payload.max_turns).toBe(200);
   });
 
   test('threads trace: true into the agent payload when set on the task record', async () => {
@@ -233,7 +234,7 @@ describe('hydrateAndTransition', () => {
       ...mockHydratedContext,
       guardrail_blocked: 'PR context blocked by content policy',
     });
-    const prTask = { ...baseTask, task_type: 'pr_iteration', pr_number: 10 };
+    const prTask = { ...baseTask, resolved_workflow: { id: 'coding/pr-iteration-v1', version: '1.0.0' }, pr_number: 10 };
     await expect(hydrateAndTransition(prTask as any)).rejects.toThrow(
       'Guardrail blocked: PR context blocked by content policy',
     );
@@ -245,7 +246,7 @@ describe('hydrateAndTransition', () => {
     const guardrailEvent = putCalls.find((item: any) => item.event_type === 'guardrail_blocked');
     expect(guardrailEvent).toBeDefined();
     expect(guardrailEvent.metadata.reason).toBe('PR context blocked by content policy');
-    expect(guardrailEvent.metadata.task_type).toBe('pr_iteration');
+    expect(guardrailEvent.metadata.resolved_workflow).toBe('coding/pr-iteration-v1');
     expect(guardrailEvent.metadata.pr_number).toBe(10);
     expect(guardrailEvent.metadata.sources).toEqual(['task_description']);
     expect(guardrailEvent.metadata.token_estimate).toBe(20);
@@ -265,7 +266,7 @@ describe('hydrateAndTransition', () => {
       ...mockHydratedContext,
       guardrail_blocked: 'PR context blocked by content policy',
     });
-    const prTask = { ...baseTask, task_type: 'pr_iteration', pr_number: 10 };
+    const prTask = { ...baseTask, resolved_workflow: { id: 'coding/pr-iteration-v1', version: '1.0.0' }, pr_number: 10 };
     await expect(hydrateAndTransition(prTask as any)).rejects.toThrow(
       'Guardrail blocked: PR context blocked by content policy',
     );
@@ -285,6 +286,91 @@ describe('hydrateAndTransition', () => {
     expect(metadata.token_estimate).toBe(20);
     expect(metadata.truncated).toBe(false);
     expect(metadata.content_trust).toEqual({ task_description: 'trusted' });
+  });
+
+  test('lifecycle events carry the {user_id, repo} correlation envelope (#245)', async () => {
+    mockDdbSend.mockResolvedValue({});
+    mockHydrateContext.mockResolvedValueOnce(mockHydratedContext);
+    await hydrateAndTransition(baseTask as any);
+    const events = mockDdbSend.mock.calls
+      .filter((c: any) => c[0]._type === 'Put')
+      .map((c: any) => c[0].input.Item);
+    for (const eventType of ['hydration_started', 'hydration_complete']) {
+      const evt = events.find((e: any) => e.event_type === eventType);
+      expect(evt).toMatchObject({ user_id: 'user-123', repo: 'org/repo' });
+    }
+  });
+
+  test('repo-less task omits repo but still stamps user_id (#245, #248)', async () => {
+    mockDdbSend.mockResolvedValue({});
+    mockHydrateContext.mockResolvedValueOnce(mockHydratedContext);
+    const { repo: _repo, ...repoLess } = baseTask;
+    await hydrateAndTransition(repoLess as any);
+    const started = mockDdbSend.mock.calls
+      .filter((c: any) => c[0]._type === 'Put')
+      .map((c: any) => c[0].input.Item)
+      .find((e: any) => e.event_type === 'hydration_started');
+    expect(started.user_id).toBe('user-123');
+    expect(started).not.toHaveProperty('repo');
+  });
+});
+
+describe('emitTaskEvent — correlation envelope (#245)', () => {
+  test('stamps user_id and repo as top-level fields when supplied', async () => {
+    mockDdbSend.mockResolvedValue({});
+    await emitTaskEvent('TASK001', 'session_started', { session_id: 's-1' }, { user_id: 'user-123', repo: 'org/repo' });
+    const item = mockDdbSend.mock.calls.find((c: any) => c[0]._type === 'Put')[0].input.Item;
+    expect(item).toMatchObject({
+      task_id: 'TASK001',
+      event_type: 'session_started',
+      user_id: 'user-123',
+      repo: 'org/repo',
+    });
+    expect(item.metadata).toEqual({ session_id: 's-1' });
+  });
+
+  test('omits repo (not null/empty) when repo-less, keeps user_id', async () => {
+    mockDdbSend.mockResolvedValue({});
+    await emitTaskEvent('TASK001', 'task_failed', undefined, { user_id: 'user-123', repo: undefined });
+    const item = mockDdbSend.mock.calls.find((c: any) => c[0]._type === 'Put')[0].input.Item;
+    expect(item.user_id).toBe('user-123');
+    expect(item).not.toHaveProperty('repo');
+  });
+
+  test('omits both when no correlation is supplied (back-compat)', async () => {
+    mockDdbSend.mockResolvedValue({});
+    await emitTaskEvent('TASK001', 'task_created');
+    const item = mockDdbSend.mock.calls.find((c: any) => c[0]._type === 'Put')[0].input.Item;
+    expect(item).not.toHaveProperty('user_id');
+    expect(item).not.toHaveProperty('repo');
+  });
+});
+
+describe('envelopeFor — single source for log context + event correlation (#245)', () => {
+  function captureLine(fn: () => void): Record<string, unknown> {
+    const lines: string[] = [];
+    const spy = jest.spyOn(process.stdout, 'write').mockImplementation((chunk: unknown) => {
+      lines.push(String(chunk));
+      return true;
+    });
+    try { fn(); } finally { spy.mockRestore(); }
+    return JSON.parse(lines[0]) as Record<string, unknown>;
+  }
+
+  test('log child and correlation both carry user_id + repo', () => {
+    const { log, correlation } = envelopeFor({ task_id: 't-1', user_id: 'u-1', repo: 'o/r' });
+    // Regression guard for the loadBlueprintConfig gap: the log child must carry
+    // user_id, not just task_id/repo — every admission→terminal line needs it.
+    expect(captureLine(() => log.info('x'))).toMatchObject({ task_id: 't-1', user_id: 'u-1', repo: 'o/r' });
+    expect(correlation).toEqual({ user_id: 'u-1', repo: 'o/r' });
+  });
+
+  test('repo-less: repo omitted from the log line and left undefined on correlation', () => {
+    const { log, correlation } = envelopeFor({ task_id: 't-1', user_id: 'u-1' });
+    const line = captureLine(() => log.info('x'));
+    expect(line).toMatchObject({ task_id: 't-1', user_id: 'u-1' });
+    expect(line).not.toHaveProperty('repo');
+    expect(correlation.repo).toBeUndefined();
   });
 });
 
@@ -668,6 +754,33 @@ describe('loadBlueprintConfig', () => {
     const config = await loadBlueprintConfig(baseTask as any);
     expect(config.cedar_policies).toBeUndefined();
   });
+
+  // Compute substrate is a per-repo property that applies to ALL workflows: a
+  // read-only decompose/review task clones + reads the SAME repo, so it needs the
+  // SAME compute (a repo big enough to need the 64GB ECS tier to build also OOMs
+  // the AgentCore microVM just reading it). So an ecs repo's ecs compute_type
+  // flows through regardless of the workflow's read-only-ness.
+  const ecsRepoConfig = {
+    repo: 'org/repo',
+    status: 'active' as const,
+    onboarded_at: '2024-01-01T00:00:00Z',
+    updated_at: '2024-01-01T00:00:00Z',
+    compute_type: 'ecs' as const,
+  };
+
+  test('a read-only workflow (coding/decompose-v1) on an ecs repo INHERITS ecs (same repo, same footprint)', async () => {
+    mockLoadRepoConfig.mockResolvedValueOnce(ecsRepoConfig);
+    const planTask = { ...baseTask, resolved_workflow: { id: 'coding/decompose-v1', version: '1.0.0' } };
+    const config = await loadBlueprintConfig(planTask as any);
+    expect(config.compute_type).toBe('ecs');
+  });
+
+  test('a writeable workflow (coding/new-task-v1) on an ecs repo also uses ecs', async () => {
+    mockLoadRepoConfig.mockResolvedValueOnce(ecsRepoConfig);
+    const buildTask = { ...baseTask, resolved_workflow: { id: 'coding/new-task-v1', version: '1.0.0' } };
+    const config = await loadBlueprintConfig(buildTask as any);
+    expect(config.compute_type).toBe('ecs');
+  });
 });
 
 describe('hydrateAndTransition with blueprint config', () => {
@@ -808,6 +921,8 @@ describe('finalizeTask', () => {
     const eventCall = mockDdbSend.mock.calls[2][0];
     expect(eventCall.input.Item.event_type).toBe('task_failed');
     expect(eventCall.input.Item.metadata.reason).toBe('agent_heartbeat_stale');
+    // Terminal event carries the correlation envelope (#245).
+    expect(eventCall.input.Item).toMatchObject({ user_id: 'user-123', repo: 'org/repo' });
   });
 
   test('transitions RUNNING to TIMED_OUT on poll timeout', async () => {

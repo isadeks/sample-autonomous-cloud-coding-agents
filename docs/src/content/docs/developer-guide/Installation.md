@@ -2,7 +2,7 @@
 title: Installation
 ---
 
-Follow the [Quick Start](/getting-started/quick-start) to clone, install, deploy, and submit your first task. It covers prerequisites, toolchain setup, deployment, PAT configuration, Cognito user creation, and a smoke test.
+Follow the [Quick Start](./QUICK_START.mdx) to clone, install, deploy, and submit your first task. It covers prerequisites, toolchain setup, deployment, PAT configuration, Cognito user creation, and a smoke test.
 
 This section covers what the Quick Start does not: troubleshooting, local testing, and the development workflow.
 
@@ -95,7 +95,7 @@ curl http://localhost:8080/ping
 
 curl -X POST http://localhost:8080/invocations \
   -H "Content-Type: application/json" \
-  -d ‘{"input":{"prompt":"Fix the login bug","repo_url":"owner/repo"}}’
+  -d '{"input":{"prompt":"Fix the login bug","repo_url":"owner/repo"}}'
 ```
 
 #### Monitoring
@@ -152,18 +152,18 @@ For the full list, see `agent/README.md`.
 
 ### Deployment
 
-Follow the [Quick Start](/getting-started/quick-start) steps 3-6 for first-time deployment. For subsequent deploys after code changes:
+Follow the [Quick Start](./QUICK_START.mdx) steps 3-6 for first-time deployment. For subsequent deploys after code changes:
 
 ```bash
 mise run build
-mise run //cdk:deploy
+mise //cdk:deploy
 ```
 
 A full deploy takes approximately 10 minutes. Expect variation by region and whether container layers are cached.
 
 ### Stack outputs
 
-After deployment, the stack emits these outputs (retrieve with `aws cloudformation describe-stacks --stack-name backgroundagent-dev --query ‘Stacks[0].Outputs’ --output table`):
+After deployment, the stack emits these outputs (retrieve with `aws cloudformation describe-stacks --stack-name backgroundagent-dev --query 'Stacks[0].Outputs' --output table`):
 
 | Output | Description |
 |---|---|
@@ -172,9 +172,15 @@ After deployment, the stack emits these outputs (retrieve with `aws cloudformati
 | `UserPoolId` / `AppClientId` | Cognito identifiers |
 | `TaskTableName` | DynamoDB table for task state |
 | `TaskEventsTableName` | DynamoDB table for audit events |
+| `TaskNudgesTableName` | DynamoDB table for task nudges |
+| `TaskApprovalsTableName` | DynamoDB table for Cedar HITL approval gates |
 | `UserConcurrencyTableName` | DynamoDB table for per-user concurrency |
 | `WebhookTableName` | DynamoDB table for webhook integrations |
 | `RepoTableName` | DynamoDB table for per-repo Blueprint config |
+| `CedarWasmLayerArn` | Lambda layer ARN for the Cedar WASM policy engine |
+| `TraceArtifactsBucketName` | S3 bucket for agent trace artifacts (7-day lifecycle) |
 | `GitHubTokenSecretArn` | Secrets Manager secret ARN for the GitHub PAT |
+
+When the Slack or Linear integrations are enabled, the stack emits additional outputs (e.g. `Slack*` and `Linear*` secret ARNs and integration table names).
 
 Use the same AWS Region as your deployment. If `--region` is omitted, the CLI uses your default from `aws configure`.

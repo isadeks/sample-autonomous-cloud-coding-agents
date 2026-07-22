@@ -22,7 +22,7 @@ import { S3Client } from '@aws-sdk/client-s3';
 import { DynamoDBDocumentClient, GetCommand, PutCommand, UpdateCommand } from '@aws-sdk/lib-dynamodb';
 import { ulid } from 'ulid';
 import { AttachmentBudgetExceededError, AttachmentConfigurationError, AttachmentResolutionError, hydrateContext, resolveGitHubToken } from './context-hydration';
-import { logger } from './logger';
+import { logger, type Logger } from './logger';
 import { writeMinimalEpisode } from './memory';
 import { coerceNumericOrNull } from './numeric';
 import { computePromptVersion } from './prompt-version';
@@ -168,16 +168,45 @@ export async function transitionTask(
   }));
 }
 
+/** Correlation envelope stamped on orchestrator-plane task events (#245). */
+export interface EventCorrelation {
+  readonly user_id?: string;
+  /** `owner/repo`, or absent for repo-less workflows (#248 Phase 3). Matches
+   *  the source `TaskRecord.repo` (`string | undefined`). */
+  readonly repo?: string;
+}
+
+/**
+ * Build the correlation envelope (#245) for a task from its identity fields:
+ * a `log` child stamping `{task_id, user_id, repo}` on every line, and the
+ * matching `correlation` for `emitTaskEvent`. Single source so the log context
+ * and the event envelope can't drift. `repo` is omitted (not null/empty) for
+ * repo-less workflows.
+ */
+export function envelopeFor(
+  identity: { task_id: string; user_id: string; repo?: string },
+): { log: Logger; correlation: EventCorrelation } {
+  const { task_id, user_id, repo } = identity;
+  return {
+    log: logger.child({ task_id, user_id, ...(repo && { repo }) }),
+    correlation: { user_id, repo },
+  };
+}
+
 /**
  * Emit a task event to the audit log.
  * @param taskId - the task ID.
  * @param eventType - the event type string.
  * @param metadata - optional event metadata.
+ * @param correlation - optional `{ user_id, repo }` stamped as top-level fields
+ *   so the event stream joins to orchestrator logs by the correlation envelope
+ *   (#245). `repo` is omitted when null/absent (repo-less workflows).
  */
 export async function emitTaskEvent(
   taskId: string,
   eventType: string,
   metadata?: Record<string, unknown>,
+  correlation?: EventCorrelation,
 ): Promise<void> {
   await ddb.send(new PutCommand({
     TableName: EVENTS_TABLE_NAME,
@@ -187,6 +216,8 @@ export async function emitTaskEvent(
       event_type: eventType,
       timestamp: new Date().toISOString(),
       ttl: computeTtlEpoch(TASK_RETENTION_DAYS),
+      ...(correlation?.user_id && { user_id: correlation.user_id }),
+      ...(correlation?.repo && { repo: correlation.repo }),
       ...(metadata && { metadata }),
     },
   }));
@@ -203,22 +234,23 @@ const MAX_POLL_INTERVAL_MS = 300_000;
  * @returns the merged blueprint config.
  */
 export async function loadBlueprintConfig(task: TaskRecord): Promise<BlueprintConfig> {
-  const repoConfig = await loadRepoConfig(task.repo);
+  // Correlation envelope (#245) on this shared function's logs too, matching the
+  // orchestrate handler's child logger. `repo` omitted for repo-less workflows.
+  const { log } = envelopeFor(task);
+
+  // Repo-less workflows (#248 Phase 3) have no per-repo Blueprint — use platform
+  // defaults directly rather than a RepoTable lookup on a missing repo.
+  const repoConfig = task.repo ? await loadRepoConfig(task.repo) : null;
 
   if (repoConfig) {
-    logger.info('Loaded per-repo blueprint config', {
-      task_id: task.task_id,
-      repo: task.repo,
+    log.info('Loaded per-repo blueprint config', {
       has_runtime_override: !!repoConfig.runtime_arn,
       has_model_override: !!repoConfig.model_id,
       has_prompt_override: !!repoConfig.system_prompt_overrides,
       has_token_override: !!repoConfig.github_token_secret_arn,
     });
   } else {
-    logger.info('No per-repo config found, using platform defaults', {
-      task_id: task.task_id,
-      repo: task.repo,
-    });
+    log.info('No per-repo config found, using platform defaults');
   }
 
   // Clamp poll_interval_ms to safe range
@@ -226,8 +258,7 @@ export async function loadBlueprintConfig(task: TaskRecord): Promise<BlueprintCo
   if (pollIntervalMs !== undefined) {
     const clamped = Math.min(Math.max(pollIntervalMs, MIN_POLL_INTERVAL_MS), MAX_POLL_INTERVAL_MS);
     if (clamped !== pollIntervalMs) {
-      logger.warn('poll_interval_ms clamped to safe range', {
-        repo: task.repo,
+      log.warn('poll_interval_ms clamped to safe range', {
         original: pollIntervalMs,
         clamped,
         min: MIN_POLL_INTERVAL_MS,
@@ -237,6 +268,17 @@ export async function loadBlueprintConfig(task: TaskRecord): Promise<BlueprintCo
     }
   }
 
+  // Compute substrate is a per-repo property (``compute_type``, default
+  // ``agentcore``). It applies to ALL workflows on the repo — including a
+  // read-only decompose/planning or pr-review task, because that task CLONES and
+  // READS the same repository the coding agent does, so its context/memory
+  // footprint is the same: a repo big enough to need the context-gated 64GB ECS
+  // tier for building is also big enough to OOM the fixed AgentCore microVM just
+  // reading it. So planning must run on the same substrate as the agent — do NOT
+  // special-case read-only workflows to agentcore. (An ecs-configured repo on a
+  // stack that hasn't wired the ECS substrate fails at session start; that's a
+  // stack-config gap surfaced by the honest "couldn't plan, nothing run — re-apply
+  // or run as single" note, not something to paper over by mis-routing compute.)
   return {
     compute_type: repoConfig?.compute_type ?? 'agentcore',
     runtime_arn: repoConfig?.runtime_arn ?? RUNTIME_ARN,
@@ -246,6 +288,8 @@ export async function loadBlueprintConfig(task: TaskRecord): Promise<BlueprintCo
     system_prompt_overrides: repoConfig?.system_prompt_overrides,
     github_token_secret_arn: repoConfig?.github_token_secret_arn ?? process.env.GITHUB_TOKEN_SECRET_ARN,
     poll_interval_ms: pollIntervalMs,
+    build_command: repoConfig?.build_command,
+    lint_command: repoConfig?.lint_command,
     cedar_policies: repoConfig?.cedar_policies,
     approval_gate_cap: repoConfig?.approval_gate_cap,
   };
@@ -329,8 +373,9 @@ function isValidApprovalGateCap(value: unknown): value is number {
  * @returns the assembled payload for the agent runtime.
  */
 export async function hydrateAndTransition(task: TaskRecord, blueprintConfig?: BlueprintConfig): Promise<Record<string, unknown>> {
+  const { log, correlation } = envelopeFor(task);
   await transitionTask(task.task_id, TaskStatus.SUBMITTED, TaskStatus.HYDRATING);
-  await emitTaskEvent(task.task_id, 'hydration_started');
+  await emitTaskEvent(task.task_id, 'hydration_started', undefined, correlation);
 
   const hydratedContext = await hydrateContext(task, {
     githubTokenSecretArn: blueprintConfig?.github_token_secret_arn,
@@ -343,15 +388,14 @@ export async function hydrateAndTransition(task: TaskRecord, blueprintConfig?: B
     try {
       await emitTaskEvent(task.task_id, 'guardrail_blocked', {
         reason: hydratedContext.guardrail_blocked,
-        task_type: task.task_type,
+        resolved_workflow: task.resolved_workflow?.id,
         pr_number: task.pr_number,
         sources: hydratedContext.sources,
         token_estimate: hydratedContext.token_estimate,
         ...(hydratedContext.content_trust && { content_trust: hydratedContext.content_trust }),
-      });
+      }, correlation);
     } catch (eventErr) {
-      logger.error('Failed to emit guardrail_blocked event', {
-        task_id: task.task_id,
+      log.error('Failed to emit guardrail_blocked event', {
         error: eventErr instanceof Error ? eventErr.message : String(eventErr),
       });
     }
@@ -369,8 +413,7 @@ export async function hydrateAndTransition(task: TaskRecord, blueprintConfig?: B
         ExpressionAttributeValues: { ':bn': hydratedContext.resolved_branch_name, ':now': new Date().toISOString() },
       }));
     } catch (err) {
-      logger.error('Failed to update branch_name from PR head_ref — task record will show stale placeholder', {
-        task_id: task.task_id,
+      log.error('Failed to update branch_name from PR head_ref — task record will show stale placeholder', {
         resolved_branch: hydratedContext.resolved_branch_name,
         error: err instanceof Error ? err.message : String(err),
       });
@@ -392,8 +435,8 @@ export async function hydrateAndTransition(task: TaskRecord, blueprintConfig?: B
       ExpressionAttributeValues: { ':pv': promptVersion, ':now': new Date().toISOString() },
     }));
   } catch (err) {
-    logger.warn('Failed to store prompt_version on task record', {
-      task_id: task.task_id, error: err instanceof Error ? err.message : String(err),
+    log.warn('Failed to store prompt_version on task record', {
+      error: err instanceof Error ? err.message : String(err),
     });
   }
 
@@ -411,8 +454,7 @@ export async function hydrateAndTransition(task: TaskRecord, blueprintConfig?: B
     task.approval_gate_cap !== undefined
     && !isValidApprovalGateCap(task.approval_gate_cap)
   ) {
-    logger.warn('TaskRecord.approval_gate_cap is not a valid integer in bounds; omitting from agent payload', {
-      task_id: task.task_id,
+    log.warn('TaskRecord.approval_gate_cap is not a valid integer in bounds; omitting from agent payload', {
       approval_gate_cap: task.approval_gate_cap,
       min: APPROVAL_GATE_CAP_MIN,
       max: APPROVAL_GATE_CAP_MAX,
@@ -467,8 +509,7 @@ export async function hydrateAndTransition(task: TaskRecord, blueprintConfig?: B
           );
         }
 
-        logger.warn('Failed to resolve GitHub token for URL attachment fetch (no GitHub URLs in batch — proceeding)', {
-          task_id: task.task_id,
+        log.warn('Failed to resolve GitHub token for URL attachment fetch (no GitHub URLs in batch — proceeding)', {
           error: err instanceof Error ? err.message : String(err),
         });
       }
@@ -508,9 +549,18 @@ export async function hydrateAndTransition(task: TaskRecord, blueprintConfig?: B
     user_id: task.user_id,
     branch_name: hydratedContext.resolved_branch_name ?? task.branch_name,
     ...(task.issue_number !== undefined && { issue_number: String(task.issue_number) }),
-    task_type: task.task_type ?? 'new_task',
+    resolved_workflow: task.resolved_workflow ?? { id: 'coding/new-task-v1', version: '1.0.0' },
     ...(task.pr_number !== undefined && { pr_number: task.pr_number }),
     ...(hydratedContext.resolved_base_branch && { base_branch: hydratedContext.resolved_base_branch }),
+    // #247 A4: orchestration children carry their stacked base branch +
+    // (diamond case) predecessor branches to merge in, via channel_metadata.
+    // The PR-task ``resolved_base_branch`` path above wins if both are set
+    // (a task is never both a PR-iteration and an orchestration child).
+    ...(!hydratedContext.resolved_base_branch
+      && task.channel_metadata?.orchestration_base_branch
+      && { base_branch: task.channel_metadata.orchestration_base_branch }),
+    ...(task.channel_metadata?.orchestration_merge_branches
+      && { merge_branches: parseMergeBranches(task.channel_metadata.orchestration_merge_branches) }),
     ...(task.task_description && { prompt: task.task_description }),
     max_turns: task.max_turns ?? blueprintConfig?.max_turns ?? DEFAULT_MAX_TURNS,
     ...(effectiveBudget !== undefined && { max_budget_usd: effectiveBudget }),
@@ -520,6 +570,11 @@ export async function hydrateAndTransition(task: TaskRecord, blueprintConfig?: B
     ...(task.trace === true && { trace: true }),
     ...(blueprintConfig?.model_id && { model_id: blueprintConfig.model_id }),
     ...(blueprintConfig?.system_prompt_overrides && { system_prompt_overrides: blueprintConfig.system_prompt_overrides }),
+    // #1: per-repo build/lint verification commands. Absent → agent defaults
+    // to ``mise run build`` / ``mise run lint``. Set for non-mise repos so
+    // build-regression gating actually runs the repo's real command.
+    ...(blueprintConfig?.build_command && { build_command: blueprintConfig.build_command }),
+    ...(blueprintConfig?.lint_command && { lint_command: blueprintConfig.lint_command }),
     ...(blueprintConfig?.cedar_policies && blueprintConfig.cedar_policies.length > 0 && { cedar_policies: blueprintConfig.cedar_policies }),
     // Cedar HITL: the agent's PreToolUse hook uses this to compute
     // the maxLifetime ceiling on per-gate approval timeouts (§6.5).
@@ -562,8 +617,7 @@ export async function hydrateAndTransition(task: TaskRecord, blueprintConfig?: B
   };
 
   if (hydratedContext.fallback_error) {
-    logger.warn('Context hydration fell back to minimal payload', {
-      task_id: task.task_id,
+    log.warn('Context hydration fell back to minimal payload', {
       fallback_error: hydratedContext.fallback_error,
     });
   }
@@ -576,7 +630,7 @@ export async function hydrateAndTransition(task: TaskRecord, blueprintConfig?: B
     has_memory_context: !!hydratedContext.memory_context,
     ...(hydratedContext.content_trust && { content_trust: hydratedContext.content_trust }),
     ...(hydratedContext.fallback_error && { fallback_error: hydratedContext.fallback_error }),
-  });
+  }, correlation);
   return payload;
 }
 
@@ -661,6 +715,9 @@ export async function finalizeTask(
 ): Promise<void> {
   const task = await loadTask(taskId);
   const currentStatus = task.status;
+  // Correlation envelope (#245) on this function's own log lines too, not just
+  // the events it emits — admission→terminal logs must join by {user_id, repo}.
+  const { log, correlation } = envelopeFor(task);
 
   // Lost session: RUNNING but agent heartbeats stopped (crash/OOM) — fail fast
   if (
@@ -678,8 +735,7 @@ export async function finalizeTask(
     } catch (err) {
       // Task may have transitioned concurrently (e.g. agent wrote terminal status).
       // Re-read to avoid double-decrement or contradictory events.
-      logger.warn('Finalization transition to FAILED (heartbeat) failed, task may have transitioned concurrently', {
-        task_id: taskId,
+      log.warn('Finalization transition to FAILED (heartbeat) failed, task may have transitioned concurrently', {
         error: err instanceof Error ? err.message : String(err),
       });
     }
@@ -687,21 +743,21 @@ export async function finalizeTask(
       await emitTaskEvent(taskId, 'task_failed', {
         reason: 'agent_heartbeat_stale',
         poll_attempts: pollState.attempts,
-      });
+      }, correlation);
       await decrementConcurrency(userId);
     } else {
       // Transition failed — re-read task to determine actual state.
       // If already terminal the block below will handle TTL + concurrency.
       const reread = await loadTask(taskId);
       if (TERMINAL_STATUSES.includes(reread.status)) {
-        logger.info('Heartbeat path: task already terminal after failed transition', { task_id: taskId, status: reread.status });
+        log.info('Heartbeat path: task already terminal after failed transition', { status: reread.status });
         await emitTaskEvent(taskId, `task_${reread.status.toLowerCase()}`, {
           final_status: reread.status,
           poll_attempts: pollState.attempts,
-        });
+        }, correlation);
         await decrementConcurrency(userId);
       } else {
-        logger.warn('Heartbeat path: task in unexpected state after failed transition, releasing concurrency', { task_id: taskId, status: reread.status });
+        log.warn('Heartbeat path: task in unexpected state after failed transition, releasing concurrency', { status: reread.status });
         await decrementConcurrency(userId);
       }
     }
@@ -710,7 +766,7 @@ export async function finalizeTask(
 
   // If the agent already wrote a terminal status, just finalize
   if (TERMINAL_STATUSES.includes(currentStatus)) {
-    logger.info('Task already in terminal state', { task_id: taskId, status: currentStatus });
+    log.info('Task already in terminal state', { status: currentStatus });
 
     try {
       await ddb.send(new UpdateCommand({
@@ -721,12 +777,12 @@ export async function finalizeTask(
         ExpressionAttributeValues: { ':ttl': computeTtlEpoch(TASK_RETENTION_DAYS) },
       }));
     } catch (err) {
-      logger.warn('Failed to stamp TTL on terminal task', { task_id: taskId, error: err instanceof Error ? err.message : String(err) });
+      log.warn('Failed to stamp TTL on terminal task', { error: err instanceof Error ? err.message : String(err) });
     }
 
     // Memory fallback: if the agent did not write memory, write a minimal episode
     if (MEMORY_ID && !task.memory_written) {
-      logger.info('Agent did not write memory — writing fallback episode', { task_id: taskId });
+      log.info('Agent did not write memory — writing fallback episode');
       try {
         // Coerce at the shared helper rather than ``Number(...)`` so a
         // corrupt string ``cost_usd`` from the DDB Document client
@@ -744,20 +800,22 @@ export async function finalizeTask(
           { field: 'cost_usd', task_id: taskId },
           logger,
         );
+        // Memory actorId: repo for coding tasks, user:{user_id} for repo-less
+        // workflows (#248 Phase 3, ADR-014 addendum 2026-06-08).
+        const actorNamespace = task.repo ?? `user:${task.user_id}`;
         const written = await writeMinimalEpisode(
           MEMORY_ID,
-          task.repo,
+          actorNamespace,
           taskId,
           currentStatus,
           durationS ?? undefined,
           costUsd ?? undefined,
         );
         if (!written) {
-          logger.warn('Fallback episode write returned false', { task_id: taskId });
+          log.warn('Fallback episode write returned false');
         }
       } catch (err) {
-        logger.warn('Fallback episode write threw unexpectedly (fail-open)', {
-          task_id: taskId,
+        log.warn('Fallback episode write threw unexpectedly (fail-open)', {
           error: err instanceof Error ? err.message : String(err),
         });
       }
@@ -766,7 +824,7 @@ export async function finalizeTask(
     await emitTaskEvent(taskId, `task_${currentStatus.toLowerCase()}`, {
       final_status: currentStatus,
       poll_attempts: pollState.attempts,
-    });
+    }, correlation);
     await decrementConcurrency(userId);
     return;
   }
@@ -791,14 +849,14 @@ export async function finalizeTask(
       });
     } catch (err) {
       // Task may have transitioned concurrently — re-read and accept
-      logger.warn('Finalization transition failed, task may have transitioned concurrently', { task_id: taskId, error: err instanceof Error ? err.message : String(err) });
+      log.warn('Finalization transition failed, task may have transitioned concurrently', { error: err instanceof Error ? err.message : String(err) });
     }
     await emitTaskEvent(taskId, 'task_timed_out', {
       reason: currentStatus === TaskStatus.AWAITING_APPROVAL
         ? 'approval_poll_timeout'
         : 'poll_timeout',
       poll_attempts: pollState.attempts,
-    });
+    }, correlation);
     await decrementConcurrency(userId);
     return;
   }
@@ -812,18 +870,18 @@ export async function finalizeTask(
         error_message: 'Session never started — poll timeout exceeded while still HYDRATING',
       });
     } catch (err) {
-      logger.warn('Finalization transition from HYDRATING failed, task may have transitioned concurrently', { task_id: taskId, error: err instanceof Error ? err.message : String(err) });
+      log.warn('Finalization transition from HYDRATING failed, task may have transitioned concurrently', { error: err instanceof Error ? err.message : String(err) });
     }
     await emitTaskEvent(taskId, 'task_failed', {
       reason: 'session_never_started',
       poll_attempts: pollState.attempts,
-    });
+    }, correlation);
     await decrementConcurrency(userId);
     return;
   }
 
   // Unexpected state — log and release concurrency
-  logger.error('Unexpected task state during finalization', { task_id: taskId, status: currentStatus });
+  log.error('Unexpected task state during finalization', { status: currentStatus });
   await decrementConcurrency(userId);
 }
 
@@ -834,6 +892,8 @@ export async function finalizeTask(
  * @param errorMessage - the error reason.
  * @param userId - the user who owns the task.
  * @param releaseConcurrency - whether to decrement the concurrency counter.
+ * @param repo - optional target repo (`owner/repo`) for the correlation
+ *   envelope (#245); omit for repo-less workflows.
  */
 export async function failTask(
   taskId: string,
@@ -841,6 +901,7 @@ export async function failTask(
   errorMessage: string,
   userId: string,
   releaseConcurrency: boolean,
+  repo?: string,
 ): Promise<void> {
   let transitioned = false;
   try {
@@ -850,13 +911,16 @@ export async function failTask(
     });
     transitioned = true;
   } catch (err) {
-    logger.warn('Failed to transition task to FAILED', { task_id: taskId, error: err instanceof Error ? err.message : String(err) });
+    const { log } = envelopeFor({ task_id: taskId, user_id: userId, repo });
+    log.warn('Failed to transition task to FAILED', {
+      error: err instanceof Error ? err.message : String(err),
+    });
   }
   // Only emit / release concurrency after a successful transition. Callers such as
   // orchestrate-task rethrow after failTask; Durable Execution retries the step and
   // would otherwise re-run emit + decrement while the task is already FAILED.
   if (transitioned) {
-    await emitTaskEvent(taskId, 'task_failed', { error_message: errorMessage });
+    await emitTaskEvent(taskId, 'task_failed', { error_message: errorMessage }, { user_id: userId, repo });
     if (releaseConcurrency) {
       await decrementConcurrency(userId);
     }
@@ -887,4 +951,26 @@ async function decrementConcurrency(userId: string): Promise<void> {
       logger.warn('Failed to decrement concurrency counter', { user_id: userId, error: err instanceof Error ? err.message : String(err) });
     }
   }
+}
+
+/**
+ * Parse the JSON-encoded predecessor merge-branch list that the
+ * orchestration release path stashes in
+ * ``channel_metadata.orchestration_merge_branches`` (#247 A4, diamond
+ * case). Best-effort: a malformed value yields an empty list rather than
+ * failing the orchestration — the child still branches off its base, it
+ * just won't have the predecessor code merged in (surfaced as a normal
+ * build failure if it actually needed it, never a silent crash here).
+ */
+function parseMergeBranches(raw: string): string[] {
+  try {
+    const parsed = JSON.parse(raw) as unknown;
+    if (Array.isArray(parsed) && parsed.every((b) => typeof b === 'string')) {
+      return parsed as string[];
+    }
+  } catch {
+    // fall through
+  }
+  logger.warn('Ignoring malformed orchestration_merge_branches', { raw });
+  return [];
 }
