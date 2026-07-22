@@ -25,7 +25,11 @@ from config import (
     resolve_linear_api_token,
 )
 from context import assemble_prompt, fetch_github_issue
-from jira_reactions import comment_task_finished, comment_task_started
+from jira_reactions import (
+    comment_task_started,
+    transition_pr_opened,
+    transition_task_started,
+)
 from linear_reactions import react_task_finished, react_task_started
 from models import AgentResult, HydratedContext, RepoSetup, TaskConfig, TaskResult
 from observability import current_otel_trace_id, task_span
@@ -807,13 +811,18 @@ def run_task(
             "repo.url": config.repo_url,
             "issue.number": config.issue_number,
             "agent.model": config.anthropic_model,
+            # Correlation envelope (#245): user.id joins agent spans to
+            # orchestrator logs by the platform identity, not just task/repo.
+            **({"user.id": config.user_id} if config.user_id else {}),
         },
     ) as root_span:
         task_state.write_running(config.task_id)
         task_state.write_heartbeat(config.task_id)
 
         agent_result: AgentResult | None = None
-        progress = _ProgressWriter(config.task_id, trace=trace)
+        progress = _ProgressWriter(
+            config.task_id, trace=trace, user_id=config.user_id, repo=config.repo_url
+        )
         # #251: clear any blocker latched by a prior task. The agent container
         # is one-task-per-process today, but the FastAPI server thread-pool can
         # in principle dispatch a second run_task in the same process — reset
@@ -926,19 +935,17 @@ def run_task(
                     system_prompt_overrides=system_prompt_overrides,
                 )
 
-            # Configure git and gh auth before setup_repo() uses them
-            subprocess.run(
-                ["git", "config", "--global", "user.name", "bgagent"],
-                check=True,
-                capture_output=True,
-                timeout=60,
-            )
-            subprocess.run(
-                ["git", "config", "--global", "user.email", "bgagent@noreply.github.com"],
-                check=True,
-                capture_output=True,
-                timeout=60,
-            )
+            # Configure git identity and gh auth before setup_repo() uses them.
+            # Use GIT_AUTHOR_*/GIT_COMMITTER_* env vars rather than
+            # `git config --global`: git honors these for every commit (inherited
+            # by Claude Code and the safety-net commit in post_hooks) WITHOUT
+            # writing to any on-disk config. `--global` would clobber the real
+            # ~/.gitconfig — harmless in the ephemeral container, but destructive
+            # when this pipeline runs on a developer workstation (#622).
+            os.environ["GIT_AUTHOR_NAME"] = "bgagent"
+            os.environ["GIT_AUTHOR_EMAIL"] = "bgagent@noreply.github.com"
+            os.environ["GIT_COMMITTER_NAME"] = "bgagent"
+            os.environ["GIT_COMMITTER_EMAIL"] = "bgagent@noreply.github.com"
             os.environ["GITHUB_TOKEN"] = config.github_token
             os.environ["GH_TOKEN"] = config.github_token
 
@@ -948,28 +955,23 @@ def run_task(
             if prompt_version:
                 os.environ["PROMPT_VERSION"] = prompt_version
 
-            # Setup repo (deterministic pre-hooks)
-            with task_span("task.repo_setup") as setup_span:
-                setup = setup_repo(config, progress=progress)
-                setup_span.set_attribute("build.before", setup.build_before)
-            progress.write_agent_milestone(
-                "repo_setup_complete",
-                f"branch={setup.branch} build_before={setup.build_before}",
-            )
-
-            system_prompt = build_system_prompt(config, setup, hc, system_prompt_overrides)
-
-            # Channel-specific MCP wiring. Must happen before
-            # discover_project_config so the scan picks up the file we just
-            # wrote. Resolve the per-channel access token from Secrets
-            # Manager *before* writing .mcp.json so the child SDK process
-            # inherits the env var that the MCP server entry references
-            # (${LINEAR_API_TOKEN} / ${JIRA_API_TOKEN}).
+            # ── Early ACK (ABCA-707) ─────────────────────────────────────────
+            # Acknowledge the task is picked up BEFORE the (potentially long)
+            # pre-agent baseline build in setup_repo(). On a large repo that
+            # baseline is minutes (up to the build-verify ceiling); posting the
+            # 👀 only *after* it left the issue looking dead for the whole phase
+            # (the ABCA-707 symptom: no reaction, comment, or state change for
+            # 30+ min). None of these calls needs the cloned repo — they act on
+            # the channel issue via its API token + issue id from channel
+            # metadata — so they belong before the clone/build.
+            #
+            # Resolve the per-channel access token from Secrets Manager first
+            # (react_task_started/comment_task_started read the env var it sets).
+            # configure_channel_mcp DOES need setup.repo_dir, so it stays below.
             if config.channel_source == "linear":
                 resolve_linear_api_token(config.channel_metadata)
             elif config.channel_source == "jira":
                 resolve_jira_oauth_token(config.channel_metadata)
-            configure_channel_mcp(setup.repo_dir, config.channel_source, config.channel_metadata)
 
             # 👀 on the Linear issue — acknowledges the task is picked up.
             # No-op for non-Linear tasks. Best-effort; failures are logged
@@ -994,6 +996,42 @@ def run_task(
                 config.channel_source,
                 config.channel_metadata,
             )
+
+            # Move the Jira card To Do → In Progress so the board reflects that
+            # work has started (issue #572). No-op for non-Jira tasks.
+            # Best-effort; failures are logged and never block the pipeline.
+            # Part of the Early-ACK block (moved before setup_repo with the 👀
+            # and start comment) so board state updates immediately, not after
+            # the multi-minute baseline build.
+            transition_task_started(
+                config.channel_source,
+                config.channel_metadata,
+            )
+
+            # Setup repo (deterministic pre-hooks). A failure/timeout/OOM in the
+            # pre-agent baseline build raises here; it needs no local handler —
+            # the outer ``except Exception`` at the bottom of this ``try`` writes
+            # the task FAILED, swaps the 👀 (posted above) to ❌, and posts the
+            # failure comment. Before the Early-ACK move the 👀 didn't exist yet
+            # at this point, so a setup failure left the issue silently stuck
+            # (the ABCA-707 symptom); posting the 👀 earlier is what makes the
+            # outer handler's ❌-swap actually visible for setup failures.
+            with task_span("task.repo_setup") as setup_span:
+                setup = setup_repo(config, progress=progress)
+                setup_span.set_attribute("build.before", setup.build_before)
+            progress.write_agent_milestone(
+                "repo_setup_complete",
+                f"branch={setup.branch} build_before={setup.build_before}",
+            )
+
+            system_prompt = build_system_prompt(config, setup, hc, system_prompt_overrides)
+
+            # Channel-specific MCP wiring. Must happen before
+            # discover_project_config so the scan picks up the file we just
+            # wrote — and after the clone, since it writes .mcp.json into the
+            # repo dir. (Token resolution + the 👀/start ACK moved earlier so
+            # the user gets immediate feedback; see the Early ACK block above.)
+            configure_channel_mcp(setup.repo_dir, config.channel_source, config.channel_metadata)
 
             # Download attachments from S3 (version-pinned, integrity-verified)
             prepared_attachments: list = []
@@ -1302,6 +1340,14 @@ def run_task(
                     post_span.set_attribute("pr.url", pr_url or "")
             if pr_url:
                 progress.write_agent_milestone("pr_created", pr_url)
+                # Move the Jira card In Progress → In Review now that a PR is
+                # open (issue #572). Only fires when a PR was actually opened —
+                # failed / no-PR tasks leave the card where humans can see the
+                # failure comment. No-op for non-Jira tasks; best-effort.
+                transition_pr_opened(
+                    config.channel_source,
+                    config.channel_metadata,
+                )
 
             # Memory write — capture task episode and repo learnings
             memory_written = False
@@ -1363,14 +1409,14 @@ def run_task(
                 transition_state=linear_transition_state,
             )
 
-            # Terminal status comment on the Jira issue (REST shim, with the
-            # PR link when one was opened). No-op for non-Jira tasks.
-            comment_task_finished(
-                config.channel_source,
-                config.channel_metadata,
-                success=(overall_status == "success"),
-                pr_url=pr_url,
-            )
+            # NOTE: the terminal status comment on the Jira issue is NOT posted
+            # here. Since issue #573 the deterministic fan-out plane
+            # (``cdk/src/handlers/fanout-task-events.ts`` ``dispatchToJira``)
+            # owns the Jira final-status comment — it carries cost/turns/
+            # duration and, crucially, fires even if this agent crashes before
+            # reaching this point (max-turns, OOM). Posting here too would
+            # double-comment. The agent still posts the *start* comment
+            # (``comment_task_started`` above) for in-flight progress.
 
             # --trace trajectory S3 upload (design §10.1). Runs AFTER
             # post-hooks but BEFORE ``write_terminal`` so the resulting
@@ -1545,14 +1591,11 @@ def run_task(
                 success=False,
                 started_reaction_id=linear_eyes_reaction_id,
             )
-            # Best-effort failure comment on the Jira issue. No-op for
-            # non-Jira tasks; network failures are swallowed.
-            comment_task_finished(
-                config.channel_source,
-                config.channel_metadata,
-                success=False,
-                pr_url=None,
-            )
+            # NOTE: no Jira failure comment here — the fan-out plane's
+            # ``dispatchToJira`` (issue #573) owns the Jira terminal comment
+            # and fires on the platform side even when this crash path runs,
+            # so posting here would double-comment. (Contrast the Linear ❌
+            # reaction above, which the fan-out plane does not replicate.)
             raise
 
 
@@ -1574,6 +1617,34 @@ _PAYLOAD_STR_KEYS = frozenset({"issue_number", "pr_number"})
 #: signature (not inside the function, so patching ``run_task`` in tests can't
 #: shadow it). Any payload key not in this set is ignored, never passed through.
 _RUN_TASK_PARAMS = frozenset(inspect.signature(run_task).parameters)
+
+#: Orchestrator payload keys we KNOW about that ``run_task`` does not (yet)
+#: accept as a parameter. Dropping one of these is expected today, but a key that
+#: shows up here AND is silently dropped is exactly the "wired one side of an
+#: orchestrator→agent field, forgot the other" no-op that ABCA-487 was — so we
+#: WARN when we drop one, making a future contract gap visible instead of silent.
+#: Keys not in this set (genuinely foreign) are dropped quietly as before.
+#:
+#: NB (merge note): on this branch ``run_task`` DOES accept ``build_command``,
+#: ``lint_command``, ``base_branch`` and ``merge_branches`` (see its signature),
+#: so those are forwarded — NOT dropped — and must NOT be listed here (they would
+#: never hit the drop path). ``github_token_secret_arn`` is deliberately omitted
+#: too (N3): it is ALWAYS present and ALWAYS resolved via the
+#: ``GITHUB_TOKEN_SECRET_ARN`` env in build_config, so listing it would fire the
+#: WARN on 100% of ECS boots — pure noise. It falls through as a quiet
+#: foreign-key drop instead.
+_KNOWN_ORCHESTRATOR_KEYS = frozenset(
+    {
+        # AgentCore's server.py exports task_started_at as TASK_STARTED_AT, which
+        # hooks._remaining_maxlifetime_s() uses to clip the Cedar HITL approval-gate
+        # maxLifetime. The ECS boot path bypasses server.py and does not (yet) set
+        # that env, so this key is dropped here — a silent AgentCore↔ECS HITL
+        # divergence (fail-open: the clip returns None, gate uses the task default).
+        # Listing it makes the drop WARN so the parity gap is visible until the ECS
+        # strategy sets TASK_STARTED_AT in containerEnv (tracked as a follow-up).
+        "task_started_at",
+    }
+)
 
 
 def run_task_from_payload(payload: dict) -> dict:
@@ -1601,13 +1672,42 @@ def run_task_from_payload(payload: dict) -> dict:
     for key, value in (payload or {}).items():
         target = _PAYLOAD_KEY_ALIASES.get(key, key)
         if target not in _RUN_TASK_PARAMS:
-            continue  # not a run_task parameter — ignore (e.g. github_token_secret_arn)
+            # Not a run_task parameter — ignore. A KNOWN orchestrator key being
+            # dropped is expected today but worth a breadcrumb: if run_task ever
+            # grows a matching param, this WARN is where a "forgot to wire it
+            # through" no-op surfaces (N4 / ABCA-487 class). Foreign keys are
+            # dropped quietly.
+            if key in _KNOWN_ORCHESTRATOR_KEYS and value is not None:
+                log(
+                    "WARN",
+                    f"run_task_from_payload: dropping known orchestrator key '{key}' "
+                    f"(not a run_task parameter) — consumed elsewhere or not yet wired",
+                )
+            continue
         if value is None:
             continue  # let run_task's default apply
         if target in _PAYLOAD_STR_KEYS:
             value = str(value)
         elif target == "max_turns":
-            value = int(value)
+            # Defensive: a malformed max_turns must not crash the whole boot —
+            # drop it and let run_task's default apply (with a breadcrumb) rather
+            # than raise. Unlike the str keys above, this is the one field with a
+            # non-str coercion, so it also guards the surprising int() cases the
+            # orchestrator never emits but a hand-edited payload might: a bool
+            # (``int(True) == 1``) and a non-integral float (``int(3.9) == 3``)
+            # would both silently become a bogus turn count (N4).
+            if isinstance(value, bool) or not isinstance(value, (int, float, str)):
+                log("WARN", f"run_task_from_payload: ignoring non-integer max_turns {value!r}")
+                continue
+            try:
+                coerced = int(value)
+            except (TypeError, ValueError):
+                log("WARN", f"run_task_from_payload: ignoring non-integer max_turns {value!r}")
+                continue
+            if isinstance(value, float) and coerced != value:
+                log("WARN", f"run_task_from_payload: ignoring non-integral max_turns {value!r}")
+                continue
+            value = coerced
         kwargs[target] = value
 
     kwargs.setdefault("aws_region", os.environ.get("AWS_REGION", ""))
