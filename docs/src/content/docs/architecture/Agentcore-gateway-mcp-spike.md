@@ -169,3 +169,20 @@ Proven live (acct 829…, all spike resources torn down; user's real Linear app 
 - Working recipe: aws-cli ≥2.35 (control-plane model w/ 3LO fields) · Gateway authorizer CUSTOM_JWT (reuse TaskApiUserPool) — AWS_IAM inbound is REJECTED for 3LO · OAuth2CredentialProvider CustomOauth2 (Linear authorize/token endpoints, client creds from bgagent-linear-oauth-<ws>) · target credentialProviderConfigurations OAUTH grantType=AUTHORIZATION_CODE + customParameters{actor:app} + defaultReturnUrl · mcpServer.listingMode=DEFAULT (DYNAMIC incompatible w/ 3LO) · register the provider's per-UUID callback on the Linear app.
 - Design costs (all real, all one-time-per-workspace-at-onboard, none hit end users): admin browser consent; per-provider Linear-app redirect-URI registration; actor=app param.
 - End users NEVER consent — it's the same one-admin-per-workspace install ABCA does today; Gateway only moves that consent's plumbing + gains 24h managed refresh.
+
+## F13 — LIVE DEPLOY-TEST (2026-07-20/21, acct 829…, maguireb): substrate deployed, inbound leg proven, plumbing shipped
+Deployed the full build (`--context linearGateway=true --context compute_type=ecs`). Verified by artifact (not exit code):
+- **Inbound leg PROVEN**: minted the agent's Cognito M2M client_credentials JWT (as `gateway_auth.py` does) and called the gateway MCP endpoint directly — `initialize`→200 (CUSTOM_JWT inbound accepts the M2M token), `tools/list`→200 with the Linear tools federated. The F15/F16 "can the agent auth to its own gateway" question is answered: YES.
+- **`complete-resource-token-auth` is MANDATORY** (data-plane `bedrock-agentcore`): the OAuth callback does NOT auto-complete the vault; without this call the target sits in CREATE_PENDING_AUTH → FAILED. Args: `userIdentifier={userId: <authorizationData.oauth2.userId>}` + `sessionUri=<the PAR request_uri from the authorization URL>`. One call → CREATE_PENDING_AUTH → CREATING → READY.
+- **`defaultReturnUrl` must be a benign landing page, NOT the callback URL** — pointing it at the callback makes the browser re-hit `/callback` with no code/state → "authorizationCode must not be null".
+- **Plumbing shipped**: the registry row's `gateway_url` now flows through `resolveLinearOauthToken` → `channelMetadata.gateway_url` → task record → agent `channel_mcp.py`. Deployed + artifact-verified (Lambda bundle + agent image both contain it).
+
+## F14 — TWO-APP MODEL (the fix for existing installs): give the gateway its OWN Linear OAuth app
+The blocker for retrofitting the gateway onto an existing workspace: the gateway's `actor=app` consent is a fresh *install* of the OAuth app, but if the gateway reuses the MAIN app's client_id, that app is ALREADY installed → Linear dead-ends the consent (F12) → only an `actor=user` token can be vaulted. **Live-confirmed the actor mode is the cause** (2026-07-21): the workspace's existing `actor=app` token reads Linear MCP fine (`get_user`/`list_issues` succeed, 52 tools), while the gateway's `actor=user` token returns "An internal error occurred" on the same calls (30 tools). AgentCore has NO token-import (F5), so the working app token can't be copied into the vault.
+
+**Resolution — a DEDICATED gateway Linear app (distinct client_id):**
+- The main app stays installed and working (direct/REST path + existing customers untouched — zero disruption).
+- The new gateway app has never been installed in the workspace → its `actor=app` consent is a clean fresh install → vaults an app token → MCP data reads work.
+- Both apps coexist in one workspace (different install slots, no F12 collision).
+
+This serves all cohorts without uninstalling anything: existing customers keep the direct integration and opt into the gateway later; a from-scratch onboard installs the main app AND enables the gateway app. Wired via `bgagent linear enable-gateway --gateway-client-id/--gateway-client-secret` (and the same options on `add-workspace --gateway`); omitting them falls back to the main app with a loud warning that actor=app will dead-end.
