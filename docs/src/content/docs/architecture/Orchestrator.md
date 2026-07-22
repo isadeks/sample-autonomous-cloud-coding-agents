@@ -9,7 +9,7 @@ The orchestrator drives the task lifecycle from submission to completion. It run
 The orchestrator is implemented as a Lambda Durable Function. Durable execution provides checkpoint/replay across process restarts, suspension without compute charges during long waits, and condition-based polling for session completion. See the Implementation section for details.
 
 - **Use this doc for:** task state machine, admission/finalization flow, cancellation behavior, failure recovery, and concurrency management.
-- **Related docs:** [ARCHITECTURE.md](/architecture/architecture) for the high-level blueprint model, [COMPUTE.md](/architecture/compute) for the session runtime, [MEMORY.md](/architecture/memory) for context sources, [REPO_ONBOARDING.md](/architecture/repo-onboarding) for per-repo customization.
+- **Related docs:** [ARCHITECTURE.md](/sample-autonomous-cloud-coding-agents/architecture/architecture) for the high-level blueprint model, [COMPUTE.md](/sample-autonomous-cloud-coding-agents/architecture/compute) for the session runtime, [MEMORY.md](/sample-autonomous-cloud-coding-agents/architecture/memory) for context sources, [REPO_ONBOARDING.md](/sample-autonomous-cloud-coding-agents/architecture/repo-onboarding) for per-repo customization.
 
 ## API and agent contracts
 
@@ -42,15 +42,15 @@ The orchestrator is deliberately scoped. It handles coordination and bookkeeping
 
 | Component | Owner | Reference |
 |---|---|---|
-| Request authentication | Input gateway | [INPUT_GATEWAY.md](/architecture/input-gateway) |
-| Agent logic (clone, code, test, PR) | Agent runtime | [COMPUTE.md](/architecture/compute) |
-| Compute session lifecycle (VM, image pull) | AgentCore Runtime | [COMPUTE.md](/architecture/compute) |
-| Memory storage and retrieval | AgentCore Memory | [MEMORY.md](/architecture/memory) |
-| Repository onboarding | Blueprint construct | [REPO_ONBOARDING.md](/architecture/repo-onboarding) |
+| Request authentication | Input gateway | [INPUT_GATEWAY.md](/sample-autonomous-cloud-coding-agents/architecture/input-gateway) |
+| Agent logic (clone, code, test, PR) | Agent runtime | [COMPUTE.md](/sample-autonomous-cloud-coding-agents/architecture/compute) |
+| Compute session lifecycle (VM, image pull) | AgentCore Runtime | [COMPUTE.md](/sample-autonomous-cloud-coding-agents/architecture/compute) |
+| Memory storage and retrieval | AgentCore Memory | [MEMORY.md](/sample-autonomous-cloud-coding-agents/architecture/memory) |
+| Repository onboarding | Blueprint construct | [REPO_ONBOARDING.md](/sample-autonomous-cloud-coding-agents/architecture/repo-onboarding) |
 
 ## Task state machine
 
-Every task moves through a finite set of states from creation to a terminal outcome. The state machine is the backbone of the orchestrator: it determines what actions are valid at each point, when resources are acquired or released, and how the platform recovers from failures. Four of the eight states are terminal, meaning the task is done and no further transitions occur.
+Every task moves through a finite set of states from creation to a terminal outcome. The state machine is the backbone of the orchestrator: it determines what actions are valid at each point, when resources are acquired or released, and how the platform recovers from failures. Four of the ten states are terminal, meaning the task is done and no further transitions occur.
 
 ### States
 
@@ -115,7 +115,7 @@ stateDiagram-v2
 | `HYDRATING` | `FAILED` | Hydration error | GitHub API failure, guardrail blocks content, Bedrock unavailable |
 | `RUNNING` | `AWAITING_APPROVAL` | Cedar soft-deny gate fires | Tool call triggers a soft-deny policy rule during execution |
 | `RUNNING` | `FINALIZING` | Session ends | Response received or session terminated |
-| `RUNNING` | `TIMED_OUT` | Max duration exceeded | Wall-clock timer (default 8h, matching AgentCore max) |
+| `RUNNING` | `TIMED_OUT` | Max duration exceeded | AgentCore terminates the session at its 8h cap; the orchestrator's own safety-net poll window is `MAX_POLL_ATTEMPTS` (1020) × 30s ≈ 8.5h, after which a still-`RUNNING` task is driven to `TIMED_OUT` |
 | `RUNNING` | `FAILED` | Session crash | Heartbeat lost (see Liveness monitoring) |
 | `AWAITING_APPROVAL` | `RUNNING` | Approved or denied | Human decision received; agent resumes |
 | `AWAITING_APPROVAL` | `CANCELLED` | User cancels | Explicit cancel while awaiting approval |
@@ -143,7 +143,7 @@ Multiple timeout mechanisms work together to prevent runaway tasks. Time-based l
 
 | Type | Default | Effect |
 |---|---|---|
-| Max session duration | 8 hours | AgentCore terminates session. Task transitions to `TIMED_OUT`. |
+| Max session duration | 8 hours | AgentCore terminates the session at its 8h cap. The orchestrator's safety-net poll loop runs up to `MAX_POLL_ATTEMPTS` (1020) × 30s ≈ 8.5h; a task still `RUNNING` when that window is exhausted is driven to `TIMED_OUT`. |
 | Idle timeout | 15 minutes | AgentCore terminates if agent is idle. See Liveness monitoring. |
 | Max turns | 100 (range 1-500) | Agent stops after N model invocations. Configurable per task or per repo. |
 | Max cost budget | $0.01-$100 | Agent stops when budget is reached. Per-task or per-repo via Blueprint. |
@@ -151,16 +151,18 @@ Multiple timeout mechanisms work together to prevent runaway tasks. Time-based l
 
 ## Blueprint execution
 
-Every task follows a blueprint: a sequence of deterministic steps wrapping one agentic step. The default blueprint is the sequence described in [ARCHITECTURE.md](/architecture/architecture). Per-repo customization (see [REPO_ONBOARDING.md](/architecture/repo-onboarding)) changes which steps run without affecting the framework guarantees.
+Every task follows a blueprint: a sequence of deterministic steps wrapping one agentic step. The default blueprint is the sequence described in [ARCHITECTURE.md](/sample-autonomous-cloud-coding-agents/architecture/architecture). Per-repo customization (see [REPO_ONBOARDING.md](/sample-autonomous-cloud-coding-agents/architecture/repo-onboarding)) changes which steps run without affecting the framework guarantees.
 
 ```mermaid
 flowchart LR
-    A[Admission] --> B[Hydration]
-    B --> C[Pre-flight]
+    A[Admission] --> B[Pre-flight]
+    B --> C[Hydration]
     C --> D[Start session]
     D --> E[Await completion]
     E --> F[Finalize]
 ```
+
+The orchestrator (`orchestrate-task.ts`) runs these as distinct durable-execution steps in order: `admission-control` → `pre-flight` → `hydrate-context` → `start-session` → `await-agent-completion` → `finalize`. Pre-flight runs **before** hydration so that GitHub-permission and reachability failures are caught before any prompt assembly or Bedrock screening work.
 
 ### Step 1: Admission control
 
@@ -172,27 +174,29 @@ Validates the task before any compute is consumed. Checks run in order:
 4. **Rate limiting** - Sliding window counter (10 tasks/hour per user). Exceeded tasks are rejected, not queued.
 5. **Idempotency** - If the request includes an idempotency key and a task with that key exists, return the existing task.
 
-On acceptance, the concurrency slot is acquired and the task transitions to `HYDRATING`.
+On acceptance, the concurrency slot is acquired and the orchestrator proceeds to pre-flight.
 
-### Step 2: Context hydration
+### Step 2: Pre-flight checks
 
-Assembles the agent's user prompt. The implementation lives in `context-hydration.ts`. What it does, by task type:
+Runs as a distinct top-level step (`pre-flight` in `orchestrate-task.ts`, via `runPreflightChecks`) **after** admission and **before** hydration, so external-dependency failures are caught before any prompt assembly or Bedrock screening consumes work. It verifies the GitHub token has sufficient permissions for the task type, catches inaccessible or closed PRs, and confirms GitHub API reachability. On failure it drives the task to `FAILED` and emits a `preflight_failed` event, surfacing clear errors like `INSUFFICIENT_GITHUB_REPO_PERMISSIONS` before AgentCore runtime is consumed.
 
-**`new_task`:** Fetches the GitHub issue (title, body, comments) if `issue_number` is set, loads memory from past tasks, and combines everything with the user's task description.
+### Step 3: Context hydration
 
-**`pr_iteration` / `pr_review`:** Fetches PR metadata, conversation comments, changed files (REST), and inline review comments (GraphQL, resolved threads filtered out) in four parallel calls. Extracts `head_ref` and `base_ref` for branch resolution.
+Assembles the agent's user prompt and transitions the task to `HYDRATING`. The implementation lives in `context-hydration.ts`. What it does, by resolved workflow:
 
-Regardless of task type, the assembled prompt is screened through Amazon Bedrock Guardrails for prompt injection (fail-closed: unscreened content never reaches the agent). A token budget (default 100K tokens, ~4 chars/token heuristic) trims oldest comments first when exceeded.
+**Non-PR workflows (e.g. `coding/new-task-v1`):** Fetches the GitHub issue (title, body, comments) if `issue_number` is set, loads memory from past tasks, and combines everything with the user's task description.
 
-A **pre-flight** sub-step verifies the GitHub token has sufficient permissions for the task type, catches inaccessible PRs, and confirms GitHub API reachability. This fails fast with clear errors like `INSUFFICIENT_GITHUB_REPO_PERMISSIONS` before compute is consumed.
+**PR workflows (`coding/pr-iteration-v1` / `coding/pr-review-v1`):** Fetches PR metadata, conversation comments, changed files (REST), and inline review comments (GraphQL, resolved threads filtered out) in four parallel calls. Extracts `head_ref` and `base_ref` for branch resolution.
 
-### Step 3: Session start
+Regardless of workflow, the assembled prompt is screened through Amazon Bedrock Guardrails for prompt injection (fail-closed: unscreened content never reaches the agent). A token budget (default 100K tokens, ~4 chars/token heuristic) trims oldest comments first when exceeded.
+
+### Step 4: Session start
 
 The orchestrator calls `invoke_agent_runtime` with the hydrated payload. The agent receives it, starts the coding task in a background thread (via `add_async_task`), and returns an acknowledgment immediately. The orchestrator records the `(task_id, session_id)` mapping and transitions to `RUNNING`.
 
 The session ID is pre-generated and reused on retry, making session start idempotent after a crash.
 
-### Step 4: Await completion
+### Step 5: Await completion
 
 The orchestrator polls for completion using `waitForCondition` from the Durable Execution SDK. At configurable intervals (default 30s), it re-invokes on the same session (sticky routing). The agent responds with its current status:
 
@@ -202,7 +206,7 @@ The orchestrator polls for completion using `waitForCondition` from the Durable 
 
 If the session is terminated externally (crash, timeout, cancellation), the poll detects it and the orchestrator proceeds to finalization using GitHub-based result inference as fallback.
 
-### Step 5: Finalization
+### Step 6: Finalization
 
 After the session ends, the orchestrator determines the outcome from multiple signals.
 
@@ -239,7 +243,7 @@ Every step in the pipeline satisfies these properties:
 
 ### Extension points
 
-Per [REPO_ONBOARDING.md](/architecture/repo-onboarding), blueprints customize execution through three layers:
+Per [REPO_ONBOARDING.md](/sample-autonomous-cloud-coding-agents/architecture/repo-onboarding), blueprints customize execution through three layers:
 
 1. **Parameterized strategies** - Select built-in implementations without code. Example: `compute.type: 'agentcore'` vs `compute.type: 'ecs'`.
 2. **Lambda-backed custom steps** - Inject custom logic at `pre-agent` or `post-agent` phases. Example: SAST scan before the agent, custom lint after.
@@ -383,18 +387,16 @@ Three DynamoDB tables back the orchestrator: one for task state, one for the aud
 | `user_id` | String | Cognito sub |
 | `status` | String | Current state |
 | `repo` | String | `owner/repo` |
-| `task_type` | String | `new_task`, `pr_iteration`, or `pr_review` |
+| `workflow_ref` | String? | Workflow reference as submitted (e.g. `coding/new-task-v1`); default when absent |
+| `resolved_workflow` | Map | Resolved workflow snapshot `{id, version}` — replaces the former `task_type` enum (#248) |
 | `issue_number` | Number? | GitHub issue number |
-| `pr_number` | Number? | PR number (required for PR task types) |
+| `pr_number` | Number? | PR number (required for PR workflows) |
 | `task_description` | String? | Free-text description |
 | `branch_name` | String | `bgagent/{task_id}/{slug}` for new tasks; PR's `head_ref` for PR tasks |
 | `session_id` | String? | AgentCore session ID |
 | `execution_id` | String? | Durable execution ID |
 | `pr_url` | String? | PR URL (set during finalization) |
 | `error_message` | String? | Error reason if FAILED |
-| `error_code` | String? | Machine-readable error code (e.g. `SESSION_START_FAILED`) |
-
-> **Derived field:** `error_classification` is not stored in DynamoDB. It is computed at API response time by passing `error_message` through the runtime error classifier (`error-classifier.ts`). This returns a structured object with `category` (auth/network/concurrency/compute/agent/guardrail/config/timeout/unknown), `title`, `description`, `remedy`, and `retryable` flag. The derived-field pattern means classifier updates take effect immediately for all existing tasks without data migration.
 | `max_turns` | Number? | Turn limit (per-task overrides per-repo default) |
 | `max_budget_usd` | Number? | Cost ceiling (per-task overrides per-repo default) |
 | `model_id` | String? | Foundation model ID |
@@ -405,11 +407,13 @@ Three DynamoDB tables back the orchestrator: one for task state, one for the aud
 | `ttl` | Number? | DynamoDB TTL (default: created_at + 90 days) |
 | `created_at` / `updated_at` | String | ISO 8601 timestamps |
 
+> **Derived field:** `error_classification` is not stored in DynamoDB. It is computed at API response time by passing `error_message` through the runtime error classifier (`error-classifier.ts`). This returns a structured object with `category` (auth/network/concurrency/compute/agent/guardrail/config/timeout/unknown), `title`, `description`, `remedy`, and `retryable` flag. The derived-field pattern means classifier updates take effect immediately for all existing tasks without data migration.
+
 **GSIs:** `UserStatusIndex` (PK: `user_id`, SK: `status#created_at`), `StatusIndex` (PK: `status`, SK: `created_at`), `IdempotencyIndex` (PK: `idempotency_key`, sparse).
 
 ### TaskEvents table
 
-Append-only audit log. See [OBSERVABILITY.md](/architecture/observability).
+Append-only audit log. See [OBSERVABILITY.md](/sample-autonomous-cloud-coding-agents/architecture/observability).
 
 | Field | Type | Description |
 |---|---|---|
