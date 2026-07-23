@@ -186,6 +186,13 @@ export interface TaskApiProps {
    * Required when attachmentsBucket is provided.
    */
   readonly userConcurrencyTable?: dynamodb.ITable;
+
+  /**
+   * Build identifier surfaced by ``GET /status`` as the ``build`` field
+   * (e.g. a git SHA or release tag injected at deploy time). Defaults to
+   * ``"unknown"`` when omitted.
+   */
+  readonly buildVersion?: string;
 }
 
 /**
@@ -202,6 +209,7 @@ export interface TaskApiProps {
  * - GET    /webhooks             → listWebhooks (Cognito)
  * - DELETE /webhooks/{webhook_id} → deleteWebhook (Cognito)
  * - POST   /webhooks/tasks       → webhookCreateTask (REQUEST authorizer)
+ * - GET    /status               → getStatus (no auth — liveness probe)
  */
 export class TaskApi extends Construct {
   /**
@@ -622,6 +630,23 @@ export class TaskApi extends Construct {
       memorySize: SCREENING_HANDLER_MEMORY_MB,
     });
 
+    // GET /status — lightweight, unauthenticated liveness probe. Returns
+    // { build, uptime_s } per the parent API spec (S1-PARENT-SPEC-1784764497).
+    // No downstream I/O, so it keeps the Lambda defaults (no extra timeout /
+    // memory / IAM grants beyond the managed execution role).
+    const getStatusFn = new lambda.NodejsFunction(this, 'GetStatusFn', {
+      entry: path.join(handlersDir, 'get-status.ts'),
+      handler: 'handler',
+      runtime: Runtime.NODEJS_24_X,
+      architecture: Architecture.ARM_64,
+      environment: {
+        // Surfaced verbatim as the `build` field. Overridable at deploy time;
+        // the handler falls back to "unknown" when unset.
+        BUILD_VERSION: props.buildVersion ?? 'unknown',
+      },
+      bundling: commonBundling,
+    });
+
     // --- IAM grants ---
     // Read-write for create and cancel (write task + event)
     props.taskTable.grantReadWriteData(createTaskFn);
@@ -744,8 +769,27 @@ export class TaskApi extends Construct {
     }
 
     // Collect all Lambda functions for cdk-nag suppressions
-    const allFunctions: lambda.NodejsFunction[] = [createTaskFn, getTaskFn, listTasksFn, cancelTaskFn, getTaskEventsFn, getTaskReplayFn];
+    const allFunctions: lambda.NodejsFunction[] = [createTaskFn, getTaskFn, listTasksFn, cancelTaskFn, getTaskEventsFn, getTaskReplayFn, getStatusFn];
     if (confirmUploadsFn) allFunctions.push(confirmUploadsFn);
+
+    // --- Liveness endpoint: GET /status (no auth) ---
+    // Intentionally unauthenticated so external monitors / load balancers
+    // can probe liveness without a Cognito token. Returns only a build id
+    // and process uptime — no user data — so anonymous access is safe.
+    const status = this.api.root.addResource('status');
+    const statusMethod = status.addMethod('GET', new apigw.LambdaIntegration(getStatusFn), {
+      authorizationType: apigw.AuthorizationType.NONE,
+    });
+    NagSuppressions.addResourceSuppressions(statusMethod, [
+      {
+        id: 'AwsSolutions-COG4',
+        reason: 'GET /status is a public liveness probe (build + uptime only, no user data) — Cognito auth is intentionally omitted',
+      },
+      {
+        id: 'AwsSolutions-APIG4',
+        reason: 'GET /status is a public liveness probe (build + uptime only, no user data) — authorization is intentionally omitted',
+      },
+    ]);
 
     // --- API resource tree: /tasks ---
     const tasks = this.api.root.addResource('tasks');

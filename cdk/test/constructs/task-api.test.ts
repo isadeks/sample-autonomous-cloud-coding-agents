@@ -119,20 +119,20 @@ describe('TaskApi construct', () => {
     });
   });
 
-  test('creates 6 Lambda functions without webhookTable', () => {
-    // 6 = create, get, list, cancel, get-events, get-replay (#515).
-    baseTemplate.resourceCountIs('AWS::Lambda::Function', 6);
+  test('creates 7 Lambda functions without webhookTable', () => {
+    // 7 = create, get, list, cancel, get-events, get-replay (#515), get-status.
+    baseTemplate.resourceCountIs('AWS::Lambda::Function', 7);
   });
 
-  test('creates 11 Lambda functions with webhookTable', () => {
-    webhookTemplate.resourceCountIs('AWS::Lambda::Function', 11);
+  test('creates 12 Lambda functions with webhookTable', () => {
+    webhookTemplate.resourceCountIs('AWS::Lambda::Function', 12);
   });
 
   test('Lambda functions use ARM_64 architecture and Node.js 24', () => {
     const functions = baseTemplate.findResources('AWS::Lambda::Function');
     const fnIds = Object.keys(functions);
 
-    expect(fnIds.length).toBe(6);
+    expect(fnIds.length).toBe(7);
     for (const fnId of fnIds) {
       expect(functions[fnId].Properties.Runtime).toBe('nodejs24.x');
       expect(functions[fnId].Properties.Architectures).toEqual(['arm64']);
@@ -153,6 +153,13 @@ describe('TaskApi construct', () => {
     const functions = baseTemplate.findResources('AWS::Lambda::Function');
 
     for (const fnId of Object.keys(functions)) {
+      // GetStatusFn is a dependency-free liveness probe — it does not read
+      // DynamoDB, so it only carries BUILD_VERSION (asserted separately).
+      if (fnId.startsWith('TaskApiGetStatusFn')) {
+        const envVars = functions[fnId].Properties.Environment?.Variables ?? {};
+        expect(envVars).toHaveProperty('BUILD_VERSION');
+        continue;
+      }
       const envVars = functions[fnId].Properties.Environment?.Variables ?? {};
       expect(envVars).toHaveProperty('TASK_TABLE_NAME');
       expect(envVars).toHaveProperty('TASK_EVENTS_TABLE_NAME');
@@ -184,12 +191,32 @@ describe('TaskApi construct', () => {
     const nonOptionsMethods = Object.entries(methods).filter(
       ([_, resource]) => (resource as any).Properties.HttpMethod !== 'OPTIONS',
     );
-    // 6 = POST /tasks, GET /tasks, GET+DELETE /tasks/{id}, GET events, GET replay.
-    expect(nonOptionsMethods.length).toBe(6);
+    // 7 = POST /tasks, GET /tasks, GET+DELETE /tasks/{id}, GET events, GET
+    // replay (all Cognito), plus GET /status (unauthenticated liveness probe).
+    expect(nonOptionsMethods.length).toBe(7);
 
-    for (const [_, resource] of nonOptionsMethods) {
-      expect((resource as any).Properties.AuthorizationType).toBe('COGNITO_USER_POOLS');
-    }
+    const cognitoMethods = nonOptionsMethods.filter(
+      ([_, resource]) => (resource as any).Properties.AuthorizationType === 'COGNITO_USER_POOLS',
+    );
+    // 6 owner-scoped endpoints remain behind Cognito.
+    expect(cognitoMethods.length).toBe(6);
+
+    // GET /status is intentionally public (AuthorizationType: NONE).
+    const noneAuthMethods = nonOptionsMethods.filter(
+      ([_, resource]) => (resource as any).Properties.AuthorizationType === 'NONE',
+    );
+    expect(noneAuthMethods.length).toBe(1);
+    expect((noneAuthMethods[0][1] as any).Properties.HttpMethod).toBe('GET');
+  });
+
+  test('creates GET /status as an unauthenticated liveness probe', () => {
+    baseTemplate.hasResourceProperties('AWS::ApiGateway::Resource', {
+      PathPart: 'status',
+    });
+    baseTemplate.hasResourceProperties('AWS::ApiGateway::Method', {
+      HttpMethod: 'GET',
+      AuthorizationType: 'NONE',
+    });
   });
 
   test('creates a WAFv2 Web ACL with managed rule groups', () => {
@@ -413,13 +440,14 @@ describe('TaskApi construct with webhooks', () => {
     });
   });
 
-  test('creates 10 non-OPTIONS API methods with webhooks', () => {
+  test('creates 11 non-OPTIONS API methods with webhooks', () => {
     const methods = template.findResources('AWS::ApiGateway::Method');
     const nonOptionsMethods = Object.entries(methods).filter(
       ([_, resource]) => (resource as any).Properties.HttpMethod !== 'OPTIONS',
     );
-    // 6 base (incl. GET replay #515) + 4 webhook (POST/GET /webhooks, DELETE /webhooks/{id}, POST /webhooks/tasks)
-    expect(nonOptionsMethods.length).toBe(10);
+    // 6 base (incl. GET replay #515) + 1 GET /status (liveness) + 4 webhook
+    // (POST/GET /webhooks, DELETE /webhooks/{id}, POST /webhooks/tasks)
+    expect(nonOptionsMethods.length).toBe(11);
   });
 
   test('webhook task creation uses CUSTOM authorization', () => {
