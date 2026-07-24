@@ -244,6 +244,7 @@ function hasPhrase(text: string, phrase: string): boolean {
   // Escape regex metachars (e.g. "+1", "don't"); match on non-word boundaries so
   // "approve" doesn't fire on "approval" and "no" doesn't fire on "notify".
   const esc = phrase.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  // nosemgrep: javascript.lang.security.audit.detect-non-literal-regexp.detect-non-literal-regexp -- `phrase` comes only from internal constant phrase lists (CHANGE_VERBS/APPROVE_PHRASES/etc.) and is regex-escaped above; never user-controlled.
   return new RegExp(`(^|[^a-z0-9])${esc}([^a-z0-9]|$)`, 'i').test(text);
 }
 

@@ -55,6 +55,7 @@ def gql(query, variables=None):
         headers={"Authorization": pat(), "Content-Type": "application/json"},
     )
     try:
+        # nosemgrep: python.lang.security.audit.dynamic-urllib-use-detected.dynamic-urllib-use-detected -- request targets the hardcoded LINEAR_URL constant (https://api.linear.app/graphql); no dynamic/user-controlled URL or file:// scheme.
         with urllib.request.urlopen(req, timeout=30) as r:
             out = json.load(r)
     except urllib.error.HTTPError as e:
