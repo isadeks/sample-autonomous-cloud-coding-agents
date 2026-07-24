@@ -10,7 +10,7 @@ Use the [GitHub issue tracker](https://github.com/aws-samples/sample-autonomous-
 
 ### 1. Open an issue first
 
-Describe what you intend to contribute. This avoids duplicate work and gives maintainers a chance to provide early feedback on approach.
+Describe what you intend to contribute. This avoids duplicate work and gives maintainers a chance to provide early feedback on approach. If you plan to hand the issue to ABCA via the `bgagent` trigger label, run through the [Linear issue-intake checklist](./docs/guides/LINEAR_ISSUE_INTAKE_CHECKLIST.md) first so the agent has everything it needs to open a mergeable PR unattended.
 
 ### 2. Set up your environment
 
