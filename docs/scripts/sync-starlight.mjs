@@ -44,6 +44,7 @@ function rewriteDocsLinkTarget(target) {
     CONTRIBUTING: '/developer-guide/contributing',
     SLACK_SETUP_GUIDE: '/using/slack-setup-guide',
     LINEAR_SETUP_GUIDE: '/using/linear-setup-guide',
+    LINEAR_ISSUE_INTAKE_CHECKLIST: '/using/linear-issue-intake-checklist',
     LINEAR_PAK_MIGRATION_RUNBOOK: '/using/linear-pak-migration-runbook',
     JIRA_SETUP_GUIDE: '/using/jira-setup-guide',
     DEPLOY_PREVIEW_SCREENSHOTS_GUIDE: '/using/deploy-preview-screenshots-guide',
@@ -275,6 +276,12 @@ mirrorMarkdownFile(
 mirrorMarkdownFile(
   path.join(docsRoot, 'guides', 'LINEAR_SETUP_GUIDE.md'),
   path.join('src', 'content', 'docs', 'using', 'Linear-setup-guide.md'),
+);
+
+// --- Linear issue-intake checklist: mirror to using/ ---
+mirrorMarkdownFile(
+  path.join(docsRoot, 'guides', 'LINEAR_ISSUE_INTAKE_CHECKLIST.md'),
+  path.join('src', 'content', 'docs', 'using', 'Linear-issue-intake-checklist.md'),
 );
 
 // --- Linear PAK migration runbook: mirror to using/ ---
