@@ -101,7 +101,7 @@ Optional flags on `onboard-project`: `--decompose-allowed` (enable the `bgagent:
 
 ### 7. Test
 
-Apply the trigger label to a Linear issue in the onboarded project. The agent should start within ~30 seconds, post a `🤖 Starting on this issue…` comment, then a PR link when ready.
+Apply the trigger label to a Linear issue in the onboarded project. The agent should start within ~30 seconds, post a `🤖 Starting on this issue…` comment, then a PR link when ready. Watch the reaction on the issue: 👀 while it runs, then ✅ (done), ❓ (needs input), or ❌ (failed) — see the [recovery guide](./LINEAR_RECOVERY_GUIDE.md) for what each reaction means and how to reply.
 
 ## Inviting teammates
 
@@ -198,7 +198,7 @@ Notes:
 - **The approval conversation is interactive.** After a `:decompose` plan is posted, reply `@bgagent approve` to run it, `@bgagent reject` to discard it, or just tell it what to change in plain language — e.g. `@bgagent make it 2 tasks instead of 3` — and it re-plans and posts an updated breakdown. Repeat until you're happy, then approve.
 - **A plain `bgagent` label on a multi-part issue still runs as one task.** If the description looks like it has several parts, ABCA posts a one-line hint suggesting `:decompose` — but it does **not** block the single-task run it already started. If you wanted a plan, add `:decompose` instead.
 - **`:decompose` / `:auto` on an issue that already has sub-issues** is a no-op suffix — there's nothing to decompose, so ABCA just runs the existing sub-issue graph (Mode A).
-- **Once ABCA is working**, reply to its comments with `@bgagent <what you want>` to ask a question or request a change.
+- **Once ABCA is working**, reply to its comments with `@bgagent <what you want>` to ask a question or request a change. If a task stops and reacts ❓ (needs input) or ❌ (failed), see the [recovery guide](./LINEAR_RECOVERY_GUIDE.md) for how to interpret the reaction and reply to unblock, revise, or retry.
 - **Per-project caps** (max sub-issues, max total budget) are set at onboarding and apply to `:decompose` / `:auto`; an over-cap plan is rejected with an explanatory comment.
 
 ## Parent/sub-issue orchestration
@@ -230,6 +230,8 @@ Notes and current limitations:
 - Multi-predecessor ("diamond") sub-issues merge their predecessors' branches at start time; if a predecessor is later edited in review, re-integration of the dependent is a tracked follow-up.
 
 ## Troubleshooting
+
+> **Need to recover a task that stopped and asked for something?** See the [recovery guide](./LINEAR_RECOVERY_GUIDE.md) for how to read the 👀 / ✅ / ❓ / ❌ status reactions and how to reply with `@bgagent` to answer a question, revise a PR, or retry a failure. The section below covers **setup-side** problems (webhooks, OAuth, signing secrets).
 
 ### Webhook doesn't trigger a task
 

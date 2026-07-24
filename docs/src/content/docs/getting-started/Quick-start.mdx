@@ -573,3 +573,4 @@ Run from the `cli/` directory (`cd cli` from the repo root):
 - **Enable tracing**: `node lib/bin/bgagent.js submit --repo owner/repo --issue 42 --trace` then `node lib/bin/bgagent.js trace download <TASK_ID>`
 - **Manage webhooks**: `node lib/bin/bgagent.js webhook create --name "My CI"` — automate task submission from external systems
 - **Run locally first**: Test with `./agent/run.sh` before deploying - see the [Developer guide](/sample-autonomous-cloud-coding-agents/developer-guide/introduction)
+- **Trigger from Linear**: Apply a label to a Linear issue - see the [Linear integration setup guide](/sample-autonomous-cloud-coding-agents/using/linear-setup-guide), and the [recovery guide](/sample-autonomous-cloud-coding-agents/using/linear-recovery-guide) for reading status reactions and replying when ABCA needs input
