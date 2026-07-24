@@ -1,3 +1,4 @@
+def (
 """Task pipeline: the main orchestrator that wires all modules together."""
 
 from __future__ import annotations
