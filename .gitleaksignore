@@ -10,3 +10,14 @@
 # by commit-SHA fingerprint, #530) is now suppressed SHA-independently via a
 # stopword allowlist in .gitleaks.toml — a commit-SHA fingerprint here broke when
 # history was rewritten. See #537.
+
+# AWS account IDs written into the AgentCore Gateway MCP spike docs on the
+# feat/agentcore-gateway-* branches (merged in as predecessor epic work). The
+# files were later renamed/removed from HEAD, but the commits remain in the
+# shared branch history and cannot be scrubbed without rewriting it. Baseline
+# the historical fingerprints so the full-history sweep stays green.
+6c0cf601f15409c56f7fece1a8c71d00835f2fd6:docs/design/AGENTCORE_GATEWAY_MCP_SPIKE.md:aws-account-id:3
+d773e3ebf23581d7f68bf0cc7f99df00eb1c24a7:docs/design/AGENTCORE_GATEWAY_MCP_SPIKE.md:aws-account-id:7
+d773e3ebf23581d7f68bf0cc7f99df00eb1c24a7:docs/design/AGENTCORE_GATEWAY_MCP_SPIKE.md:aws-account-id:38
+4b958153807b1a2936cac08c1da87ae6158444c4:docs/src/content/docs/architecture/Agentcore-gateway-mcp-spike.md:aws-account-id:7
+4b958153807b1a2936cac08c1da87ae6158444c4:docs/src/content/docs/architecture/Agentcore-gateway-mcp-spike.md:aws-account-id:40
