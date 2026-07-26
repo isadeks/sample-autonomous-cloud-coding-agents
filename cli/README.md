@@ -2,6 +2,8 @@
 
 Command-line interface for the ABCA platform. Submit coding tasks, monitor their status, and manage results — all through the deployed REST API with Cognito authentication.
 
+> **Note:** The `bgagent` CLI is distributed as part of this monorepo; you must deploy the ABCA stack (see [Quick start](#quick-start)) before the CLI has an API endpoint to talk to.
+
 ## Installation
 
 ```bash
