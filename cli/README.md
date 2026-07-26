@@ -383,3 +383,5 @@ The CLI uses Cognito `USER_PASSWORD_AUTH` for initial login and `REFRESH_TOKEN_A
 ## License
 
 Apache-2.0
+
+For a broader overview of the ABCA platform, see the repository [README](../README.md) and [developer guide](../docs/guides/DEVELOPER_GUIDE.md).
