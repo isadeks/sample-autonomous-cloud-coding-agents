@@ -129,6 +129,15 @@ export interface TaskRecord {
   readonly linear_issue_id?: string;
   /** Sparse JiraIssueIndex key (`{cloudId}#{issueKey}`); internal only. */
   readonly jira_issue_identity?: string;
+  /**
+   * Sparse SlackThreadIndex key (`{teamId}#{channelId}#{threadTs}`), hoisted
+   * from ``channel_metadata`` at task-create time (ABCA-1015). Top-level because
+   * a DynamoDB GSI cannot key off a nested map — the Slack follow-up trigger
+   * queries this index to resolve a thread reply back to its newest ABCA task +
+   * PR. Present only for Slack-origin tasks that carry a thread ts; absent
+   * otherwise (which keeps the GSI sparse).
+   */
+  readonly slack_thread_identity?: string;
   readonly status_created_at: string;
   readonly created_at: string;
   readonly updated_at: string;

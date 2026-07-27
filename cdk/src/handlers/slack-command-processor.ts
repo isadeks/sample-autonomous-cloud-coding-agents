@@ -20,13 +20,17 @@
 import * as crypto from 'crypto';
 import { DynamoDBClient } from '@aws-sdk/client-dynamodb';
 import { DynamoDBDocumentClient, GetCommand, PutCommand } from '@aws-sdk/lib-dynamodb';
+import { buildIterationInstruction, type CommentTrigger } from './shared/comment-trigger';
 import { createTaskCore } from './shared/create-task-core';
 import { logger } from './shared/logger';
+import { parseRetryIntent } from './shared/orchestration-comment-trigger';
 import { slackFetch } from './shared/slack-api';
+import { prNumberFromTask, resolveTaskBySlackThread } from './shared/slack-task-by-thread';
 import { getSlackSecret, SLACK_SECRET_PREFIX } from './shared/slack-verify';
 import type { Attachment } from './shared/types';
 import { CODING_WORKFLOW_ID } from './shared/workflows';
 import type { SlackCommandPayload } from './slack-commands';
+import { TERMINAL_STATUSES, type TaskStatusType } from '../constructs/task-status';
 
 /**
  * Payload fields every inbound event carries, whether it came from a slash
@@ -58,6 +62,29 @@ export interface MentionEvent extends BasePayload {
   readonly source: 'mention';
   readonly mention_thread_ts?: string;
   readonly files?: readonly SlackFileRef[];
+  /**
+   * ABCA-1015 follow-up: set by the events handler when the mention (or DM
+   * message) is a REPLY inside an existing thread rather than a fresh top-level
+   * mention. When present the processor first tries to resolve the thread back
+   * to its ABCA task and, if found, runs a follow-up on that task's PR instead
+   * of creating a brand-new task. A miss (the thread isn't an ABCA task thread)
+   * falls through to the normal ``submit`` path so a re-mention in an unrelated
+   * thread still starts new work.
+   */
+  readonly is_thread_reply?: boolean;
+  /**
+   * ABCA-1015: the mention text with the ``@Shoof`` mention(s) stripped — the
+   * follow-up instruction ("also fix the header", "try again"). Empty for a
+   * bare re-mention, which the follow-up path treats as "address the latest
+   * review". Only meaningful together with {@link is_thread_reply}.
+   */
+  readonly follow_up_instruction?: string;
+  /**
+   * ABCA-1015: ts of the user's actual reply message (distinct from
+   * {@link mention_thread_ts}, which is the thread ROOT). Used to move the
+   * :eyes: → :x: reaction onto the reply the human wrote, not the root.
+   */
+  readonly reply_message_ts?: string;
 }
 
 /** Discriminated union of the inbound events the processor accepts. */
@@ -110,6 +137,27 @@ export async function handler(raw: RawEvent): Promise<void> {
     ? buildMentionReply(event)
     : (msg: string) => postToSlack(event.response_url, msg);
 
+  // ABCA-1015 follow-up: a reply (or re-mention) inside an existing task thread
+  // steers/re-runs the work on the SAME PR rather than starting a new task.
+  // Tried before the submit switch so a thread reply doesn't get parsed as a
+  // fresh ``submit``. A miss (the thread isn't an ABCA task thread, or the task
+  // has no PR to iterate) falls through to the normal submit path below, so a
+  // re-mention in an unrelated thread still starts new work.
+  if (event.source === 'mention' && event.is_thread_reply) {
+    try {
+      const handled = await handleFollowUp(event, reply);
+      if (handled) return;
+    } catch (err) {
+      logger.error('Slack follow-up processing failed', {
+        error: err instanceof Error ? err.message : String(err),
+        team_id: event.team_id,
+        user_id: event.user_id,
+      });
+      await reply(':warning: Something went wrong handling your follow-up. Please try again.');
+      return;
+    }
+  }
+
   try {
     switch (subcommand) {
       case 'submit':
@@ -129,6 +177,9 @@ export async function handler(raw: RawEvent): Promise<void> {
           + '*Submit a task:* Mention `@Shoof` in any channel:\n'
           + '> `@Shoof fix the login bug in org/repo#42`\n'
           + '> `@Shoof update the README in org/repo`\n\n'
+          + '*Steer or re-run a task:* Reply in the task\'s thread (mention `@Shoof` again) — I update the same pull request:\n'
+          + '> `@Shoof also fix the header`\n'
+          + '> `@Shoof retry` _(re-runs after a failure)_\n\n'
           + '*Private submissions:* DM Shoof directly.\n\n'
           + '*Cancel a task:* Use the Cancel button in the thread.\n\n'
           + '*Link your account:* `/bgagent link` — one-time setup.\n\n'
@@ -176,6 +227,168 @@ function buildMentionReply(event: MentionEvent): ReplyFn {
       logger.warn('Failed to post mention reply', { error: result.error, channel: event.channel_id });
     }
   };
+}
+
+// ─── Follow-up (ABCA-1015) ─────────────────────────────────────────────────────
+
+const TASK_TABLE = process.env.TASK_TABLE_NAME;
+
+/** createTaskCore validates idempotency keys against /^[A-Za-z0-9_-]{1,128}$/;
+ *  synthesized follow-up keys are sliced to fit. Mirrors the Linear processor. */
+const MAX_IDEMPOTENCY_KEY_LENGTH = 128;
+
+/**
+ * ABCA-1015 — a reply (or a re-mention) inside an existing task thread steers or
+ * re-runs the work on the SAME pull request.
+ *
+ * Mirrors the Linear/Jira comment-trigger flow: resolve the thread → its newest
+ * ABCA task via the sparse ``SlackThreadIndex`` GSI, then dispatch a follow-up.
+ * Reuses the shared, pure intent helpers (``buildIterationInstruction`` for the
+ * PR-iteration directive, ``parseRetryIntent`` to recognise a plain "retry" /
+ * "try again") rather than duplicating that logic here.
+ *
+ * Behaviour:
+ *  - Thread resolves to a task WITH a PR → run ``coding/pr-iteration-v1`` on it
+ *    (a bare re-mention or "retry" both iterate; "retry" is honoured even after
+ *    a failure since the same PR/branch is the target).
+ *  - Task exists but has NO PR yet (PR-less completed run, or still in flight) →
+ *    reply in-thread explaining, and DON'T start a divergent task. Returns true
+ *    (handled) so the caller does not fall through to ``submit``.
+ *  - Thread is NOT an ABCA task thread (GSI miss) → returns false so the caller
+ *    treats the re-mention as fresh new work.
+ *
+ * Returns true when the follow-up was handled (dispatched or answered),
+ * false when the caller should fall through to the normal submit path.
+ */
+async function handleFollowUp(event: MentionEvent, reply: ReplyFn): Promise<boolean> {
+  const threadTs = event.mention_thread_ts;
+  if (!threadTs) return false; // No thread context — nothing to resolve against.
+  if (!TASK_TABLE) {
+    logger.warn('Slack follow-up: TASK_TABLE_NAME not set — cannot resolve thread', {
+      team_id: event.team_id,
+    });
+    return false;
+  }
+
+  const priorTask = await resolveTaskBySlackThread(
+    ddb, TASK_TABLE, event.team_id, event.channel_id, threadTs,
+  );
+  if (!priorTask) {
+    // Not an ABCA task thread — let the caller start fresh work from the mention.
+    logger.info('Slack follow-up: thread has no ABCA task — falling through to submit', {
+      team_id: event.team_id, channel_id: event.channel_id,
+    });
+    return false;
+  }
+
+  // Attribute the follow-up to the replying user when linked; otherwise fall
+  // back to the original task's owner (a linked reviewer keeps steering their
+  // own PR even if a teammate replies). Mirrors the Jira comment path.
+  const linkedUser = await lookupPlatformUser(event.team_id, event.user_id);
+  const platformUserId = linkedUser ?? priorTask.user_id;
+  if (!platformUserId) {
+    await reply(':link: I found this task, but neither you nor the original requester has a linked ABCA account. Run `/bgagent link` first, then reply again.');
+    await swapFollowUpReaction(event);
+    return true;
+  }
+
+  const prNumber = prNumberFromTask(priorTask);
+  if (prNumber === null || !priorTask.repo) {
+    // No PR to iterate on. Distinguish an in-flight task (be patient) from a
+    // finished PR-less run (nothing to follow up on this way).
+    const stillRunning = priorTask.status !== undefined
+      && !TERMINAL_STATUSES.includes(priorTask.status as TaskStatusType);
+    if (stillRunning) {
+      await reply(":hourglass_flowing_sand: I'm still working on this task — I'll post here when the PR is ready. Reply again after that to steer it.");
+    } else {
+      await reply(":information_source: This thread's task didn't open a pull request, so there's nothing to update here. Mention `@Shoof` with a fresh request to start new work.");
+    }
+    return true; // Handled — don't fall through to a divergent new task.
+  }
+
+  // Build the follow-up instruction from the shared, pure helpers. A retry
+  // phrase ("retry", "try again") on a PR means the same thing as a bare
+  // follow-up here — re-run the agent against the existing PR — so we reuse
+  // buildIterationInstruction either way, but log the retry classification.
+  const instruction = (event.follow_up_instruction ?? '').trim();
+  const trigger: CommentTrigger = { triggered: true, instruction };
+  const isRetry = parseRetryIntent(instruction);
+  const taskDescription = buildIterationInstruction(trigger);
+
+  // ACK immediately: swap the receipt :eyes: to :hourglass_flowing_sand: on the
+  // reply so the user sees the follow-up was accepted (the fanout terminal
+  // reply then posts the ✅/❌ under the thread root).
+  await swapReaction(event.team_id, event.channel_id, event.reply_message_ts ?? threadTs, 'eyes', 'hourglass_flowing_sand');
+
+  // Thread every notification for this follow-up under the SAME thread root so
+  // the conversation stays in one place. Carry the trigger message ts so the
+  // slack dispatcher can react on it.
+  const channelMetadata: Record<string, string> = {
+    slack_team_id: event.team_id,
+    slack_channel_id: event.channel_id,
+    slack_user_id: event.user_id,
+    slack_thread_ts: threadTs,
+    slack_follow_up: 'true',
+    slack_prior_task_id: priorTask.task_id,
+  };
+
+  // Deterministic idempotency key: a Slack event redelivery (Slack retries when
+  // we don't ack in 3s) must not spawn a second iteration. Keyed on the thread +
+  // the reply message ts (unique per genuine user reply, stable across retries).
+  const idempotencyKey = `slack-iterate-${event.team_id}-${event.channel_id}-${event.reply_message_ts ?? threadTs}`
+    .replace(/[^A-Za-z0-9_-]/g, '')
+    .slice(0, MAX_IDEMPOTENCY_KEY_LENGTH);
+
+  const result = await createTaskCore(
+    {
+      repo: priorTask.repo,
+      workflow_ref: 'coding/pr-iteration-v1',
+      pr_number: prNumber,
+      task_description: taskDescription,
+    },
+    {
+      userId: platformUserId,
+      channelSource: 'slack',
+      channelMetadata,
+      idempotencyKey,
+    },
+    idempotencyKey,
+  );
+
+  if (result.statusCode === 200) {
+    // Idempotent replay of an already-accepted follow-up — the first delivery
+    // already dispatched. Leave the reaction/notifications to that path.
+    logger.info('Slack follow-up was an idempotent replay', {
+      team_id: event.team_id, prior_task_id: priorTask.task_id, pr_number: prNumber,
+    });
+    return true;
+  }
+
+  if (result.statusCode !== 201) {
+    const body = JSON.parse(result.body);
+    const errMsg = body.error?.message ?? 'Unknown error';
+    await reply(`:x: I couldn't start the follow-up on PR #${prNumber}: ${errMsg}`);
+    await swapFollowUpReaction(event);
+    return true;
+  }
+
+  logger.info('Slack follow-up iteration task created', {
+    team_id: event.team_id,
+    channel_id: event.channel_id,
+    prior_task_id: priorTask.task_id,
+    pr_number: prNumber,
+    is_retry: isRetry,
+    attributed_to_linked_user: Boolean(linkedUser),
+  });
+  return true;
+}
+
+/** Swap the follow-up reply's reaction to :x: on a failure/rejection. */
+async function swapFollowUpReaction(event: MentionEvent): Promise<void> {
+  const ts = event.reply_message_ts ?? event.mention_thread_ts;
+  if (ts) {
+    await swapReaction(event.team_id, event.channel_id, ts, 'eyes', 'x');
+  }
 }
 
 // ─── Submit ───────────────────────────────────────────────────────────────────

@@ -733,6 +733,18 @@ export async function createTaskCore(
         jira_issue_identity:
           `${context.channelMetadata.jira_cloud_id}#${context.channelMetadata.jira_issue_key}`,
       }),
+    // ABCA-1015: hoist the Slack thread key so the sparse SlackThreadIndex GSI
+    // can resolve a thread reply → its newest task + PR (a GSI cannot key off
+    // the nested channel_metadata map). Slack-origin tasks WITH a thread ts
+    // only — a DM/first-mention with no thread ts stays absent (sparse).
+    ...(context.channelSource === 'slack'
+      && context.channelMetadata?.slack_team_id
+      && context.channelMetadata?.slack_channel_id
+      && context.channelMetadata?.slack_thread_ts
+      && {
+        slack_thread_identity:
+          `${context.channelMetadata.slack_team_id}#${context.channelMetadata.slack_channel_id}#${context.channelMetadata.slack_thread_ts}`,
+      }),
     ...(attachmentRecords.length > 0 && { attachments: attachmentRecords }),
     status_created_at: `${initialStatus}#${now}`,
     created_at: now,
