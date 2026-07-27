@@ -62,6 +62,9 @@ export interface TaskTableProps {
  *   comment trigger)
  * - JiraIssueIndex (PK: jira_issue_identity, SK: created_at) — sparse index
  *   for resolving a Jira issue to its newest PR-producing task (#640)
+ * - SlackThreadIndex (PK: slack_thread_identity, SK: created_at) — sparse index
+ *   for resolving a Slack thread back to its newest ABCA task + PR, so a reply
+ *   in the task thread runs a follow-up on the existing PR (ABCA-1015)
  */
 export class TaskTable extends Construct {
   /**
@@ -97,6 +100,16 @@ export class TaskTable extends Construct {
    * PK: jira_issue_identity (`{cloudId}#{issueKey}`), SK: created_at.
    */
   public static readonly JIRA_ISSUE_INDEX = JIRA_ISSUE_INDEX_NAME;
+
+  /**
+   * GSI for resolving a Slack task thread → its newest ABCA task + PR
+   * (ABCA-1015). PK: slack_thread_identity (`{teamId}#{channelId}#{threadTs}`),
+   * SK: created_at (newest task wins). Sparse — only Slack-origin tasks that
+   * carry a thread ts write the top-level ``slack_thread_identity`` attribute;
+   * GitHub/Linear/Jira/API tasks are absent. Powers the follow-up trigger when a
+   * reviewer replies in (or re-mentions Shoof inside) the task's thread.
+   */
+  public static readonly SLACK_THREAD_INDEX = 'SlackThreadIndex';
 
   /**
    * The underlying DynamoDB table. Use this to grant access or read the table name.
@@ -179,6 +192,19 @@ export class TaskTable extends Construct {
     this.table.addGlobalSecondaryIndex({
       indexName: TaskTable.JIRA_ISSUE_INDEX,
       partitionKey: { name: 'jira_issue_identity', type: dynamodb.AttributeType.STRING },
+      sortKey: { name: 'created_at', type: dynamodb.AttributeType.STRING },
+      projectionType: dynamodb.ProjectionType.INCLUDE,
+      nonKeyAttributes: ['pr_url', 'pr_number', 'status', 'repo', 'user_id', 'channel_metadata'],
+    });
+
+    // GSI: Slack thread → newest ABCA task + PR (sparse — only Slack-origin
+    // tasks carrying a thread ts write the top-level slack_thread_identity).
+    // ABCA-1015 follow-up trigger: a reply in the task's thread iterates on the
+    // existing PR. Same lean INCLUDE projection as the Linear/Jira indexes — the
+    // follow-up resolver reads only these fields.
+    this.table.addGlobalSecondaryIndex({
+      indexName: TaskTable.SLACK_THREAD_INDEX,
+      partitionKey: { name: 'slack_thread_identity', type: dynamodb.AttributeType.STRING },
       sortKey: { name: 'created_at', type: dynamodb.AttributeType.STRING },
       projectionType: dynamodb.ProjectionType.INCLUDE,
       nonKeyAttributes: ['pr_url', 'pr_number', 'status', 'repo', 'user_id', 'channel_metadata'],

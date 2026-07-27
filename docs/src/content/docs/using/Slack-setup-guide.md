@@ -24,6 +24,8 @@ This single command handles everything: deploying the stack (if needed), generat
 ## How it works
 
 - **@Shoof mentions**: `@Shoof fix the bug in org/repo#42` submits a task. Reactions on your message show progress: :eyes: (received) → :hourglass_flowing_sand: (working) → :white_check_mark: (done)
+- **Thread follow-ups**: Reply in the task's thread (mention `@Shoof` again) to steer or re-run the work on the *same* pull request — e.g. `@Shoof also fix the header` adds to the PR, and a bare `@Shoof retry` re-runs after a failure. A reply in a thread Shoof never worked in just starts fresh work.
+- **Plan approval for big requests**: When a request is large enough to break into several pieces, Shoof posts a proposed plan in the thread and *waits* — nothing runs until you decide. Reply naturally: `approve` / `looks good` / :thumbsup: creates the pieces and starts them; `cancel` discards the plan; or tell it what to change — `drop #3`, `merge 1 and 2`, `make #2 small` — and it edits the same plan message in place. A vague or ambiguous reply gets a nudge rather than guessing, so an approve or a discard is always deliberate.
 - **DMs**: Message Shoof directly for private task submissions
 - **Notifications**: Threaded messages show task_created → completed (with PR link, duration, cost). The Cancel button lets you stop a running task.
 - **Multi-workspace**: Each workspace installs via OAuth and gets its own bot token

@@ -153,6 +153,45 @@ describe('createTaskCore', () => {
     expect(taskPut![0].input.Item).not.toHaveProperty('jira_issue_identity');
   });
 
+  test('hoists the Slack thread identity for the sparse follow-up index (ABCA-1015)', async () => {
+    const result = await createTaskCore(
+      { repo: 'org/repo', task_description: 'Fix the bug from Slack' },
+      makeContext({
+        channelSource: 'slack',
+        channelMetadata: {
+          slack_team_id: 'T1',
+          slack_channel_id: 'C1',
+          slack_thread_ts: '1234.5678',
+        },
+      }),
+      'req-slack-thread',
+    );
+
+    expect(result.statusCode).toBe(201);
+    const taskPut = mockSend.mock.calls.find(
+      ([command]) => command._type === 'Put' && command.input.TableName === 'Tasks',
+    );
+    expect(taskPut![0].input.Item.slack_thread_identity).toBe('T1#C1#1234.5678');
+  });
+
+  test('does not hoist Slack thread identity when the thread ts is absent', async () => {
+    // A first mention with no thread ts (e.g. a DM before any reply) stays out of
+    // the sparse index — there is no thread to resolve a follow-up against.
+    await createTaskCore(
+      { repo: 'org/repo', task_description: 'Fix the bug from Slack' },
+      makeContext({
+        channelSource: 'slack',
+        channelMetadata: { slack_team_id: 'T1', slack_channel_id: 'C1' },
+      }),
+      'req-slack-no-thread',
+    );
+
+    const taskPut = mockSend.mock.calls.find(
+      ([command]) => command._type === 'Put' && command.input.TableName === 'Tasks',
+    );
+    expect(taskPut![0].input.Item).not.toHaveProperty('slack_thread_identity');
+  });
+
   test('accepts an initial_approvals pattern whose value contains a colon', async () => {
     // Regression: the degenerate-pattern guard used split(':', 2)[1], which
     // truncated the value at the next colon. For "ab:cdefgh" that yields the
