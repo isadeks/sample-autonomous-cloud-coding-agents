@@ -266,6 +266,115 @@ describe('slack-events handler', () => {
     expect(postedReply).toBeFalsy();
   });
 
+  test('thread re-mention is forwarded as a follow-up (is_thread_reply)', async () => {
+    fetchMock.mockResolvedValue({ ok: true, json: () => Promise.resolve({ ok: true }) });
+    lambdaSend.mockResolvedValueOnce({});
+    smSend.mockImplementation((cmd: { _type: string; input?: { SecretId?: string } }) => {
+      if (cmd._type === 'GetSecretValue' && cmd.input?.SecretId === process.env.SLACK_SIGNING_SECRET_ARN) {
+        return Promise.resolve({ SecretString: SIGNING_SECRET });
+      }
+      return Promise.resolve({ SecretString: 'xoxb-bot' });
+    });
+
+    const body = JSON.stringify({
+      type: 'event_callback',
+      team_id: 'T1',
+      event: {
+        type: 'app_mention',
+        user: 'U1',
+        channel: 'C1',
+        text: '<@BOT> also fix the header',
+        ts: '2000.0002', // the reply
+        thread_ts: '1000.0001', // an EXISTING thread root
+      },
+    });
+    const result = await handler(signedEvent(body));
+    expect(result.statusCode).toBe(200);
+    expect(lambdaSend).toHaveBeenCalledTimes(1);
+    const [invokeCmd] = lambdaSend.mock.calls[0];
+    const payload = JSON.parse(new TextDecoder().decode(invokeCmd.input.Payload));
+    expect(payload.is_thread_reply).toBe(true);
+    expect(payload.follow_up_instruction).toBe('also fix the header');
+    expect(payload.mention_thread_ts).toBe('1000.0001');
+    expect(payload.reply_message_ts).toBe('2000.0002');
+    // The receipt :eyes: lands on the REPLY, not the thread root.
+    const reactionCall = fetchMock.mock.calls.find(([url]) => String(url).includes('reactions.add'));
+    expect(reactionCall).toBeTruthy();
+    expect(String((reactionCall![1] as { body: string }).body)).toContain('2000.0002');
+  });
+
+  test('bare thread re-mention (empty text) is still forwarded as a follow-up', async () => {
+    fetchMock.mockResolvedValue({ ok: true, json: () => Promise.resolve({ ok: true }) });
+    lambdaSend.mockResolvedValueOnce({});
+    smSend.mockImplementation((cmd: { _type: string; input?: { SecretId?: string } }) => {
+      if (cmd._type === 'GetSecretValue' && cmd.input?.SecretId === process.env.SLACK_SIGNING_SECRET_ARN) {
+        return Promise.resolve({ SecretString: SIGNING_SECRET });
+      }
+      return Promise.resolve({ SecretString: 'xoxb-bot' });
+    });
+
+    const body = JSON.stringify({
+      type: 'event_callback',
+      team_id: 'T1',
+      event: { type: 'app_mention', user: 'U1', channel: 'C1', text: '<@BOT>', ts: '2.0', thread_ts: '1.0' },
+    });
+    const result = await handler(signedEvent(body));
+    expect(result.statusCode).toBe(200);
+    // Unlike a fresh mention, an empty thread reply is NOT dropped.
+    expect(lambdaSend).toHaveBeenCalledTimes(1);
+    const [invokeCmd] = lambdaSend.mock.calls[0];
+    const payload = JSON.parse(new TextDecoder().decode(invokeCmd.input.Payload));
+    expect(payload.is_thread_reply).toBe(true);
+    expect(payload.follow_up_instruction).toBe('');
+  });
+
+  test('bot-authored message event is ignored (no loop)', async () => {
+    const body = JSON.stringify({
+      type: 'event_callback',
+      team_id: 'T1',
+      event: {
+        type: 'app_mention',
+        user: 'U1',
+        channel: 'C1',
+        text: '<@BOT> hi',
+        ts: '2.0',
+        thread_ts: '1.0',
+        bot_id: 'B999',
+      },
+    });
+    const result = await handler(signedEvent(body));
+    expect(result.statusCode).toBe(200);
+    expect(lambdaSend).not.toHaveBeenCalled();
+  });
+
+  test('a first mention that STARTS a thread is not a follow-up', async () => {
+    fetchMock.mockResolvedValue({ ok: true, json: () => Promise.resolve({ ok: true }) });
+    lambdaSend.mockResolvedValueOnce({});
+    smSend.mockImplementation((cmd: { _type: string; input?: { SecretId?: string } }) => {
+      if (cmd._type === 'GetSecretValue' && cmd.input?.SecretId === process.env.SLACK_SIGNING_SECRET_ARN) {
+        return Promise.resolve({ SecretString: SIGNING_SECRET });
+      }
+      return Promise.resolve({ SecretString: 'xoxb-bot' });
+    });
+    // thread_ts === ts → this message IS the thread root, a fresh mention.
+    const body = JSON.stringify({
+      type: 'event_callback',
+      team_id: 'T1',
+      event: {
+        type: 'app_mention',
+        user: 'U1',
+        channel: 'C1',
+        text: '<@BOT> fix org/repo#1',
+        ts: '5.0',
+        thread_ts: '5.0',
+      },
+    });
+    await handler(signedEvent(body));
+    const [invokeCmd] = lambdaSend.mock.calls[0];
+    const payload = JSON.parse(new TextDecoder().decode(invokeCmd.input.Payload));
+    expect(payload.is_thread_reply).toBeUndefined();
+  });
+
   test('app_mention with Lambda invoke failure swaps :eyes: to :x:', async () => {
     fetchMock.mockResolvedValue({
       ok: true,

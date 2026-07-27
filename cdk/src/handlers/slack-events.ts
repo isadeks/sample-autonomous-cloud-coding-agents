@@ -50,6 +50,13 @@ interface SlackEventPayload {
     readonly channel?: string;
     readonly ts?: string;
     readonly thread_ts?: string;
+    /** Present on messages authored by a bot (incl. Shoof itself) — used to
+     *  ignore the bot's own messages so a threaded reply can't loop. */
+    readonly bot_id?: string;
+    readonly app_id?: string;
+    /** Message subtype (e.g. ``message_changed``, ``bot_message``); a plain
+     *  user message has none, a file upload is ``file_share``. */
+    readonly subtype?: string;
     readonly [key: string]: unknown;
   };
 }
@@ -161,10 +168,28 @@ async function handleAppMention(
     return;
   }
 
+  // Ignore the bot's own messages so a threaded bot reply can never loop back
+  // into a new task/follow-up (app_mention rarely carries these, but message.im
+  // DMs can — and a re-mention of Shoof inside its OWN notification would echo).
+  if (event.bot_id || event.app_id || (event.subtype && event.subtype !== 'file_share')) {
+    logger.info('Ignoring bot-authored / non-user message event', {
+      has_bot_id: Boolean(event.bot_id), subtype: event.subtype,
+    });
+    return;
+  }
+
   // Strip the @mention prefix (e.g. "<@U12345> fix the bug" → "fix the bug").
   const text = rawText.replace(/<@[A-Z0-9]+>/g, '').trim();
 
-  if (!text) {
+  // ABCA-1015: a message inside an EXISTING thread (thread_ts present and not
+  // the message's own ts) is a follow-up reply, not a fresh mention. The
+  // processor resolves the thread → its ABCA task and iterates on that PR;
+  // an empty reply after stripping the mention is a bare "address the latest
+  // review" follow-up (still valid), so — unlike a fresh mention — we do NOT
+  // drop it for being empty. A miss (non-task thread) falls back to submit.
+  const isThreadReply = Boolean(threadTs && threadTs !== messageTs);
+
+  if (!text && !isThreadReply) {
     logger.info('app_mention with empty text after stripping mention, ignoring');
     return;
   }
@@ -215,10 +240,23 @@ async function handleAppMention(
     source: 'mention',
     mention_thread_ts: threadTs ?? messageTs,
     ...(files.length > 0 && { files }),
+    // ABCA-1015: mark thread replies so the processor tries the follow-up path
+    // (resolve the thread → its ABCA task → iterate the PR) before ``submit``.
+    // ``follow_up_instruction`` is the mention text with the @Shoof prefix
+    // stripped (empty for a bare re-mention = "address the latest review");
+    // ``reply_message_ts`` is the user's actual reply so reactions land on it.
+    ...(isThreadReply && {
+      is_thread_reply: true,
+      follow_up_instruction: text,
+      ...(messageTs && { reply_message_ts: messageTs }),
+    }),
   };
 
   // React with :eyes: immediately so the user knows the bot saw their message.
-  const mentionTs = threadTs ?? messageTs;
+  // For a fresh mention this is the message itself; for an ABCA-1015 thread
+  // reply it must be the REPLY (messageTs), not the thread root — that's where
+  // the follow-up handler later swaps :eyes: → :hourglass:/:x:.
+  const mentionTs = isThreadReply ? messageTs : (threadTs ?? messageTs);
   if (mentionTs) {
     const botToken = await getSlackSecret(`${SLACK_SECRET_PREFIX}${teamId}`);
     if (botToken) {

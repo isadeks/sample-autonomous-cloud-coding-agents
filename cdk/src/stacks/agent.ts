@@ -787,6 +787,10 @@ export class AgentStack extends Stack {
       taskTable: taskTable.table,
       taskEventsTable: taskEventsTable.table,
       repoTable: repoTable.table,
+      // ABCA-1016: the Slack plan checkpoint persists pending plans + seeds a
+      // multi-step orchestration on approval — both on the orchestration table.
+      orchestrationTable: orchestrationTable.table,
+      userConcurrencyTable: userConcurrencyTable.table,
       orchestratorFunctionArn: orchestrator.alias.functionArn,
       guardrailId: inputGuardrail.guardrailId,
       guardrailVersion: inputGuardrail.guardrailVersion,
