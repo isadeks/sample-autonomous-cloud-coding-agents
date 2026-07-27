@@ -36,12 +36,21 @@ jest.mock('../../src/handlers/shared/create-task-core', () => ({
   createTaskCore: (...args: unknown[]) => createTaskCoreMock(...args),
 }));
 
+const resolveTaskBySlackThreadMock = jest.fn();
+jest.mock('../../src/handlers/shared/slack-task-by-thread', () => ({
+  resolveTaskBySlackThread: (...args: unknown[]) => resolveTaskBySlackThreadMock(...args),
+  // Reuse the real prNumberFromTask so the follow-up path's PR extraction is
+  // exercised, not stubbed.
+  prNumberFromTask: jest.requireActual('../../src/handlers/shared/linear-task-by-issue').prNumberFromTask,
+}));
+
 const fetchMock = jest.fn();
 (global as unknown as { fetch: unknown }).fetch = fetchMock;
 
 process.env.SLACK_USER_MAPPING_TABLE_NAME = 'SlackMap';
 process.env.SLACK_INSTALLATION_TABLE_NAME = 'SlackInstall';
 process.env.SLACK_CHANNEL_MAPPING_TABLE_NAME = 'SlackChannelMap';
+process.env.TASK_TABLE_NAME = 'TaskTable';
 
 import { handler, type MentionEvent, type SlashCommandEvent } from '../../src/handlers/slack-command-processor';
 
@@ -89,6 +98,8 @@ describe('slack-command-processor handler', () => {
     smSend.mockReset();
     fetchMock.mockReset();
     createTaskCoreMock.mockReset();
+    resolveTaskBySlackThreadMock.mockReset();
+    resolveTaskBySlackThreadMock.mockResolvedValue(null);
     smSend.mockResolvedValue({ SecretString: 'xoxb-bot' });
     fetchMock.mockResolvedValue({
       ok: true,
@@ -379,6 +390,178 @@ describe('slack-command-processor handler', () => {
       expect(createTaskCoreMock).toHaveBeenCalledTimes(1);
       const [reqBody] = createTaskCoreMock.mock.calls[0];
       expect(reqBody.attachments).toBeUndefined();
+    });
+  });
+
+  // ─── ABCA-1015 thread follow-ups ─────────────────────────────────────────────
+  describe('thread follow-up', () => {
+    /** A follow-up reply the events handler forwarded (is_thread_reply set). */
+    function followUp(overrides: Partial<MentionEvent> = {}): MentionEvent {
+      return mention({
+        text: 'submit also fix the header',
+        is_thread_reply: true,
+        follow_up_instruction: 'also fix the header',
+        mention_thread_ts: '1000.0001',
+        reply_message_ts: '1000.0009',
+        ...overrides,
+      });
+    }
+
+    /** Mock the DDB reads the follow-up path makes: the user mapping (linked by
+     *  default) + an active workspace installation (so getBotToken succeeds and
+     *  in-thread replies can post). Pass linked=false to simulate an unlinked
+     *  user while still resolving a bot token. */
+    function linkUser(opts: { linked?: boolean; platformUserId?: string } = {}): void {
+      const { linked = true, platformUserId = 'user-123' } = opts;
+      ddbSend.mockImplementation((cmd: { _type: string; input?: { Key?: { slack_identity?: string; team_id?: string } } }) => {
+        if (cmd._type === 'Get' && cmd.input?.Key?.slack_identity) {
+          return linked
+            ? Promise.resolve({ Item: { platform_user_id: platformUserId, status: 'linked' } })
+            : Promise.resolve({});
+        }
+        if (cmd._type === 'Get' && cmd.input?.Key?.team_id) {
+          return Promise.resolve({ Item: { status: 'active' } });
+        }
+        return Promise.resolve({});
+      });
+    }
+
+    test('resolves the thread and iterates the existing PR (pr-iteration-v1)', async () => {
+      linkUser();
+      resolveTaskBySlackThreadMock.mockResolvedValueOnce({
+        task_id: 'Tprev', repo: 'org/repo', pr_number: 42, status: 'COMPLETED', user_id: 'orig',
+      });
+      createTaskCoreMock.mockResolvedValueOnce({
+        statusCode: 201, body: JSON.stringify({ data: { task_id: 'Tnew' } }),
+      });
+
+      await handler(followUp());
+
+      expect(createTaskCoreMock).toHaveBeenCalledTimes(1);
+      const [reqBody, ctx] = createTaskCoreMock.mock.calls[0];
+      expect(reqBody.workflow_ref).toBe('coding/pr-iteration-v1');
+      expect(reqBody.pr_number).toBe(42);
+      expect(reqBody.task_description).toBe('also fix the header');
+      expect(ctx.channelSource).toBe('slack');
+      expect(ctx.channelMetadata.slack_thread_ts).toBe('1000.0001');
+      expect(ctx.channelMetadata.slack_follow_up).toBe('true');
+      expect(ctx.idempotencyKey).toContain('slack-iterate-');
+    });
+
+    test('a bare re-mention iterates with the default review instruction', async () => {
+      linkUser();
+      resolveTaskBySlackThreadMock.mockResolvedValueOnce({
+        task_id: 'Tprev', repo: 'org/repo', pr_number: 7, status: 'COMPLETED', user_id: 'orig',
+      });
+      createTaskCoreMock.mockResolvedValueOnce({
+        statusCode: 201, body: JSON.stringify({ data: { task_id: 'Tnew' } }),
+      });
+
+      await handler(followUp({ text: 'submit', follow_up_instruction: '' }));
+
+      const [reqBody] = createTaskCoreMock.mock.calls[0];
+      expect(reqBody.task_description).toBe('Address the latest review feedback on this pull request.');
+    });
+
+    test('recognises a plain "retry" after a failure and re-runs on the same PR', async () => {
+      linkUser();
+      resolveTaskBySlackThreadMock.mockResolvedValueOnce({
+        task_id: 'Tprev', repo: 'org/repo', pr_number: 5, status: 'FAILED', user_id: 'orig',
+      });
+      createTaskCoreMock.mockResolvedValueOnce({
+        statusCode: 201, body: JSON.stringify({ data: { task_id: 'Tnew' } }),
+      });
+
+      await handler(followUp({ text: 'submit retry', follow_up_instruction: 'retry' }));
+
+      expect(createTaskCoreMock).toHaveBeenCalledTimes(1);
+      const [reqBody] = createTaskCoreMock.mock.calls[0];
+      expect(reqBody.workflow_ref).toBe('coding/pr-iteration-v1');
+      expect(reqBody.pr_number).toBe(5);
+    });
+
+    test('thread with no ABCA task falls through to submit (new work)', async () => {
+      linkUser();
+      resolveTaskBySlackThreadMock.mockResolvedValueOnce(null);
+      createTaskCoreMock.mockResolvedValueOnce({
+        statusCode: 201, body: JSON.stringify({ data: { task_id: 'Tnew' } }),
+      });
+
+      await handler(followUp({ text: 'submit org/repo do a new thing', follow_up_instruction: 'org/repo do a new thing' }));
+
+      // Fell through to the normal submit path → a fresh coding task, not an iteration.
+      expect(createTaskCoreMock).toHaveBeenCalledTimes(1);
+      const [reqBody] = createTaskCoreMock.mock.calls[0];
+      expect(reqBody.workflow_ref).not.toBe('coding/pr-iteration-v1');
+    });
+
+    test('task exists but has no PR yet (still running) → patient reply, no new task', async () => {
+      linkUser();
+      resolveTaskBySlackThreadMock.mockResolvedValueOnce({
+        task_id: 'Tprev', repo: 'org/repo', status: 'RUNNING', user_id: 'orig',
+      });
+
+      await handler(followUp());
+
+      expect(createTaskCoreMock).not.toHaveBeenCalled();
+      const reply = fetchMock.mock.calls.find(
+        ([url, opts]) => String(url).includes('chat.postMessage') && String((opts as { body: string }).body).includes('still working'),
+      );
+      expect(reply).toBeTruthy();
+    });
+
+    test('task finished with no PR → explains and does not diverge', async () => {
+      linkUser();
+      resolveTaskBySlackThreadMock.mockResolvedValueOnce({
+        task_id: 'Tprev', repo: 'org/repo', status: 'COMPLETED', user_id: 'orig',
+      });
+
+      await handler(followUp());
+
+      expect(createTaskCoreMock).not.toHaveBeenCalled();
+      const reply = fetchMock.mock.calls.find(
+        ([url, opts]) => String(url).includes('chat.postMessage') && String((opts as { body: string }).body).includes("didn't open a pull request"),
+      );
+      expect(reply).toBeTruthy();
+    });
+
+    test('unlinked user (and no original owner) → link prompt, no task', async () => {
+      // No user mapping (unlinked) — but a resolvable bot token so the reply posts.
+      linkUser({ linked: false });
+      resolveTaskBySlackThreadMock.mockResolvedValueOnce({
+        task_id: 'Tprev', repo: 'org/repo', pr_number: 3, status: 'COMPLETED',
+      });
+
+      await handler(followUp());
+
+      expect(createTaskCoreMock).not.toHaveBeenCalled();
+      const reply = fetchMock.mock.calls.find(
+        ([url, opts]) => String(url).includes('chat.postMessage') && String((opts as { body: string }).body).includes('linked ABCA account'),
+      );
+      expect(reply).toBeTruthy();
+    });
+
+    test('idempotent replay (200) does not double-notify', async () => {
+      linkUser();
+      resolveTaskBySlackThreadMock.mockResolvedValueOnce({
+        task_id: 'Tprev', repo: 'org/repo', pr_number: 9, status: 'COMPLETED', user_id: 'orig',
+      });
+      createTaskCoreMock.mockResolvedValueOnce({ statusCode: 200, body: JSON.stringify({}) });
+
+      await handler(followUp());
+
+      // Still dispatched exactly once; the 200 path returns quietly.
+      expect(createTaskCoreMock).toHaveBeenCalledTimes(1);
+    });
+
+    test('a non-thread mention is never treated as a follow-up', async () => {
+      linkUser();
+      createTaskCoreMock.mockResolvedValueOnce({
+        statusCode: 201, body: JSON.stringify({ data: { task_id: 'T1' } }),
+      });
+      // No is_thread_reply flag → resolver is not consulted.
+      await handler(mention({ text: 'submit org/repo fix the bug' }));
+      expect(resolveTaskBySlackThreadMock).not.toHaveBeenCalled();
     });
   });
 });
