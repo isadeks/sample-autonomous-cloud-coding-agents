@@ -66,6 +66,22 @@ export interface SlackIntegrationProps {
   /** The DynamoDB repo config table (optional — for repo onboarding checks). */
   readonly repoTable?: dynamodb.ITable;
 
+  /**
+   * The DynamoDB orchestration table (optional). Powers the ABCA-1016 Slack plan
+   * checkpoint: the pending-plan row lives here, and an approved plan seeds a
+   * multi-step orchestration (the same table the reconciler drives). Absent → the
+   * checkpoint is inert (no pending plans exist), degrading to the ABCA-1015
+   * follow-up behaviour.
+   */
+  readonly orchestrationTable?: dynamodb.ITable;
+
+  /**
+   * The DynamoDB per-user concurrency table (optional). When present, the Slack
+   * plan seed throttles the initial root release to the user's free budget, the
+   * same way the reconciler does.
+   */
+  readonly userConcurrencyTable?: dynamodb.ITable;
+
   /** Orchestrator Lambda function ARN for async task invocation. */
   readonly orchestratorFunctionArn?: string;
 
@@ -284,6 +300,14 @@ export class SlackIntegration extends Construct {
         SLACK_USER_MAPPING_TABLE_NAME: this.userMappingTable.tableName,
         SLACK_INSTALLATION_TABLE_NAME: this.installationTable.tableName,
         SLACK_CHANNEL_MAPPING_TABLE_NAME: this.channelMappingTable.tableName,
+        // ABCA-1016 plan checkpoint: the pending-plan store + approved-plan seed
+        // both live on the orchestration table. Absent → the checkpoint is inert.
+        ...(props.orchestrationTable && {
+          ORCHESTRATION_TABLE_NAME: props.orchestrationTable.tableName,
+        }),
+        ...(props.userConcurrencyTable && {
+          USER_CONCURRENCY_TABLE_NAME: props.userConcurrencyTable.tableName,
+        }),
       },
       // Screens inline file attachments via createTaskCore — pdf-parse must stay unbundled.
       bundling: attachmentScreeningBundling,
@@ -296,6 +320,16 @@ export class SlackIntegration extends Construct {
     props.taskEventsTable.grantReadWriteData(commandProcessorFn);
     if (props.repoTable) {
       props.repoTable.grantReadData(commandProcessorFn);
+    }
+    // ABCA-1016: the plan checkpoint reads/writes pending-plan rows and seeds an
+    // orchestration (child rows + meta) on approval — both on the orchestration
+    // table, so the processor needs read/write there.
+    if (props.orchestrationTable) {
+      props.orchestrationTable.grantReadWriteData(commandProcessorFn);
+    }
+    // The seed reads the user's free concurrency budget to throttle root release.
+    if (props.userConcurrencyTable) {
+      props.userConcurrencyTable.grantReadData(commandProcessorFn);
     }
     if (props.orchestratorFunctionArn) {
       commandProcessorFn.addToRolePolicy(new iam.PolicyStatement({

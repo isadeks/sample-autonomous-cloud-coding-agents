@@ -23,8 +23,16 @@ import { DynamoDBDocumentClient, GetCommand, PutCommand } from '@aws-sdk/lib-dyn
 import { buildIterationInstruction, type CommentTrigger } from './shared/comment-trigger';
 import { createTaskCore } from './shared/create-task-core';
 import { logger } from './shared/logger';
+import { makeSlackChannel, slackThreadRef } from './shared/orchestration-channel-slack';
 import { parseRetryIntent } from './shared/orchestration-comment-trigger';
 import { slackFetch } from './shared/slack-api';
+import { runSlackPlanReply, type SlackPlanEffects } from './shared/slack-plan-flow';
+import { seedSlackApprovedPlan } from './shared/slack-plan-seed';
+import {
+  consumeSlackPendingPlan,
+  getSlackPendingPlan,
+  putSlackPendingPlan,
+} from './shared/slack-plan-store';
 import { prNumberFromTask, resolveTaskBySlackThread } from './shared/slack-task-by-thread';
 import { getSlackSecret, SLACK_SECRET_PREFIX } from './shared/slack-verify';
 import type { Attachment } from './shared/types';
@@ -137,6 +145,26 @@ export async function handler(raw: RawEvent): Promise<void> {
     ? buildMentionReply(event)
     : (msg: string) => postToSlack(event.response_url, msg);
 
+  // ABCA-1016 plan checkpoint: a reply inside a thread that has a PENDING PLAN
+  // (a big request the bot broke into pieces and is waiting on) is a decision on
+  // that plan — approve / discard / change — NOT a PR-iteration follow-up and NOT
+  // fresh work. Tried FIRST so a pending plan's approval reply is never mistaken
+  // for a task follow-up. A miss (no pending plan on this thread) falls through.
+  if (event.source === 'mention' && event.is_thread_reply) {
+    try {
+      const handled = await handlePlanReply(event, reply);
+      if (handled) return;
+    } catch (err) {
+      logger.error('Slack plan-reply processing failed', {
+        error: err instanceof Error ? err.message : String(err),
+        team_id: event.team_id,
+        user_id: event.user_id,
+      });
+      await reply(':warning: Something went wrong handling your reply to the plan. Please try again.');
+      return;
+    }
+  }
+
   // ABCA-1015 follow-up: a reply (or re-mention) inside an existing task thread
   // steers/re-runs the work on the SAME PR rather than starting a new task.
   // Tried before the submit switch so a thread reply doesn't get parsed as a
@@ -228,6 +256,111 @@ function buildMentionReply(event: MentionEvent): ReplyFn {
     }
   };
 }
+
+// ─── Plan checkpoint (ABCA-1016) ───────────────────────────────────────────────
+
+const ORCHESTRATION_TABLE = process.env.ORCHESTRATION_TABLE_NAME;
+const USER_CONCURRENCY_TABLE = process.env.USER_CONCURRENCY_TABLE_NAME;
+/** Per-user max concurrent child tasks (release-throttle ceiling). Mirrors the
+ *  reconciler default; a numeric env override is honoured. */
+const MAX_CONCURRENT = Number(process.env.MAX_CONCURRENT_TASKS ?? '5');
+
+/**
+ * ABCA-1016 — a thread reply while a plan is PENDING is a decision on that plan.
+ *
+ * Resolves the thread's pending plan from the store; if none, returns false so the
+ * caller falls through to the ABCA-1015 PR-follow-up path. When a plan exists, the
+ * reply is understood via the SHARED verdict helpers (through
+ * {@link runSlackPlanReply} → classifySlackPlanReply) and acted on: approve seeds
+ * the multi-step orchestration through the Slack channel adapter, reject discards,
+ * a structural change re-renders the SAME panel in place, and anything else nudges.
+ *
+ * Returns true when the reply was handled as a plan decision (so the caller does
+ * NOT also treat it as a follow-up), false to fall through.
+ */
+async function handlePlanReply(event: MentionEvent, reply: ReplyFn): Promise<boolean> {
+  const threadTs = event.mention_thread_ts;
+  if (!threadTs) return false;
+  if (!ORCHESTRATION_TABLE) {
+    // Not wired for the checkpoint — behave as before (no pending plans exist).
+    return false;
+  }
+
+  const threadRef = slackThreadRef(event.channel_id, threadTs);
+  const pending = await getSlackPendingPlan(ddb, ORCHESTRATION_TABLE, threadRef);
+  if (!pending) return false; // No plan awaiting a decision — fall through.
+
+  const instruction = (event.follow_up_instruction ?? '').trim();
+
+  // Drive the plan panel via the Slack channel adapter: editPanel is chat.update
+  // on the panel message (matures the ONE message in place), postReply is a fresh
+  // threaded nudge. The issue "ref" is the thread; team_id keys the bot token.
+  const channel = makeSlackChannel();
+  const issueRef = { issueId: threadRef, credentialsRef: event.team_id };
+  const effects: SlackPlanEffects = {
+    editPanel: async (body, panelMessageTs) => {
+      const ref = await channel.upsertComment(
+        issueRef, body, panelMessageTs ? { commentId: panelMessageTs } : undefined,
+      );
+      return ref?.commentId ?? null;
+    },
+    postReply: async (body) => { await reply(body); },
+    replacePendingPlan: async (nodes, panelMessageTs) => {
+      await putSlackPendingPlan({
+        ddb,
+        tableName: ORCHESTRATION_TABLE,
+        threadRef,
+        teamId: event.team_id,
+        channelId: event.channel_id,
+        threadTs,
+        repo: pending.repo,
+        nodes,
+        platformUserId: pending.platform_user_id,
+        ...(panelMessageTs !== undefined && { panelMessageTs }),
+        now: new Date().toISOString(),
+        ttlEpochSeconds: Math.floor(Date.now() / 1000) + SLACK_PLAN_TTL_SECONDS,
+      });
+    },
+    consumePendingPlan: async () => {
+      const taken = await consumeSlackPendingPlan(ddb, ORCHESTRATION_TABLE, threadRef);
+      return taken ? { nodes: taken.nodes } : null;
+    },
+    seedApprovedPlan: async (nodes) => seedSlackApprovedPlan({
+      ddb,
+      orchestrationTable: ORCHESTRATION_TABLE,
+      ...(USER_CONCURRENCY_TABLE && { userConcurrencyTable: USER_CONCURRENCY_TABLE }),
+      maxConcurrent: MAX_CONCURRENT,
+      createTaskCore,
+      nodes,
+      repo: pending.repo,
+      platformUserId: pending.platform_user_id,
+      teamId: event.team_id,
+      channelId: event.channel_id,
+      threadTs,
+      channel,
+    }),
+  };
+
+  const result = await runSlackPlanReply({
+    instruction,
+    pending: { nodes: pending.nodes, ...(pending.panel_message_ts !== undefined && { panelMessageTs: pending.panel_message_ts }) },
+    effects,
+  });
+
+  // A pending plan existed, so the reply was ABOUT the plan regardless of the
+  // verdict — always handled here (never fall through to the PR-follow-up path).
+  logger.info('Slack plan reply handled', {
+    team_id: event.team_id, channel_id: event.channel_id, result_kind: result.kind,
+  });
+  if (result.kind === 'error') {
+    await reply(':warning: Something went wrong acting on the plan. Please try again.');
+  }
+  return true;
+}
+
+/** TTL for a pending Slack plan row: 7 days, matching the Linear pending-plan
+ *  window (PENDING_PLAN_TTL_SECONDS in the webhook/reconciler). */
+const SLACK_PLAN_TTL_SECONDS = 604_800;
 
 // ─── Follow-up (ABCA-1015) ─────────────────────────────────────────────────────
 
