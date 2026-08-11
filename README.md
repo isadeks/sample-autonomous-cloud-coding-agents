@@ -31,7 +31,7 @@
 
 ## The Use Case
 
-Users submit tasks through webhooks, CLI, Slack, Linear, Jira,... For each task, the orchestrator executes the blueprint: an isolated environment is provisioned, an agent clones the target GitHub repository, creates a branch, works on the task, and opens a pull request.
+Users submit tasks through webhooks, CLI, Slack, Linear, Jira,... For each task, the orchestrator executes the blueprint: an isolated environment is provisioned, an agent clones the target GitHub repository, creates a branch, works on the task, and opens a pull request. For example, adding the `abca` label to a Linear issue dispatches a coding task for that issue.
 
 Key characteristics:
 
