@@ -45,6 +45,17 @@ Operator commands (`platform`, `repo`, `github set-token`) use **operator AWS cr
 
 ## Commands
 
+### `bgagent version`
+
+Print the installed CLI version (read from `package.json`). Equivalent to the root `bgagent --version` flag, but available as an explicit subcommand with a `--output json` mode for scripting.
+
+```
+bgagent version \
+  --output <text|json>         Output format (default: text)
+```
+
+Text mode prints the bare version string (e.g. `0.0.0`); JSON mode prints `{ "version": "0.0.0" }`.
+
 ### `bgagent configure`
 
 Save API endpoint and Cognito settings to `~/.bgagent/config.json`.
