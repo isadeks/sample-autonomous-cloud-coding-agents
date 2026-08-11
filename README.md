@@ -1,6 +1,6 @@
 <div align="center">
   <h1>ABCA</h1>
-  <img alt="ABCA" width="350" src="docs/imgs/ABCA.png" />
+  <img alt="ABCA" width="350" src="docs/imgs/ABCA.jpg" />
 
   <br />
   <br />
