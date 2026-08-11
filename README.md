@@ -138,6 +138,8 @@ Install [mise](https://mise.jdx.dev/getting-started.html) if you want to use rep
 Follow the [Developer Guide](./docs/guides/DEVELOPER_GUIDE.md) to set up your environment and deploy the application to your AWS account.
 Then, follow the [User Guide](./docs/guides/USER_GUIDE.md) to learn how to use the system.
 
+> **Triggering tasks from Linear?** Before you label an issue, run through the intake checklist — [Trigger labels](./docs/guides/LINEAR_SETUP_GUIDE.md#trigger-labels) and [Usage](./docs/guides/LINEAR_SETUP_GUIDE.md#usage) in the Linear setup guide, plus the [Prompt guide](./docs/guides/PROMPT_GUIDE.md) for writing an issue the agent can act on unattended.
+
 ## Documentation
 
 A documentation site is available containing design documents and guides to deploy and use the platform. You can access it [here](https://aws-samples.github.io/sample-autonomous-cloud-coding-agents/).
