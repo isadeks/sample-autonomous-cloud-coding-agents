@@ -244,6 +244,54 @@ describe('classifyError', () => {
       expect(result!.retryable).toBe(false);
     });
 
+    test('ABCA-659 #2: build_ok=infra is a retryable COMPUTE fault, not "did not succeed"/build-failed', () => {
+      // A build killed by ENOSPC/OOM never verified the code — must read as a
+      // transient infra fault (retry / more capacity), NOT the generic
+      // agent-did-not-succeed or a bogus build failure. Ordered before the
+      // agent_status catch-all so it wins.
+      const result = classifyError(
+        "Task did not succeed (agent_status='success', build_ok=infra)",
+      );
+      expect(result!.category).toBe(ErrorCategory.COMPUTE);
+      expect(result!.title).toMatch(/ran out of resources/i);
+      expect(result!.retryable).toBe(true);
+      expect(result!.errorClass).toBe(ErrorClass.TRANSIENT);
+      expect(result!.remedy).toMatch(/try again|capacity|admin/i);
+    });
+
+    test('ABCA-815: deliverable=lost is a retryable AGENT fault (work not saved), not the generic did-not-succeed', () => {
+      // A new-work task reported agent-success but no commit reached the branch
+      // and no PR opened — the agent's changes were LOST (nested-clone workspace
+      // fault). Must read as retryable/transient with "not saved" copy, NOT the
+      // non-retryable "Agent task did not succeed". Ordered before the
+      // agent_status catch-all so it wins.
+      const result = classifyError(
+        'Task did not succeed (agent_status=success, deliverable=lost): the coding '
+        + 'task reported success but no commit reached the branch and no PR was opened '
+        + "— the agent's changes did not land in the task's repository.",
+      );
+      expect(result!.category).toBe(ErrorCategory.AGENT);
+      expect(result!.title).toMatch(/not saved/i);
+      expect(result!.retryable).toBe(true);
+      expect(result!.errorClass).toBe(ErrorClass.TRANSIENT);
+      expect(result!.remedy).toMatch(/try again/i);
+    });
+
+    test('ABCA-815 sibling: deliverable=no_pr says the work is SAFE on the branch (PR just did not open)', () => {
+      // A commit DID land but the PR never opened — recoverable, and the copy
+      // must reassure the change is not gone. Distinct from deliverable=lost.
+      const result = classifyError(
+        'Task did not succeed (agent_status=success, deliverable=no_pr): a commit '
+        + 'reached the branch but no PR was opened — the change is on the branch but '
+        + 'was not delivered.',
+      );
+      expect(result!.category).toBe(ErrorCategory.AGENT);
+      expect(result!.title).toMatch(/pull request did not open/i);
+      expect(result!.retryable).toBe(true);
+      expect(result!.errorClass).toBe(ErrorClass.TRANSIENT);
+      expect(result!.description).toMatch(/safe on the branch/i);
+    });
+
     test('classifies error_max_turns as TIMEOUT with specific title (ordered before generic catch-all)', () => {
       // Regression guard: pre-fix, the agent's specific
       // ``agent_status='error_max_turns'`` signal was swallowed by the
@@ -420,6 +468,7 @@ describe('classifyError', () => {
       expect(result!.title).toMatch(/didn't finish in time|timed out/i);
       // A timeout is user-actionable (retry / raise the cap), not a hard failure.
       expect(result!.retryable).toBe(true);
+      expect(result!.errorClass).toBe(ErrorClass.USER);
       // Must NOT fall through to the generic Unexpected error.
       expect(result!.title).not.toMatch(/Unexpected error/i);
     });

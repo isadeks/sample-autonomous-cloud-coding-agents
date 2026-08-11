@@ -169,6 +169,9 @@ const durableHandler: DurableExecutionHandler<OrchestrateTaskEvent, void> = asyn
         userId: task.user_id,
         payload,
         blueprintConfig,
+        // #299 ECS_RIGHTSIZED_PLANNING: a read-only workflow (decompose-v1 planning)
+        // runs on the smaller ECS planning task def. Ignored by AgentCore.
+        readOnly: workflowIsReadOnly(task.resolved_workflow?.id ?? 'coding/new-task-v1'),
       };
       // Transient-error AUTO-RETRY (once), extracted to startSessionWithRetry so
       // the four branches are unit-tested (#599 B2). The retry-event emit is

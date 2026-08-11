@@ -36,17 +36,20 @@ describe('AgentStack', () => {
     expect(template).toBeDefined();
   });
 
-  test('creates exactly 18 DynamoDB tables', () => {
+  test('creates exactly 21 DynamoDB tables', () => {
     // task, task-events, repo, user-concurrency, webhook, task-nudges,
     // task-approvals (Cedar HITL V2),
-    // api-key (platform API keys for headless webhook management, #376),
+    // api-key (platform API keys for headless webhook management, #376/#579),
     // slack-installation, slack-user-mapping,
+    // slack-channel-mapping (channel → default-repo onboarding),
     // linear-project-mapping, linear-user-mapping, linear-webhook-dedup,
     // linear-workspace-registry (added in Phase 2.0b for OAuth bookkeeping),
+    // github-webhook-dedup (added by GitHubScreenshotIntegration),
     // jira-project-mapping, jira-user-mapping, jira-workspace-registry,
-    // jira-webhook-dedup (added for the Jira Cloud integration),
-    // github-webhook-dedup (added by GitHubScreenshotIntegration on main)
-    template.resourceCountIs('AWS::DynamoDB::Table', 19);
+    // jira-webhook-dedup (added for the Jira Cloud integration on main),
+    // orchestration (added by #247 — parent/sub-issue DAG state).
+    // = 16 shared/base + 4 Jira + 1 orchestration = 21.
+    template.resourceCountIs('AWS::DynamoDB::Table', 21);
   });
 
   test('creates TaskApprovalsTable with user_id-status-index GSI', () => {
@@ -271,10 +274,25 @@ describe('AgentStack', () => {
     });
     const overridden = Template.fromStack(stack);
 
-    // Collect every bedrock:InvokeModel statement's Resource across IAM policies.
+    // Collect every bedrock:InvokeModel statement's Resource across the IAM
+    // policies the ``bedrockModels`` override GOVERNS: the runtime execution role
+    // and the per-task session role (the coding agent's task-model grants). The
+    // override replaces the model set for the WORKLOAD; these are its surfaces.
+    //
+    // Deliberately EXCLUDES the Linear webhook processor's policy: the #299
+    // deterministic-revise interpreter (linear-integration.ts) makes one tiny
+    // "which plan-edit did they mean?" classification call pinned to a FIXED
+    // model (DEFAULT_REVISE_MODEL_ID = sonnet), by design independent of the
+    // per-task ``bedrockModels`` override — you don't want a cheap classification
+    // running on whatever heavyweight coding model an operator selected. That
+    // grant is scoped to its single fixed model (asserted in the linear
+    // integration tests), so it's not a wildcard/drift risk; it just isn't part
+    // of the override contract this test checks.
+    const OVERRIDE_GOVERNED_POLICY_PREFIXES = ['RuntimeExecutionRole', 'AgentSessionRole'];
     const policies = overridden.findResources('AWS::IAM::Policy');
     const bedrockResources: unknown[] = [];
-    for (const p of Object.values(policies)) {
+    for (const [logicalId, p] of Object.entries(policies)) {
+      if (!OVERRIDE_GOVERNED_POLICY_PREFIXES.some((prefix) => logicalId.startsWith(prefix))) continue;
       for (const s of (p.Properties?.PolicyDocument?.Statement ?? []) as Array<{ Action?: string | string[]; Resource?: unknown }>) {
         const actions = Array.isArray(s.Action) ? s.Action : [s.Action];
         if (actions.some((a) => typeof a === 'string' && a.startsWith('bedrock:InvokeModel'))) {
@@ -523,9 +541,11 @@ describe('AgentStack with the ECS substrate gate (--context compute_type=ecs)', 
     template = Template.fromStack(stack);
   });
 
-  test('provisions an ECS cluster + Fargate task definition', () => {
+  test('provisions an ECS cluster + both Fargate task definitions (build + planning)', () => {
     template.resourceCountIs('AWS::ECS::Cluster', 1);
-    template.resourceCountIs('AWS::ECS::TaskDefinition', 1);
+    // #299 ECS_RIGHTSIZED_PLANNING: two task defs now — the 64 GB build def and
+    // the 8 GB read-only planning def (decompose-v1 runs on the smaller one).
+    template.resourceCountIs('AWS::ECS::TaskDefinition', 2);
   });
 
   test('outputs ComputeSubstrate=ecs so the CLI allows compute_type=ecs onboarding', () => {

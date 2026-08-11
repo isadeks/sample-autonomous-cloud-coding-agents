@@ -38,7 +38,7 @@
  */
 
 import { DynamoDBClient } from '@aws-sdk/client-dynamodb';
-import { DynamoDBDocumentClient, GetCommand, UpdateCommand } from '@aws-sdk/lib-dynamodb';
+import { DynamoDBDocumentClient, GetCommand, QueryCommand, UpdateCommand } from '@aws-sdk/lib-dynamodb';
 import type {
   DynamoDBBatchItemFailure,
   DynamoDBBatchResponse,
@@ -47,19 +47,23 @@ import type {
 } from 'aws-lambda';
 import { clearTokenCache, resolveGitHubToken } from './shared/context-hydration';
 import { classifyError } from './shared/error-classifier';
+import { renderFailureReply } from './shared/failure-reply';
 import { renderCommentBody, upsertTaskComment } from './shared/github-comment';
+import { renderMaturingReply } from './shared/iteration-reply';
 import {
   buildAdfDocument,
   postIssueCommentAdf,
   type AdfParagraph,
   type AdfTextRun,
 } from './shared/jira-feedback';
-import { postIssueComment } from './shared/linear-feedback';
+import { EMOJI_FAILURE, EMOJI_NEEDS_INPUT, EMOJI_SUCCESS, postIssueComment, swapCommentReaction, upsertThreadedReply } from './shared/linear-feedback';
 import { logger } from './shared/logger';
 import { coerceNumericOrNull } from './shared/numeric';
 import { loadRepoConfig } from './shared/repo-config';
+import { encodeMarkdownUrl } from './shared/screenshot-url';
 import type { ChannelConfig, TaskNotificationsConfig, TaskRecord } from './shared/types';
 import { dispatchSlackEvent, SlackApiError } from './slack-notify';
+import { TaskStatus } from '../constructs/task-status';
 
 // Re-export the shared types so existing test imports (and any future
 // caller that only imports from the handler module) continue to work.
@@ -163,20 +167,28 @@ export const CHANNEL_DEFAULTS: Record<NotificationChannel, ReadonlySet<string>> 
     ...TERMINAL_EVENT_TYPES,
     'pr_created',
   ]),
-  // Linear posts a single deterministic final-status comment on
-  // terminal events. The agent's three-comment prompt contract (start /
-  // PR-opened / completion) covers in-flight progress; this dispatcher
-  // only fires once the task reaches a terminal state, with cost /
-  // turns / duration / pr_url metrics the requester wouldn't otherwise
-  // see. Crucially, this fires even when the agent crashes (e.g.
-  // error_max_turns, OOM) before reaching its own step-3 completion
-  // comment — the GH issue #239 motivating example.
+  // Linear posts deterministic status comments on the platform tier
+  // (ADR-016: Linear is fully deterministic — the agent has no Linear MCP
+  // and posts nothing itself). Two events:
+  //   * ``pr_created`` — the first-run "🔗 PR opened" courtesy comment (or,
+  //     for a comment-iteration, matures the threaded reply to "🔄 Working").
+  //     This replaces the agent's old step-2 MCP save_comment.
+  //   * terminal — the final ✅/⚠️/❌ status with cost / turns / duration /
+  //     pr_url metrics. Fires even when the agent crashes (error_max_turns,
+  //     OOM) before any PR — the GH issue #239 motivating example.
   //
-  // Linear's `save_comment` doesn't support edit, so this is post-once
-  // (no live updates a la GitHub edit-in-place). Approvals / milestones
-  // are excluded for the same reason — N comments rather than 1.
+  // Linear's `save_comment` doesn't support edit, so each is post-once (no
+  // live updates a la GitHub edit-in-place), idempotent across partial-batch
+  // retries via per-event markers. The start "🤖 Starting" comment is posted
+  // even earlier, at task-admission in the webhook processor (ADR-016 P4.5).
   linear: new Set<string>([
     ...TERMINAL_EVENT_TYPES,
+    'pr_created',
+    // review should-fix: include task_timed_out so a Linear standalone iteration
+    // that TIMES OUT still settles (its 👀→✅/❌ + terminal reply come through the
+    // fanout plane). Without it a timed-out iteration's threaded reply matured to
+    // 🔄 and never resolved. Matches the Jira/Slack defaults, which already have it.
+    'task_timed_out',
   ]),
   // Jira posts a single deterministic final-status comment on terminal
   // events — the Jira analogue of the Linear default above (issue #573).
@@ -465,6 +477,37 @@ async function loadTaskForComment(taskId: string): Promise<TaskRecord | null> {
 }
 
 /**
+ * iteration-UX: strongly-consistent re-read of just the two screenshot fields,
+ * taken late (right before the terminal-settle renders) so it reflects the
+ * screenshot the deploy webhook persisted AFTER the early task load. ConsistentRead
+ * beats the read-after-write lag that let the comment-edit race clobber the
+ * preview (ABCA-438). Best-effort: returns nulls on any failure (caller falls
+ * back to the loaded task's values).
+ */
+async function reloadScreenshotFields(taskId: string): Promise<{ screenshotUrl: string | null; deployUrl: string | null }> {
+  const tableName = process.env.TASK_TABLE_NAME;
+  if (!tableName) return { screenshotUrl: null, deployUrl: null };
+  try {
+    const res = await ddb.send(new GetCommand({
+      TableName: tableName,
+      Key: { task_id: taskId },
+      ProjectionExpression: 'screenshot_url, screenshot_preview_url',
+      ConsistentRead: true,
+    }));
+    const item = res.Item as { screenshot_url?: string; screenshot_preview_url?: string } | undefined;
+    return {
+      screenshotUrl: typeof item?.screenshot_url === 'string' ? item.screenshot_url : null,
+      deployUrl: typeof item?.screenshot_preview_url === 'string' ? item.screenshot_preview_url : null,
+    };
+  } catch (err) {
+    logger.warn('[fanout/linear] screenshot re-read failed (non-fatal)', {
+      task_id: taskId, error: err instanceof Error ? err.message : String(err),
+    });
+    return { screenshotUrl: null, deployUrl: null };
+  }
+}
+
+/**
  * Persist the ``github_comment_id`` on the TaskRecord after a
  * successful POST (either the first-ever dispatch or a 404 re-POST
  * fallback). Subsequent PATCHes are no-ops on the TaskRecord because
@@ -534,17 +577,28 @@ async function saveCommentState(
 const CONDITIONAL_CHECK_FAILED = 'ConditionalCheckFailedException';
 
 /**
- * Shared post-once / dedup marker writer for channel dispatchers. Both the
- * GitHub comment-id persistence and the Linear post-once marker share the
- * same load-bearing invariant: a successful external post must NEVER turn
- * into a batch retry because the marker write failed (the retry IS the
- * duplicate the marker exists to prevent). So this helper never throws —
- * it classifies the failure instead:
+ * Shared post-once / dedup marker writer for channel dispatchers, called AFTER a
+ * successful external post to record that it happened so a later event/retry
+ * skips it. It does NOT gate the post (the post already occurred by the time this
+ * runs); it is best-effort dedup, not a claim.
  *
- *   - ConditionalCheckFailedException → benign INFO (TTL eviction, or a
- *     sibling invocation won the race; its post is the surviving one).
- *   - anything else → ERROR with the channel's ``error_id`` so operators
- *     can alarm on "next event/retry may duplicate" distinctly.
+ * Load-bearing invariant: a successful external post must NEVER turn into a batch
+ * retry because the marker write failed (the retry IS the duplicate the marker
+ * exists to prevent). So this helper never throws — it classifies the failure and
+ * returns:
+ *
+ *   - ConditionalCheckFailedException → benign INFO (TTL eviction, or a concurrent
+ *     invocation already wrote the marker — both posts may exist; cosmetic).
+ *   - anything else → ERROR with the channel's ``error_id`` so operators can alarm
+ *     on "marker unwritten → next event/retry may duplicate" distinctly.
+ *
+ * KNOWN GAP (review #7): because the marker is written after the post, two
+ * concurrent invocations — or a successful post whose marker write is throttled,
+ * then a sibling-channel partial-batch retry — can each post once. Closing this
+ * needs a claim-BEFORE-post protocol with release-on-retryable-failure (else a
+ * retryable post failure would strand the marker and DROP the comment); tracked
+ * as a fan-out-wide idempotency change, not done here. Impact: a rare duplicate
+ * courtesy/status comment, never a lost one.
  */
 async function saveDispatchMarker(opts: {
   readonly taskId: string;
@@ -600,6 +654,24 @@ async function saveLinearCommentState(taskId: string, eventId: string): Promise<
     values: { ':eid': eventId },
     channel: 'linear',
     errorId: 'FANOUT_LINEAR_PERSIST_FAILED',
+    logContext: { event_id: eventId },
+  });
+}
+
+/**
+ * Persist the post-once marker after a successful first-run Linear "PR opened"
+ * courtesy comment (ADR-016 P4.5). The pr_created analogue of
+ * ``saveLinearCommentState`` — a distinct attribute so the PR-opened and
+ * terminal comments are independently idempotent.
+ */
+async function saveLinearPrCommentState(taskId: string, eventId: string): Promise<void> {
+  await saveDispatchMarker({
+    taskId,
+    updateExpression: 'SET linear_pr_comment_event_id = :eid',
+    conditionExpression: 'attribute_exists(task_id) AND attribute_not_exists(linear_pr_comment_event_id)',
+    values: { ':eid': eventId },
+    channel: 'linear',
+    errorId: 'FANOUT_LINEAR_PR_PERSIST_FAILED',
     logContext: { event_id: eventId },
   });
 }
@@ -891,6 +963,16 @@ async function dispatchToEmail(event: FanOutEvent): Promise<void> {
 }
 
 /**
+ * Render the first-run "PR opened" courtesy comment (ADR-016 P4.5). Kept short
+ * — the 🔗 prefix is in the self-trigger guard's bot-comment markers so it never
+ * re-triggers ABCA, and the terminal comment carries the authoritative outcome.
+ */
+export function renderLinearPrOpenedComment(prUrl: string, prNumber: number | null): string {
+  const ref = prNumber != null ? `PR #${prNumber}` : 'a pull request';
+  return `🔗 Opened ${ref}: ${prUrl}`;
+}
+
+/**
  * Render the Linear final-status comment body. Inputs are already
  * coerced to native types by the caller; this function only formats.
  *
@@ -925,9 +1007,28 @@ export function renderLinearFinalStatusComment(args: {
   durationS: number | null;
   taskId: string;
   errorTitle: string | null;
+  /**
+   * Clarify-before-spend (UX #4): the agent judged the request too ambiguous to
+   * implement and asked a question instead of guessing — no PR, no charge for a
+   * guess. When true, render the answer text as a 💬 question rather than a ✅.
+   */
+  needsInput?: boolean;
+  /** The agent's clarifying question (surfaced verbatim when needsInput). */
+  answerText?: string | null;
 }): string {
   const isCompleted = args.eventType === 'task_completed';
   const shippedDespiteFailure = !isCompleted && args.prUrl != null;
+
+  // Clarify-and-hold: the deliverable is a question, so the whole comment is
+  // just that question under a 💬 header — no cost/turns subtitle (it reads like
+  // a person asking), no ❌ (nothing failed), no PR line (there isn't one).
+  if (args.needsInput) {
+    const question = (args.answerText ?? '').trim();
+    const lines = ['💬 **A quick question before I start**', ''];
+    lines.push(question || 'Could you share a bit more detail so I build the right thing?');
+    lines.push('', 'Reply with the details and I\'ll get going.', '', `_task ${args.taskId}_`);
+    return lines.join('\n');
+  }
 
   let header: string;
   if (isCompleted) {
@@ -1046,6 +1147,15 @@ async function dispatchToLinear(event: FanOutEvent): Promise<void> {
     return;
   }
 
+  // #299 agent-native planning: a coding/decompose-v1 task is a PLANNER, not a
+  // coding run — its user-facing surface is the reconciler's 🗂️ plan proposal,
+  // not a "✅ Task completed · cost · turns" comment. Suppress the fanout
+  // lifecycle comments for it entirely (live-caught on ABCA-510: a propose+revise
+  // cycle posted 3 ✅-completed comments that just cluttered the plan thread).
+  if (task.resolved_workflow?.id === 'coding/decompose-v1') {
+    return;
+  }
+
   const issueId = task.channel_metadata?.linear_issue_id;
   const workspaceId = task.channel_metadata?.linear_workspace_id;
   if (!issueId || !workspaceId) {
@@ -1056,6 +1166,73 @@ async function dispatchToLinear(event: FanOutEvent): Promise<void> {
       has_workspace_id: Boolean(workspaceId),
     });
     return;
+  }
+
+  // Iteration-UX: this task is a comment-iteration when it carries a maturing
+  // reply id (set at trigger time). For those, the progress + terminal status
+  // lives in that ONE edited reply, NOT in fresh top-level comments.
+  const iterationReplyId = task.channel_metadata?.iteration_reply_comment_id;
+  const triggerCommentId = task.channel_metadata?.trigger_comment_id;
+  const isIteration = Boolean(triggerCommentId);
+
+  // pr_created milestone:
+  //   * iteration → mature the threaded reply to "🔄 Working".
+  //   * first-run (non-iteration) → post the "🔗 PR opened" courtesy comment.
+  //     This replaces the agent's old step-2 `mcp__linear-server__save_comment`
+  //     (ADR-016 P4.5): the agent has no Linear MCP, so the platform posts it.
+  //     Post-once via `linear_pr_comment_event_id` so a pr_created redelivery
+  //     (or a sibling channel's infra-rejection re-run) doesn't duplicate it.
+  if (event.event_type === 'agent_milestone') {
+    if (isIteration && iterationReplyId && triggerCommentId) {
+      await upsertThreadedReply(
+        { linearWorkspaceId: workspaceId, registryTableName },
+        issueId,
+        triggerCommentId,
+        renderMaturingReply({
+          state: 'working',
+          ...(typeof task.pr_number === 'number' && { prNumber: task.pr_number }),
+        }),
+        iterationReplyId,
+      );
+      return;
+    }
+    // First-run PR-opened comment. Skip if we've already posted it, or if
+    // there's no PR URL yet (nothing to link).
+    if (task.linear_pr_comment_event_id || !task.pr_url) return;
+    const prBody = renderLinearPrOpenedComment(task.pr_url, task.pr_number ?? null);
+    const prResult = await postIssueComment(
+      { linearWorkspaceId: workspaceId, registryTableName },
+      issueId,
+      prBody,
+    );
+    if (prResult.ok) {
+      logger.info('[fanout/linear] PR-opened comment dispatched', {
+        event: 'fanout.linear.pr_comment_dispatched',
+        task_id: task.task_id,
+        issue_id: issueId,
+      });
+      await saveLinearPrCommentState(task.task_id, event.event_id);
+    } else {
+      logger.warn('[fanout/linear] PR-opened comment post failed', {
+        event: 'fanout.linear.pr_comment_failed',
+        error_id: 'FANOUT_LINEAR_PR_COMMENT_FAILED',
+        task_id: task.task_id,
+        issue_id: issueId,
+        retryable: prResult.retryable,
+      });
+      if (prResult.retryable) {
+        // Mirror the terminal path: escalate a TRANSIENT failure (500/429/network)
+        // to routeEvent's Promise.allSettled so the record enters batchItemFailures
+        // and Lambda retries. Safe because the post-once marker was NOT persisted —
+        // the retry re-posts, or short-circuits on the marker if a concurrent run
+        // won. Terminal failures (auth, bad issue id) stay log-only — a retry can't
+        // fix them and would burn the event-source's bounded retryAttempts.
+        throw new Error(
+          `[fanout/linear] transient Linear PR-opened post failure for task ${task.task_id} — escalating for batch retry`,
+        );
+      }
+    }
+    return; // milestones never post the terminal status comment
   }
 
   // Idempotency across partial-batch retries: Linear has no comment
@@ -1084,77 +1261,262 @@ async function dispatchToLinear(event: FanOutEvent): Promise<void> {
   // title rather than nothing. See error-classifier.ts.
   const classification = classifyError(task.error_message);
 
-  const body = renderLinearFinalStatusComment({
-    eventType: event.event_type,
-    prUrl: task.pr_url ?? null,
-    // DDB returns numeric attributes as strings at the Document-client
-    // boundary; coerce so toFixed/comparisons work. Same pattern the
-    // GitHub dispatcher uses.
-    costUsd: coerceNumericOrNull(
-      task.cost_usd,
-      { field: 'cost_usd', task_id: task.task_id, event_id: event.event_id },
-      logger,
-    ),
-    turns: coerceNumericOrNull(
-      task.turns_attempted,
-      { field: 'turns_attempted', task_id: task.task_id, event_id: event.event_id },
-      logger,
-    ),
-    maxTurns: coerceNumericOrNull(
-      task.max_turns,
-      { field: 'max_turns', task_id: task.task_id, event_id: event.event_id },
-      logger,
-    ),
-    durationS: coerceNumericOrNull(
-      task.duration_s,
-      { field: 'duration_s', task_id: task.task_id, event_id: event.event_id },
-      logger,
-    ),
-    taskId: task.task_id,
-    errorTitle: classification?.title ?? null,
-  });
-
-  const postResult = await postIssueComment(
-    { linearWorkspaceId: workspaceId, registryTableName },
-    issueId,
-    body,
-  );
-
-  // Split the success / failure path so post-failure can be alarmed
-  // distinctly. The underlying linear-feedback.ts path already WARNs
-  // on the specific failure reason (auth, network, etc.); this
-  // backstop ensures a steady drip of post-failures shows up in the
-  // dispatcher's own log channel for cross-channel alarms.
-  if (postResult.ok) {
-    logger.info('[fanout/linear] comment dispatched', {
-      event: 'fanout.linear.dispatched',
-      task_id: task.task_id,
-      issue_id: issueId,
-      event_type: event.event_type,
-      posted: true,
+  // Iteration-UX: an iteration's outcome + cost goes into the matured threaded
+  // reply (below), NOT a fresh top-level "Task completed" comment — that
+  // top-level comment is the clutter we're removing. Only the FIRST task (and
+  // any non-iteration Linear task) posts the headline top-level status comment.
+  if (!isIteration) {
+    const body = renderLinearFinalStatusComment({
+      eventType: event.event_type,
+      prUrl: task.pr_url ?? null,
+      // Clarify-before-spend (UX #4): a new_task run that HELD to ask a question
+      // carries code_changed===false + answer_text (the question) and made no PR.
+      // Surface it as a 💬 question, not a ✅ "Task completed" (which would read as
+      // "done" when nothing shipped). Only the no-PR + code_changed===false shape.
+      needsInput: task.code_changed === false && !task.pr_url,
+      answerText: typeof task.answer_text === 'string' ? task.answer_text : null,
+      // DDB returns numeric attributes as strings at the Document-client
+      // boundary; coerce so toFixed/comparisons work. Same pattern the
+      // GitHub dispatcher uses.
+      costUsd: coerceNumericOrNull(
+        task.cost_usd,
+        { field: 'cost_usd', task_id: task.task_id, event_id: event.event_id },
+        logger,
+      ),
+      turns: coerceNumericOrNull(
+        task.turns_attempted,
+        { field: 'turns_attempted', task_id: task.task_id, event_id: event.event_id },
+        logger,
+      ),
+      maxTurns: coerceNumericOrNull(
+        task.max_turns,
+        { field: 'max_turns', task_id: task.task_id, event_id: event.event_id },
+        logger,
+      ),
+      durationS: coerceNumericOrNull(
+        task.duration_s,
+        { field: 'duration_s', task_id: task.task_id, event_id: event.event_id },
+        logger,
+      ),
+      taskId: task.task_id,
+      errorTitle: classification?.title ?? null,
     });
-    await saveLinearCommentState(task.task_id, event.event_id);
-  } else {
-    logger.warn('[fanout/linear] postIssueComment failed — Linear API path failed', {
-      event: 'fanout.linear.post_failed',
-      error_id: 'FANOUT_LINEAR_POST_FAILED',
-      task_id: task.task_id,
-      issue_id: issueId,
-      event_type: event.event_type,
-      posted: false,
-      retryable: postResult.retryable,
-    });
-    if (postResult.retryable) {
+
+    const postResult = await postIssueComment(
+      { linearWorkspaceId: workspaceId, registryTableName },
+      issueId,
+      body,
+    );
+
+    // Split the success / failure path so post-failure can be alarmed
+    // distinctly. The underlying linear-feedback.ts path already WARNs
+    // on the specific failure reason (auth, network, etc.); this
+    // backstop ensures a steady drip of post-failures shows up in the
+    // dispatcher's own log channel for cross-channel alarms.
+    if (postResult.ok) {
+      logger.info('[fanout/linear] comment dispatched', {
+        event: 'fanout.linear.dispatched',
+        task_id: task.task_id,
+        issue_id: issueId,
+        event_type: event.event_type,
+        posted: true,
+      });
+      await saveLinearCommentState(task.task_id, event.event_id);
+    } else {
+      logger.warn('[fanout/linear] postIssueComment failed — Linear API path failed', {
+        event: 'fanout.linear.post_failed',
+        error_id: 'FANOUT_LINEAR_POST_FAILED',
+        task_id: task.task_id,
+        issue_id: issueId,
+        event_type: event.event_type,
+        posted: false,
+        retryable: postResult.retryable,
+      });
+      if (postResult.retryable) {
       // Escalate to routeEvent's Promise.allSettled so the record
       // enters batchItemFailures and Lambda retries. Safe because the
       // marker above was NOT persisted — the retry posts the missing
       // comment or, if a concurrent run won, short-circuits on the
       // marker. Terminal failures stay log-only: a retry cannot fix
       // them and would burn the event-source's bounded retryAttempts.
-      throw new Error(
-        `[fanout/linear] transient Linear post failure for task ${task.task_id} — escalating for batch retry`,
-      );
+        throw new Error(
+          `[fanout/linear] transient Linear post failure for task ${task.task_id} — escalating for batch retry`,
+        );
+      }
     }
+  } // end if (!isIteration) — top-level headline status comment
+
+  // #247 UX.3 + iteration-UX: a STANDALONE comment-triggered iteration (carries
+  // trigger_comment_id but NOT orchestration_iteration — those get the
+  // reconciler's reply) closes the human's @bgagent conversation by MATURING the
+  // threaded reply (👀→✅/💬 + cost + running total) it posted at trigger time.
+  // Orchestration iterations are settled by the reconciler instead (skipped here
+  // via the orchestration_iteration guard inside replyToStandaloneTrigger).
+  await replyToStandaloneTrigger(event, task, registryTableName, workspaceId, issueId);
+}
+
+/**
+ * #247 UX.3 — post the threaded ✅/❌ reply for a standalone comment-triggered
+ * iteration. Idempotent: claims the one reply by conditionally stamping
+ * ``ack_replied_at`` on the task record, so a redelivered terminal stream
+ * record never double-replies (mirrors the reconciler's orchestration-iteration
+ * ack). Best-effort — never throws into the dispatcher.
+ */
+async function replyToStandaloneTrigger(
+  event: FanOutEvent,
+  task: TaskRecord,
+  registryTableName: string,
+  workspaceId: string,
+  issueId: string,
+): Promise<void> {
+  const cm = task.channel_metadata;
+  const triggerCommentId = cm?.trigger_comment_id;
+  // Only standalone iterations: must have a trigger comment AND must NOT be an
+  // orchestration iteration (the reconciler owns that reply).
+  if (!triggerCommentId || cm?.orchestration_iteration === 'true') return;
+
+  const tableName = process.env.TASK_TABLE_NAME;
+  if (!tableName) return;
+
+  // Claim the single reply for this task (dedup redelivered terminal events).
+  try {
+    await ddb.send(new UpdateCommand({
+      TableName: tableName,
+      Key: { task_id: task.task_id },
+      UpdateExpression: 'SET ack_replied_at = :now',
+      ConditionExpression: 'attribute_not_exists(ack_replied_at)',
+      ExpressionAttributeValues: { ':now': event.timestamp },
+    }));
+  } catch (err) {
+    if ((err as { name?: string })?.name !== 'ConditionalCheckFailedException') {
+      logger.warn('[fanout/linear] UX.3 ack claim failed — skipping reply', {
+        task_id: task.task_id,
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
+    return; // lost the claim (replay) or errored → don't double-reply
+  }
+
+  // A clean success = completed AND the build/tests passed. A completed task
+  // whose build is red is NOT a clean ack — it gets the failure reply
+  // (consistent with the reconciler's success gate).
+  const completed = event.event_type === 'task_completed';
+  const succeeded = completed && task.build_passed !== false;
+  const prNumber = typeof task.pr_number === 'number'
+    ? task.pr_number
+    : (typeof task.pr_url === 'string' ? Number(task.pr_url.match(/\/pull\/(\d+)\b/)?.[1]) || null : null);
+
+  // Iteration-UX: cumulative cost across ALL iteration tasks on this PR/issue
+  // (incl. this one), so the reply shows a running total over many rounds.
+  const issueIdForCost = task.channel_metadata?.linear_issue_id ?? issueId;
+  const runningTotalUsd = await sumIterationCostForIssue(issueIdForCost, task);
+  const thisCost = coerceNumericOrNull(
+    task.cost_usd, { field: 'cost_usd', task_id: task.task_id, event_id: event.event_id }, logger,
+  );
+  const durationS = coerceNumericOrNull(
+    task.duration_s, { field: 'duration_s', task_id: task.task_id, event_id: event.event_id }, logger,
+  );
+  // iteration-UX: the screenshot webhook persists screenshot_url onto THIS task
+  // (the iteration task) durably, but it lands AFTER the deploy — well after the
+  // early loadTaskForComment() that produced ``task``. Re-read those two fields
+  // strongly-consistent right before rendering, so we render the preview from the
+  // freshest durable state instead of racing the (eventually-consistent) comment
+  // edit the webhook also makes (the ABCA-438 clobber). Falls back to the loaded
+  // task's values on read failure.
+  const shot = await reloadScreenshotFields(task.task_id);
+  const screenshotUrl = shot.screenshotUrl ?? (typeof task.screenshot_url === 'string' ? task.screenshot_url : null);
+  const deployUrl = shot.deployUrl ?? (typeof task.screenshot_preview_url === 'string' ? task.screenshot_preview_url : null);
+
+  // Build the maturing-reply terminal state. A6/#299: code_changed===false (a
+  // question) → 💬 answered; else ✅ updated. A failure → ❌ with the sanitized
+  // reason. Cost / running total / screenshot fold into the one reply.
+  let state: 'updated' | 'answered' | 'failed';
+  if (!succeeded) state = 'failed';
+  else if (task.code_changed === false) state = 'answered';
+  else state = 'updated';
+
+  const body = state === 'failed'
+    ? renderFailureReply({
+      status: completed ? TaskStatus.COMPLETED : TaskStatus.FAILED,
+      buildPassed: typeof task.build_passed === 'boolean' ? task.build_passed : null,
+      ...(typeof task.error_message === 'string' && { errorMessage: task.error_message }),
+      taskId: task.task_id,
+    })
+    : renderMaturingReply({
+      state,
+      prNumber,
+      ...(typeof task.pr_url === 'string' && { prUrl: task.pr_url }),
+      ...(typeof task.answer_text === 'string' && { answerText: task.answer_text }),
+      costUsd: thisCost,
+      durationS,
+      runningTotalUsd,
+      // Only fold the preview thumbnail in on a real edit (a question didn't
+      // change the UI). The screenshot links to the live deploy when known.
+      ...(state === 'updated' && screenshotUrl ? { screenshotUrl } : {}),
+      ...(state === 'updated' && screenshotUrl && deployUrl ? { deployUrl: encodeMarkdownUrl(deployUrl) } : {}),
+    });
+
+  // Iteration-UX: EDIT the maturing reply posted at trigger time (👀 On it →
+  // terminal) rather than posting a fresh comment. Falls back to a new threaded
+  // reply when the ack-reply id wasn't captured (best-effort at trigger).
+  const replyCtx = { linearWorkspaceId: workspaceId, registryTableName };
+  const existingReplyId = task.channel_metadata?.iteration_reply_comment_id;
+  // preservePreview: this terminal-settle and the screenshot webhook's preview
+  // append race on this one reply (live-caught ABCA-434). Carry an already-landed
+  // `[preview]` link onto the freshly-rendered terminal body so they converge.
+  await upsertThreadedReply(replyCtx, issueId, triggerCommentId, body, existingReplyId, { preservePreview: true });
+
+  // Swap the TRIGGER comment's 👀 → ✅ / 💬 / ❌ so the human's comment reads
+  // "done" at a glance, not just the threaded reply. The orchestration path does
+  // this in the reconciler (UX.21); the standalone path was missing it, leaving a
+  // stale 👀 on every plain-issue iteration forever. Best-effort + idempotent
+  // (the ack_replied_at claim above gates this to once; the swap re-converges).
+  const reaction = state === 'failed' ? EMOJI_FAILURE : (state === 'answered' ? EMOJI_NEEDS_INPUT : EMOJI_SUCCESS);
+  await swapCommentReaction(replyCtx, triggerCommentId, reaction);
+}
+
+/**
+ * Iteration-UX: sum ``cost_usd`` across ALL Linear-iteration tasks on one issue
+ * (the running total shown on the reply). The LinearIssueIndex GSI lists every
+ * task_id for the issue (its projection deliberately does NOT include cost_usd —
+ * a GSI projection can't be changed in place, see task-table.ts), so we GetItem
+ * each task's cost from the base table. Iteration counts per issue are small, so
+ * the per-task reads are bounded. ``current``'s own cost is added explicitly in
+ * case the index hasn't caught up (deduped by task_id). Best-effort: on any read
+ * failure returns just this task's cost (never throws).
+ */
+async function sumIterationCostForIssue(issueId: string, current: TaskRecord): Promise<number | null> {
+  const tableName = process.env.TASK_TABLE_NAME;
+  const currentCost = coerceNumericOrNull(current.cost_usd, { field: 'cost_usd', task_id: current.task_id }, logger) ?? 0;
+  if (!tableName || !issueId) return currentCost || null;
+  try {
+    const listed = await ddb.send(new QueryCommand({
+      TableName: tableName,
+      IndexName: 'LinearIssueIndex',
+      KeyConditionExpression: 'linear_issue_id = :iid',
+      ProjectionExpression: 'task_id',
+      ExpressionAttributeValues: { ':iid': issueId },
+    }));
+    const taskIds = ((listed.Items ?? []) as { task_id?: string }[])
+      .map((i) => i.task_id)
+      .filter((t): t is string => typeof t === 'string');
+    let total = 0;
+    let sawCurrent = false;
+    for (const taskId of taskIds) {
+      if (taskId === current.task_id) { sawCurrent = true; total += currentCost; continue; }
+      const got = await ddb.send(new GetCommand({
+        TableName: tableName, Key: { task_id: taskId }, ProjectionExpression: 'cost_usd',
+      }));
+      const c = coerceNumericOrNull(got.Item?.cost_usd, { field: 'cost_usd', task_id: taskId }, logger);
+      if (typeof c === 'number') total += c;
+    }
+    if (!sawCurrent) total += currentCost; // index lag — add this task explicitly
+    return total > 0 ? total : null;
+  } catch (err) {
+    logger.warn('[fanout/linear] running-total cost query failed — using this task only', {
+      task_id: current.task_id, error: err instanceof Error ? err.message : String(err),
+    });
+    return currentCost || null;
   }
 }
 

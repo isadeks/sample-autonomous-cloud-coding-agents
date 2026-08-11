@@ -7,7 +7,7 @@ operations are no-ops.
 
 import os
 import time
-from typing import Any, TypedDict
+from typing import TypedDict
 
 from shell import log, log_error_cw
 
@@ -246,7 +246,9 @@ def write_terminal(task_id: str, status: str, result: dict | None = None) -> Non
             return
         now = _now_iso()
         expr_names = {"#s": "status"}
-        expr_values: dict[str, Any] = {
+        # Mixed value types: most are strings, but build_passed/lint_passed are
+        # persisted as native booleans (the reconciler reads them via .BOOL).
+        expr_values: dict[str, object] = {
             ":s": status,
             ":t": now,
             ":sca": f"{status}#{now}",
@@ -294,16 +296,37 @@ def write_terminal(task_id: str, status: str, result: dict | None = None) -> Non
             if result.get("memory_written") is not None:
                 update_parts.append("memory_written = :mw")
                 expr_values[":mw"] = result["memory_written"]
-            # Verification verdict (#515 replay bundle). build_passed/lint_passed
-            # were historically dropped here (present on TaskResult but never
-            # written), so TaskDetail.build_passed was always null. Persist both
-            # so the replay bundle carries a structured verification signal.
+            # Persist the post-hook verify outcomes so they're observable on the
+            # task record (orchestration reconciler / dashboards / #515 replay
+            # bundle), not just consumed in-process by the gate. build_passed/
+            # lint_passed were historically dropped here (present on TaskResult but
+            # never written) — persist both so a consumer sees WHY a task passed/
+            # failed verification, as a structured signal.
             if result.get("build_passed") is not None:
                 update_parts.append("build_passed = :bp")
                 expr_values[":bp"] = bool(result["build_passed"])
             if result.get("lint_passed") is not None:
                 update_parts.append("lint_passed = :lp")
                 expr_values[":lp"] = bool(result["lint_passed"])
+            # A6/#299: whether a PR-iteration advanced the branch HEAD (a real
+            # commit landed) vs. ran with no change (a question-only comment).
+            # The Linear/Slack settle reply reads this to avoid a false
+            # "✅ Updated" on a no-op iteration. None ⇒ not persisted (the
+            # consumer defaults to the change-made side, back-compat).
+            if result.get("code_changed") is not None:
+                update_parts.append("code_changed = :cc")
+                expr_values[":cc"] = bool(result["code_changed"])
+            # The pushed HEAD sha — lets the screenshot webhook match a deploy's
+            # commit to the iteration task that pushed it (correct preview-reply
+            # attribution when two iterations overlap on one PR). Skip empties.
+            if result.get("head_sha"):
+                update_parts.append("head_sha = :hsha")
+                expr_values[":hsha"] = str(result["head_sha"])
+            if result.get("answer_text"):
+                update_parts.append("answer_text = :ans")
+                # Bound the persisted answer so a verbose agent can't bloat the
+                # row; the reply renderer truncates again for display.
+                expr_values[":ans"] = str(result["answer_text"])[:2000]
             # OTEL trace id (#515) for cross-plane correlation. Absent on tasks
             # that predate this field and when tracing is unavailable.
             if result.get("otel_trace_id"):

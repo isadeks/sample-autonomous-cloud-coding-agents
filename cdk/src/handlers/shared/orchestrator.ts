@@ -268,6 +268,17 @@ export async function loadBlueprintConfig(task: TaskRecord): Promise<BlueprintCo
     }
   }
 
+  // Compute substrate is a per-repo property (``compute_type``, default
+  // ``agentcore``). It applies to ALL workflows on the repo — including a
+  // read-only decompose/planning or pr-review task, because that task CLONES and
+  // READS the same repository the coding agent does, so its context/memory
+  // footprint is the same: a repo big enough to need the context-gated 64GB ECS
+  // tier for building is also big enough to OOM the fixed AgentCore microVM just
+  // reading it. So planning must run on the same substrate as the agent — do NOT
+  // special-case read-only workflows to agentcore. (An ecs-configured repo on a
+  // stack that hasn't wired the ECS substrate fails at session start; that's a
+  // stack-config gap surfaced by the honest "couldn't plan, nothing run — re-apply
+  // or run as single" note, not something to paper over by mis-routing compute.)
   return {
     compute_type: repoConfig?.compute_type ?? 'agentcore',
     runtime_arn: repoConfig?.runtime_arn ?? RUNTIME_ARN,
@@ -277,6 +288,8 @@ export async function loadBlueprintConfig(task: TaskRecord): Promise<BlueprintCo
     system_prompt_overrides: repoConfig?.system_prompt_overrides,
     github_token_secret_arn: repoConfig?.github_token_secret_arn ?? process.env.GITHUB_TOKEN_SECRET_ARN,
     poll_interval_ms: pollIntervalMs,
+    build_command: repoConfig?.build_command,
+    lint_command: repoConfig?.lint_command,
     cedar_policies: repoConfig?.cedar_policies,
     approval_gate_cap: repoConfig?.approval_gate_cap,
   };
@@ -539,6 +552,15 @@ export async function hydrateAndTransition(task: TaskRecord, blueprintConfig?: B
     resolved_workflow: task.resolved_workflow ?? { id: 'coding/new-task-v1', version: '1.0.0' },
     ...(task.pr_number !== undefined && { pr_number: task.pr_number }),
     ...(hydratedContext.resolved_base_branch && { base_branch: hydratedContext.resolved_base_branch }),
+    // #247 A4: orchestration children carry their stacked base branch +
+    // (diamond case) predecessor branches to merge in, via channel_metadata.
+    // The PR-task ``resolved_base_branch`` path above wins if both are set
+    // (a task is never both a PR-iteration and an orchestration child).
+    ...(!hydratedContext.resolved_base_branch
+      && task.channel_metadata?.orchestration_base_branch
+      && { base_branch: task.channel_metadata.orchestration_base_branch }),
+    ...(task.channel_metadata?.orchestration_merge_branches
+      && { merge_branches: parseMergeBranches(task.channel_metadata.orchestration_merge_branches) }),
     ...(task.task_description && { prompt: task.task_description }),
     max_turns: task.max_turns ?? blueprintConfig?.max_turns ?? DEFAULT_MAX_TURNS,
     ...(effectiveBudget !== undefined && { max_budget_usd: effectiveBudget }),
@@ -548,6 +570,11 @@ export async function hydrateAndTransition(task: TaskRecord, blueprintConfig?: B
     ...(task.trace === true && { trace: true }),
     ...(blueprintConfig?.model_id && { model_id: blueprintConfig.model_id }),
     ...(blueprintConfig?.system_prompt_overrides && { system_prompt_overrides: blueprintConfig.system_prompt_overrides }),
+    // #1: per-repo build/lint verification commands. Absent → agent defaults
+    // to ``mise run build`` / ``mise run lint``. Set for non-mise repos so
+    // build-regression gating actually runs the repo's real command.
+    ...(blueprintConfig?.build_command && { build_command: blueprintConfig.build_command }),
+    ...(blueprintConfig?.lint_command && { lint_command: blueprintConfig.lint_command }),
     ...(blueprintConfig?.cedar_policies && blueprintConfig.cedar_policies.length > 0 && { cedar_policies: blueprintConfig.cedar_policies }),
     // Cedar HITL: the agent's PreToolUse hook uses this to compute
     // the maxLifetime ceiling on per-gate approval timeouts (§6.5).
@@ -924,4 +951,26 @@ async function decrementConcurrency(userId: string): Promise<void> {
       logger.warn('Failed to decrement concurrency counter', { user_id: userId, error: err instanceof Error ? err.message : String(err) });
     }
   }
+}
+
+/**
+ * Parse the JSON-encoded predecessor merge-branch list that the
+ * orchestration release path stashes in
+ * ``channel_metadata.orchestration_merge_branches`` (#247 A4, diamond
+ * case). Best-effort: a malformed value yields an empty list rather than
+ * failing the orchestration — the child still branches off its base, it
+ * just won't have the predecessor code merged in (surfaced as a normal
+ * build failure if it actually needed it, never a silent crash here).
+ */
+function parseMergeBranches(raw: string): string[] {
+  try {
+    const parsed = JSON.parse(raw) as unknown;
+    if (Array.isArray(parsed) && parsed.every((b) => typeof b === 'string')) {
+      return parsed as string[];
+    }
+  } catch {
+    // fall through
+  }
+  logger.warn('Ignoring malformed orchestration_merge_branches', { raw });
+  return [];
 }

@@ -22,7 +22,10 @@
 // `extractLinearIdentifier` since it's a pure function and the g-flag
 // regex's `lastIndex` reset behavior is easy to regress across releases.
 
-import { extractLinearIdentifier } from '../../../src/handlers/shared/linear-issue-lookup';
+import {
+  extractLinearIdentifier,
+  extractLinearIdentifierFromBranch,
+} from '../../../src/handlers/shared/linear-issue-lookup';
 
 describe('extractLinearIdentifier', () => {
   test('returns null for null / undefined / empty input', () => {
@@ -76,5 +79,33 @@ describe('extractLinearIdentifier', () => {
     expect(extractLinearIdentifier('third PLAT-9 ABCA-1')).toBe('PLAT-9');
     expect(extractLinearIdentifier(null)).toBeNull();
     expect(extractLinearIdentifier('fourth ABCA-1')).toBe('ABCA-1');
+  });
+});
+
+describe('extractLinearIdentifierFromBranch', () => {
+  test('pulls the canonical identifier from an ABCA task branch (lowercased slug)', () => {
+    // bgagent/{taskId}/{slug} where slug = slugify("ABCA-151: Add lisbon-guide.html")
+    expect(
+      extractLinearIdentifierFromBranch('bgagent/01KTSK8XGXHRMT0JX44GYRPJG7/abca-151-add-lisbon-guidehtml'),
+    ).toBe('ABCA-151');
+  });
+
+  test('the ULID task-id segment does not false-match before the identifier', () => {
+    // The ULID has no dash, so it cannot produce a <KEY>-<n> match; the
+    // first real match is the issue identifier in the slug.
+    expect(
+      extractLinearIdentifierFromBranch('bgagent/01KTSKET9040HDJP3P2QE15DXC/abca-152-link-lisbon-from-destinationsht'),
+    ).toBe('ABCA-152');
+  });
+
+  test('returns null for a branch with no identifier', () => {
+    expect(extractLinearIdentifierFromBranch('bgagent/01TASK/task')).toBeNull();
+    expect(extractLinearIdentifierFromBranch('feature/some-thing')).toBeNull();
+  });
+
+  test('returns null on null/undefined/empty', () => {
+    expect(extractLinearIdentifierFromBranch(null)).toBeNull();
+    expect(extractLinearIdentifierFromBranch(undefined)).toBeNull();
+    expect(extractLinearIdentifierFromBranch('')).toBeNull();
   });
 });

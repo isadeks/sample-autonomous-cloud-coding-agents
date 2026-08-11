@@ -153,7 +153,7 @@ class TaskConfig(BaseModel):
     task_description: str = ""
     github_token: str = ""
     aws_region: str
-    anthropic_model: str = "us.anthropic.claude-sonnet-4-6"
+    anthropic_model: str = "us.anthropic.claude-opus-4-8"
     # The "small/fast" model Claude Code uses for auxiliary work (e.g. WebFetch
     # page summarization). Must be a cross-region INFERENCE-PROFILE id (``us.``
     # prefix), not a bare foundation-model id — Claude 4.x cannot be invoked
@@ -163,6 +163,13 @@ class TaskConfig(BaseModel):
     max_turns: int = 10
     max_budget_usd: float | None = None
     system_prompt_overrides: str = ""
+    # Per-repo build/lint verification commands (#1 build-gate fix). When set
+    # (from the blueprint, via the payload), the agent runs these instead of
+    # the hardcoded ``mise run build`` / ``mise run lint`` to gate build/lint
+    # regressions. Empty → default to mise. Set for non-mise repos (e.g.
+    # ``npm run build``) so gating actually runs the repo's real command.
+    build_command: str = ""
+    lint_command: str = ""
     # The pinned workflow this task runs ({"id", "version"}), resolved at the
     # create-task boundary and threaded through the payload (#248). None on
     # local/batch runs, where the pipeline defaults to coding/new-task-v1.
@@ -242,6 +249,11 @@ class TaskConfig(BaseModel):
     approval_gate_cap: int | None = None
     issue: GitHubIssue | None = None
     base_branch: str | None = None
+    # #247 A4: predecessor branches to merge into this child's branch
+    # before work, for a diamond child (2+ predecessors) that branches off
+    # main but must see all predecessors' code. Empty for root + linear
+    # children (linear children stack via ``base_branch`` instead).
+    merge_branches: list[str] = Field(default_factory=list)
     # Attachments from the orchestrator payload (Phase 3). Validated as
     # AttachmentConfig models. Empty list for tasks without attachments.
     attachments: list[AttachmentConfig] = Field(default_factory=list)
@@ -299,6 +311,30 @@ class RepoSetup(BaseModel):
     build_before: bool = True
     lint_before: bool = True
     default_branch: str = "main"
+    # #1: True when the build verification command is INERT — it could not run
+    # at all (no build task / command not found) AND no explicit build_command
+    # was configured. In that state build-regression gating is effectively OFF
+    # (a change that breaks the build still reports success), so the agent
+    # surfaces a one-time warning on the PR. Distinct from a genuinely red build
+    # (command ran, exited non-zero), which IS meaningful gating signal.
+    build_gate_inert: bool = False
+    # #72: same notion for lint. True when the lint verification command is INERT
+    # — could not run at all (no lint task / command not found) AND no explicit
+    # lint_command was configured. In that state lint verification is meaningless
+    # (the default ``mise run lint`` fails for "no such task", not a real lint
+    # error), so lint_passed is treated as inert rather than a genuine FAIL.
+    # Mirrors build_gate_inert. Lint never gates the task verdict regardless
+    # (only a workflow declaring a gating verify_lint step opts in), so this
+    # affects reporting + the persisted lint_passed signal, not pass/fail gating.
+    lint_gate_inert: bool = False
+    # A6/#299: the branch HEAD sha captured right after checkout, BEFORE the
+    # agent runs. On a PR-iteration the post-hooks compare the final HEAD to
+    # this to decide whether the iteration actually committed anything — a
+    # question-only comment ("where is the login page?") makes no commit, and
+    # the platform must report "answered / no change" rather than a misleading
+    # "✅ Updated — PR #N". Empty when the sha couldn't be read (treated as
+    # "unknown" → defaults to the change-made path, the safe-for-back-compat side).
+    head_sha_before: str = ""
 
 
 class TokenUsage(BaseModel):
@@ -325,6 +361,13 @@ class AgentResult(BaseModel):
     # uploads/posts (#248 Phase 3). Empty for coding tasks (their product is the
     # PR, not the text).
     result_text: str = ""
+    # Clarify-before-spend (UX #4): the question text captured when the agent
+    # called the ``request_clarification`` tool instead of doing the work. A
+    # non-empty value is the deterministic hold-and-ask signal — the pipeline
+    # skips build/PR and surfaces this question to the requester (no charge for a
+    # guess). Empty when the agent proceeded normally. Preferred over the older
+    # NEEDS_INPUT_MARKER text sentinel (a tool call can't be mis-reproduced).
+    clarification_question: str = ""
 
 
 class TaskResult(BaseModel):
@@ -375,6 +418,24 @@ class TaskResult(BaseModel):
     # Phase 3), or ``None`` for coding tasks / when no artifact was delivered.
     # Surfaced on TaskDetail so the user can retrieve the knowledge-task output.
     artifact_uri: str | None = None
+    # A6/#299: True when this run advanced the PR branch HEAD (a real commit
+    # landed), False when it ran but the branch is unchanged (a question-only
+    # iteration), None when not a PR-iteration / unknown (no baseline sha). The
+    # Linear/Slack settle reply reads this: False → "💬 answered, no change",
+    # True/None → the existing "✅ Updated — PR #N". None defaults to the
+    # change-made side for back-compat with pre-fix tasks.
+    code_changed: bool | None = None
+    # The agent's final answer text, surfaced verbatim on a no-change iteration
+    # reply so a question gets an actual answer (not an empty "✅ Updated").
+    # Distinct from result_text's repo-less-artifact role; populated only for
+    # the no-op-iteration reply path. Empty otherwise.
+    answer_text: str = ""
+    # The branch HEAD sha AFTER this run pushed (PR workflows). The screenshot
+    # webhook matches a deploy's commit sha → the iteration task that pushed it,
+    # so the preview thumbnail lands on the RIGHT iteration's reply when two
+    # iterations on one PR overlap (else "newest task" mis-attributes it). Empty
+    # when unknown (rev-parse failed / non-PR run) → webhook falls back to newest.
+    head_sha: str = ""
     # OTEL trace id (32-char hex) of the task's root span, captured at terminal
     # write so the replay bundle (#515) can correlate the task to its
     # CloudWatch/X-Ray trace. ``None`` when tracing is unavailable (local/dev).

@@ -68,6 +68,15 @@ export interface GitHubScreenshotIntegrationProps {
   readonly linearWorkspaceRegistryTable?: dynamodb.ITable;
 
   /**
+   * Optional — when provided, the processor persists the captured
+   * screenshot's public URL onto the deploy task's TaskRecord (keyed by the
+   * taskId in the deploy branch), so the #247 orchestration reconciler can
+   * embed the integration node's combined preview in the parent epic panel.
+   * Unset → persistence is skipped (the PR + Linear comments still post).
+   */
+  readonly taskTable?: dynamodb.ITable;
+
+  /**
    * Removal policy for the dedup table + screenshot bucket. Defaults
    * to DESTROY so dev stacks don't accumulate orphans on `cdk destroy`.
    */
@@ -192,6 +201,9 @@ export class GitHubScreenshotIntegration extends Construct {
         ...(props.linearWorkspaceRegistryTable && {
           LINEAR_WORKSPACE_REGISTRY_TABLE_NAME: props.linearWorkspaceRegistryTable.tableName,
         }),
+        ...(props.taskTable && {
+          TASK_TABLE_NAME: props.taskTable.tableName,
+        }),
       },
       bundling: commonBundling,
     });
@@ -242,6 +254,49 @@ export class GitHubScreenshotIntegration extends Construct {
             resource: 'secret',
             arnFormat: ArnFormat.COLON_RESOURCE_NAME,
             resourceName: 'bgagent-linear-oauth-*',
+          }),
+        ],
+      }));
+    }
+
+    // #247: write access so the processor can persist screenshot_url onto the
+    // deploy task's TaskRecord (conditional UpdateItem). grantWriteData covers
+    // the UpdateItem; the handler's update is guarded by attribute_exists.
+    if (props.taskTable) {
+      props.taskTable.grantWriteData(this.webhookProcessorFn);
+      // iteration-UX: on an iteration re-deploy the processor resolves the
+      // issue's most-recent maturing-reply id via a Query on LinearIssueIndex
+      // (to append the `· [preview]` link to that reply). grantWriteData does
+      // NOT include dynamodb:Query nor the index ARN, so grant it narrowly —
+      // Query on just that one GSI, not blanket grantReadData on the table.
+      //
+      // findIterationReplyId then GetItems each candidate's `head_sha` on the
+      // BASE table to attribute the deploy to the right iteration under
+      // overlapping iterations (ABCA-438). That GetItem read needs
+      // dynamodb:GetItem on the base-table ARN — the Query GSI grant does NOT
+      // cover it. Without this, the GetItem throws AccessDenied, is swallowed
+      // non-fatally, and the preview is captured + posted to the PR but never
+      // appended to the Linear iteration reply (live-caught on DEM-33 / PR #339,
+      // 2026-06-30 — the head_sha refinement outran its IAM grant).
+      this.webhookProcessorFn.addToRolePolicy(new iam.PolicyStatement({
+        actions: ['dynamodb:Query'],
+        resources: [
+          Stack.of(this).formatArn({
+            service: 'dynamodb',
+            resource: 'table',
+            resourceName: `${props.taskTable.tableName}/index/LinearIssueIndex`,
+            arnFormat: ArnFormat.SLASH_RESOURCE_NAME,
+          }),
+        ],
+      }));
+      this.webhookProcessorFn.addToRolePolicy(new iam.PolicyStatement({
+        actions: ['dynamodb:GetItem'],
+        resources: [
+          Stack.of(this).formatArn({
+            service: 'dynamodb',
+            resource: 'table',
+            resourceName: props.taskTable.tableName,
+            arnFormat: ArnFormat.SLASH_RESOURCE_NAME,
           }),
         ],
       }));
