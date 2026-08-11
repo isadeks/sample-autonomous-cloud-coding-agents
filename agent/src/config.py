@@ -8,6 +8,7 @@ from datetime import UTC
 from models import AttachmentConfig, TaskConfig
 from shell import log
 
+# Root directory where the agent checks out and operates on the task repository.
 AGENT_WORKSPACE = os.environ.get("AGENT_WORKSPACE", "/workspace")
 
 # The platform default workflow id used when a payload omits resolved_workflow
