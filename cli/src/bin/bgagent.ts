@@ -54,7 +54,7 @@ const program = new Command();
 program
   .name('bgagent')
   .description('Background Agent CLI — submit and manage coding tasks')
-  .version('0.0.0')
+  .version('0.0.0') // Prints the bgagent CLI version string for `bgagent --version`/`-V`
   .option('--verbose', 'Enable debug output')
   .hook('preAction', (_thisCommand, actionCommand) => {
     // Resolve --verbose from the root program, not the subcommand
