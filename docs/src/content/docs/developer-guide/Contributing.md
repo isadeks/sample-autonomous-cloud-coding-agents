@@ -34,6 +34,8 @@ Guidelines:
 - For significant features, add a design document to `docs/design/`.
 - For cross-cutting or hard-to-reverse decisions, add an ADR to `docs/decisions/` (see [ADR README](/sample-autonomous-cloud-coding-agents/architecture/readme)).
 
+Before opening a pull request, run `mise run build` to verify your change. This runs the full build across every package, including the agent's Python tests (`mise //agent:quality`), so agent tests execute as part of the same command. CI runs the same `mise run build`, so a green local build is the fastest way to catch failures early.
+
 ### 4. Commit
 
 Commit messages must follow [Conventional Commits](https://www.conventionalcommits.org):
