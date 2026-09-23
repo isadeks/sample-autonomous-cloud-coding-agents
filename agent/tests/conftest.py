@@ -10,6 +10,18 @@ import pytest
 
 from models import TaskConfig
 
+# LAYER 1 of the structural git isolation (#855). Importing the autouse fixture
+# here — rather than declaring it per test file, as the four previous fixes did —
+# is what makes it cover test modules that do not exist yet. ``_isolate_git_env``
+# and ``_git_isolation_home`` are referenced only by pytest's fixture collector,
+# hence the noqa: they are not "unused imports".
+from tests.git_isolation import (  # noqa: F401
+    _git_isolation_home,
+    _isolate_git_env,
+    check_shared_git_config,
+    snapshot_shared_git_config,
+)
+
 # Session-wide hang backstop. SIGALRM (pytest-timeout method="signal") fires only
 # in the MAIN thread during a test's *call* phase, so a deadlock in a WORKER
 # thread, a fixture, collection, or a C-level socket read the main thread never
@@ -58,6 +70,16 @@ _hang_watchdog.daemon = True
 _hang_watchdog.start()
 
 
+def pytest_sessionstart(session):
+    """LAYER 2 of the git isolation (#855): fingerprint the shared .git/config.
+
+    Paired with the ``check_shared_git_config`` call in ``pytest_sessionfinish``
+    below. Mechanism-independent — it compares the file's bytes, so it catches
+    any route to the shared config, including ones layer 1 does not anticipate.
+    """
+    snapshot_shared_git_config()
+
+
 def pytest_sessionfinish(session, exitstatus):
     """Cancel the hang watchdog on a clean session finish.
 
@@ -65,8 +87,14 @@ def pytest_sessionfinish(session, exitstatus):
     the 600s deadline (e.g. during teardown / coverage write) would be hard-exited
     by ``_reap_on_hang`` and turn green red with a thread-dump uncorrelated to any
     failed test. ``Timer.cancel()`` is a no-op if the timer already fired (a true
-    hang), so this only prevents the false-positive kill."""
+    hang), so this only prevents the false-positive kill.
+
+    Also runs layer 2's comparison: if any test mutated the shared
+    ``.git/config``, print the diff plus the un-damage remedy and FAIL the run
+    (#855). Placed after the cancel so a pollution report is never lost to the
+    watchdog."""
     _hang_watchdog.cancel()
+    check_shared_git_config(session)
 
 
 class FakeRunCmd:
