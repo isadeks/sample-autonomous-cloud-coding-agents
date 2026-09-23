@@ -110,6 +110,10 @@ run = "node scripts/check-deadcode-ratchet.mjs"
 description = "Transitive-pin sync guard (#712): fail if a package pinned in root `resolutions` resolves below that floor in integrations/jira-forge-app's npm lockfile — the standalone project root `resolutions` can't reach."
 run = "node scripts/check-transitive-pin-sync.mjs"
 
+[tasks."check:git-config-clean"]
+description = "Layer 3 of the git-fixture isolation (#855): fail if the shared .git/config carries `core.worktree` or a `[user]` section — the fingerprints of a test fixture that leaked under an inherited GIT_DIR. Wired into pre-commit (before a mis-attributed commit exists) and pre-push (after the hook-run suite)."
+run = "node scripts/check-git-config-clean.mjs"
+
 [tasks."drift-prevention"]
 description = "Run checks to prevent drift in contracts between packages and documentation links"
 run = [
@@ -118,6 +122,7 @@ run = [
   { task = "check:types-sync" },
   { task = "check:coverage-thresholds-sync" },
   { task = "check:transitive-pin-sync" },
+  { task = "check:git-config-clean" },
   { task = "//docs:link-check" },
 ]
 
