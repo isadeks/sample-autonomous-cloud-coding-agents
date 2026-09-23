@@ -2,7 +2,7 @@
 
 Parent guide: [../AGENTS.md](../AGENTS.md)
 
-You maintain the **`bgagent` CLI** (`@backgroundagent/cli`): Commander commands, Cognito auth, HTTP client, and API types mirrored from CDK.
+You maintain the **`bgagent` CLI** (`@abca/cli` — unpublished and `private`; run it as `node lib/bin/bgagent.js` or link it with `npm link`): Commander commands, Cognito auth, HTTP client, and API types mirrored from CDK.
 
 ## Commands (run these)
 
