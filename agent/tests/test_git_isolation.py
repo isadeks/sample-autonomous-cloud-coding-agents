@@ -134,7 +134,7 @@ class TestSharedConfigResolution:
 
         resolved = shared_git_config_path(cwd=repo)
         assert resolved == repo / ".git" / "config"
-        assert resolved.exists()
+        assert resolved is not None and resolved.exists()
 
     def test_never_resolves_to_this_repository_from_an_unrelated_cwd(self, tmp_path):
         """Outside a repo the resolver must answer ``None`` (or at worst the repo
