@@ -2195,6 +2195,14 @@ export class AgentStack extends Stack {
       },
     ], true);
 
+    // factory-eval local patch: a second stack in the same account must not
+    // overwrite the account-level Bedrock invocation-logging config owned by
+    // backgroundagent-dev (and must not leave it pointing at a deleted log group).
+    if (this.node.tryGetContext('fevalSkipBedrockInvocationLogging') === 'true'
+      || this.node.tryGetContext('fevalSkipBedrockInvocationLogging') === true) {
+      this.node.tryRemoveChild('ModelInvocationLogging');
+    }
+
     new CfnOutput(this, 'ApiUrl', {
       value: taskApi.api.url,
       description: 'URL of the Task API',
