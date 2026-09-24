@@ -628,6 +628,9 @@ async def run_agent(
         hooks=hooks,
         max_budget_usd=config.max_budget_usd,
         stderr=_on_stderr,
+        # factory-eval local patch: the SDK's default 1 MiB stream buffer kills the session as soon as
+        # the CLI echoes an Edit of a >1 MiB file (aidlc-lib.ts is 1.16 MB). Raise it to 64 MiB.
+        max_buffer_size=64 * 1024 * 1024,
         **({"mcp_servers": mcp_servers} if mcp_servers else {}),
     )
 
