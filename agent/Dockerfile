@@ -73,7 +73,7 @@ RUN corepack enable && corepack prepare yarn@stable --activate || corepack enabl
 
 # Install Claude Code CLI (the Python SDK requires this binary)
 # Then update known vulnerable transitive packages where fixed versions exist.
-# Pinned 2.1.191 to match the CLI bundled by claude-agent-sdk 0.2.110 (see
+# Pinned 2.1.281 to match the CLI bundled by claude-agent-sdk 0.2.159 (see
 # agent/pyproject.toml) — the SDK and the on-PATH CLI must agree on the control
 # protocol. This version also has the awsCredentialExport behavior #215 needs:
 # returned creds are cached until 5 min before the JSON's `Expiration`, so an
@@ -87,7 +87,7 @@ RUN corepack enable && corepack prepare yarn@stable --activate || corepack enabl
 # after the install so the native binary is placed at build time, and hard-verify
 # it exec's (``claude --version`` fails the build if the shim is still on PATH).
 RUN npm install -g npm@latest && \
-    npm install -g @anthropic-ai/claude-code@2.1.191 && \
+    npm install -g @anthropic-ai/claude-code@2.1.281 && \
     CLAUDE_NPM_ROOT="$(npm root -g)/@anthropic-ai/claude-code" && \
     npm --prefix "${CLAUDE_NPM_ROOT}" update tar minimatch glob cross-spawn picomatch && \
     node "${CLAUDE_NPM_ROOT}/install.cjs" && \
