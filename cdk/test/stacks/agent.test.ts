@@ -1166,7 +1166,7 @@ describe('AgentStack with the ECS substrate gate (--context compute_type=ecs)', 
 
   beforeAll(() => {
     // Selecting ECS provisions the Fargate backend and emits ComputeSubstrate=ecs.
-    const app = new App({ context: { compute_type: 'ecs' } });
+    const app = new App({ context: { compute_types: 'ecs' } });
     const stack = new AgentStack(app, 'TestAgentStackEcs', {
       env: { account: '123456789012', region: 'us-east-1' },
     });
@@ -1216,7 +1216,7 @@ describe('AgentStack with the ECS substrate gate (--context compute_type=ecs)', 
     // This asserts the whole path: context -> resolver -> construct -> template.
     const app = new App({
       context: {
-        compute_type: 'ecs',
+        compute_types: 'ecs',
         ecsBuildTaskCpu: '16384',
         ecsBuildTaskMemoryMiB: '122880',
         ecsBuildTaskEphemeralStorageGiB: '100',
@@ -1252,7 +1252,7 @@ describe('AgentStack with the Lambda MicroVMs substrate gate (--context compute_
     // exists once an image identifier is available.
     const app = new App({
       context: {
-        compute_type: 'lambda-microvm',
+        compute_types: 'lambda-microvm',
         microvm_base_image_arn: BASE_IMAGE_ARN,
         microvm_base_image_version: '1',
       },
@@ -1477,7 +1477,7 @@ describe('AgentStack with the Lambda MicroVMs substrate gate (--context compute_
     beforeAll(() => {
       const app = new App({
         context: {
-          compute_type: 'lambda-microvm',
+          compute_types: 'lambda-microvm',
           microvm_region_override: true,
           microvm_base_image_arn: BASE_IMAGE_ARN,
           microvm_base_image_version: '1',
@@ -1489,7 +1489,7 @@ describe('AgentStack with the Lambda MicroVMs substrate gate (--context compute_
     });
 
     test('fails synth when the stack Region has no Lambda MicroVMs', () => {
-      const app = new App({ context: { compute_type: 'lambda-microvm' } });
+      const app = new App({ context: { compute_types: 'lambda-microvm' } });
       expect(() => new AgentStack(app, 'TestAgentStackMicrovmBadRegion', {
         env: { account: '123456789012', region: 'eu-central-1' },
       })).toThrow(/AWS Lambda MicroVMs are not available in eu-central-1/);
@@ -1543,7 +1543,7 @@ describe('AgentStack with the MicroVM gate on but no image configured (first dep
     // but no image yet. Exercises the false branch of the shared
     // `isLambdaMicrovmImageConfigured` predicate that gates BOTH the
     // orchestrator's MICROVM_* wiring and the cancel Lambda's grant.
-    const app = new App({ context: { compute_type: 'lambda-microvm' } });
+    const app = new App({ context: { compute_types: 'lambda-microvm' } });
     const stack = new AgentStack(app, 'TestAgentStackMicrovmNoImage', {
       env: { account: '123456789012', region: 'us-east-1' },
     });
@@ -1587,7 +1587,7 @@ describe('AgentStack MicroVM image ARN invariant', () => {
     const configuredSpy = jest.spyOn(lambdaMicrovmCompute, 'isLambdaMicrovmImageConfigured')
       .mockReturnValue(true);
     try {
-      const app = new App({ context: { compute_type: 'lambda-microvm' } });
+      const app = new App({ context: { compute_types: 'lambda-microvm' } });
       const stack = new AgentStack(app, 'TestAgentStackMicrovmInvariant', {
         env: { account: '123456789012', region: 'us-east-1' },
       });
@@ -1728,7 +1728,7 @@ describe('AgentStack tool-gateway gate (ADR-019 P1)', () => {
 
     beforeAll(() => {
       const app = new App({
-        context: { enableToolGateway: true, compute_type: 'ecs' },
+        context: { enableToolGateway: true, compute_types: 'ecs' },
       });
       const stack = new AgentStack(app, 'GatewayEcsStack', {
         env: { account: '123456789012', region: 'us-east-1' },
@@ -1923,7 +1923,7 @@ describe('AgentStack Linear identity vault gate (#809)', () => {
   });
 
   test('MicroVM + vault fits with only the MicroVM compute backend deployed', () => {
-    const app = new App({ context: { enableLinearIdentityVault: true, compute_type: 'lambda-microvm' } });
+    const app = new App({ context: { enableLinearIdentityVault: true, compute_types: 'lambda-microvm' } });
     const template = Template.fromStack(new AgentStack(app, 'LinearVaultMicrovmStack', {
       env: { account: '123456789012', region: 'us-east-1' },
     }));
