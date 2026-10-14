@@ -197,6 +197,26 @@ describe('hydrateAndTransition', () => {
     expect(payload.trace).toBe(true);
   });
 
+  test('threads CI/CD convergence settings from the blueprint into the agent payload', async () => {
+    mockDdbSend.mockResolvedValue({});
+    mockHydrateContext.mockResolvedValueOnce(mockHydratedContext);
+    const payload = await hydrateAndTransition(baseTask as any, {
+      compute_type: 'agentcore',
+      ci_wait_timeout_s: 2700,
+      ci_required_checks: ['AWS CodeBuild us-east-1 (ci)', 'deployment:Preview'],
+    } as any);
+    expect(payload.ci_wait_timeout_s).toBe(2700);
+    expect(payload.ci_required_checks).toEqual(['AWS CodeBuild us-east-1 (ci)', 'deployment:Preview']);
+  });
+
+  test('omits CI/CD convergence settings when the repo does not set them', async () => {
+    mockDdbSend.mockResolvedValue({});
+    mockHydrateContext.mockResolvedValueOnce(mockHydratedContext);
+    const payload = await hydrateAndTransition(baseTask as any, { compute_type: 'agentcore', ci_required_checks: [] } as any);
+    expect(payload).not.toHaveProperty('ci_wait_timeout_s');
+    expect(payload).not.toHaveProperty('ci_required_checks');
+  });
+
   test('omits trace from payload when task record has no trace flag (slim wire)', async () => {
     mockDdbSend.mockResolvedValue({});
     mockHydrateContext.mockResolvedValueOnce(mockHydratedContext);
@@ -846,6 +866,20 @@ describe('loadBlueprintConfig', () => {
     expect(config.model_id).toBe('anthropic.claude-sonnet-4-6');
     expect(config.max_turns).toBe(50);
     expect(config.poll_interval_ms).toBe(15000);
+  });
+
+  test('surfaces per-repo CI/CD convergence settings', async () => {
+    mockLoadRepoConfig.mockResolvedValueOnce({
+      repo: 'org/repo',
+      status: 'active',
+      onboarded_at: '2024-01-01T00:00:00Z',
+      updated_at: '2024-01-01T00:00:00Z',
+      ci_wait_timeout_s: 1800,
+      ci_required_checks: ['deployment:Preview'],
+    });
+    const config = await loadBlueprintConfig(baseTask as any);
+    expect(config.ci_wait_timeout_s).toBe(1800);
+    expect(config.ci_required_checks).toEqual(['deployment:Preview']);
   });
 
   test('uses per-repo github_token_secret_arn when available', async () => {

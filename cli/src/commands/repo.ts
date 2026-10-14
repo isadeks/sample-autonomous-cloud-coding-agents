@@ -160,6 +160,11 @@ export function makeRepoCommand(): Command {
       .option('--token-secret-arn <arn>', 'Per-repo GitHub token Secrets Manager ARN')
       .option('--max-turns <n>', 'Default max turns for tasks', parseInt)
       .option('--poll-interval <ms>', 'Default agent poll interval in milliseconds', parseInt)
+      .option('--build-command <cmd>', 'Post-agent build/test verify command (default: mise run build)')
+      .option('--lint-command <cmd>', 'Post-agent lint verify command (default: mise run lint)')
+      .option('--ci-wait-timeout <seconds>', 'Wait in-session for the PR\'s CI/CD checks and fix failures (0 = off)', parseInt)
+      .option('--ci-required-check <name>', 'Check that must report green before the PR converges (repeatable; e.g. deployment:Preview)', (v: string, acc: string[] = []) => [...acc, v])
+      .option('--clear-ci-required-checks', 'Remove the stored required checks')
       .option('--output <format>', 'Output format: text or json', 'text')
       .action(async (repoId: string, opts) => {
         assertRepoFormat(repoId);
@@ -236,6 +241,10 @@ export function makeRepoCommand(): Command {
           githubTokenSecretArn: opts.tokenSecretArn,
           maxTurns: opts.maxTurns,
           pollIntervalMs: opts.pollInterval,
+          buildCommand: opts.buildCommand,
+          lintCommand: opts.lintCommand,
+          ciWaitTimeoutS: opts.ciWaitTimeout,
+          ciRequiredChecks: opts.clearCiRequiredChecks ? [] : opts.ciRequiredCheck,
         });
         const notes = buildRepoOnboardNotes({
           config,

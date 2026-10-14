@@ -398,6 +398,8 @@ def _run_task_background(
     system_prompt_overrides: str = "",
     build_command: str = "",
     lint_command: str = "",
+    ci_wait_timeout_s: int = 0,
+    ci_required_checks: list[str] | None = None,
     prompt_version: str = "",
     memory_id: str = "",
     resolved_workflow: dict | None = None,
@@ -489,6 +491,8 @@ def _run_task_background(
             system_prompt_overrides=system_prompt_overrides,
             build_command=build_command,
             lint_command=lint_command,
+            ci_wait_timeout_s=ci_wait_timeout_s,
+            ci_required_checks=ci_required_checks,
             prompt_version=prompt_version,
             memory_id=memory_id,
             resolved_workflow=resolved_workflow,
@@ -544,6 +548,12 @@ def _extract_invocation_params(inp: dict, request: Request) -> dict:
     # #1: per-repo build/lint verification commands. Empty → agent defaults to mise.
     build_command = inp.get("build_command", "")
     lint_command = inp.get("lint_command", "")
+    # Per-repo: after the PR opens, wait this long (s) for its CI checks in-session
+    # and feed failures back to the agent. 0/absent = do not wait for CI.
+    ci_wait_timeout_s = int(inp.get("ci_wait_timeout_s") or 0)
+    # Check names that must all report before the PR counts as green (e.g. the
+    # CI status context and "deployment:Preview" for a CD stage).
+    ci_required_checks = [str(c) for c in (inp.get("ci_required_checks") or []) if c]
     max_turns = int(inp.get("max_turns", 0)) or int(os.environ.get("MAX_TURNS", "100"))
     max_budget_usd = float(inp.get("max_budget_usd", 0)) or None
     aws_region = inp.get("aws_region") or os.environ.get("AWS_REGION", "")
@@ -666,6 +676,8 @@ def _extract_invocation_params(inp: dict, request: Request) -> dict:
         "system_prompt_overrides": system_prompt_overrides,
         "build_command": build_command,
         "lint_command": lint_command,
+        "ci_wait_timeout_s": ci_wait_timeout_s,
+        "ci_required_checks": ci_required_checks,
         "prompt_version": prompt_version,
         "memory_id": memory_id,
         "resolved_workflow": resolved_workflow,

@@ -16,6 +16,7 @@ from pydantic import ValidationError
 import memory as agent_memory
 import task_state
 from channel_mcp import configure_channel_mcp, strip_linear_mcp_servers
+from ci_wait import render_ci_lines
 from config import (
     AGENT_WORKSPACE,
     NEEDS_INPUT_MARKER,
@@ -540,6 +541,129 @@ def _run_fixup_rounds(
     return build_outcome, agent_result, fixup
 
 
+def _head_sha(repo_dir: str) -> str:
+    r = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=repo_dir, capture_output=True, text=True, check=False
+    )
+    return r.stdout.strip()
+
+
+def _run_ci_rounds(
+    agent_result,
+    *,
+    workflow,
+    config,
+    setup,
+    pr_url: str,
+    system_prompt: str,
+    trajectory,
+    progress,
+):
+    """Wait for the PR's CI in-session; on red, resume the agent with the report (see ci_wait.py).
+
+    No-op (returns ``(agent_result, None)``) unless the repo sets
+    ``ci_wait_timeout_s``. Rounds come from the workflow's
+    ``convergence.max_fixup_rounds``; each round re-waits on the new head SHA.
+    """
+    import asyncio
+    import re
+
+    from ci_wait import (
+        CiConvergence,
+        build_ci_fixup_prompt,
+        ci_comments_for,
+        failure_report,
+        wait_for_ci,
+    )
+    from fixup import MIN_FIXUP_BUDGET_USD, max_fixup_rounds, remaining_budget
+    from runner import run_agent
+
+    timeout_s = int(getattr(config, "ci_wait_timeout_s", 0) or 0)
+    if timeout_s <= 0:
+        return agent_result, None
+    max_rounds = max_fixup_rounds(workflow)
+    match = re.search(r"/pull/(\d+)", pr_url)
+    pr_number = match.group(1) if match else ""
+    ci = CiConvergence()
+
+    def _cancelled() -> bool:
+        try:
+            rec = task_state.get_task(config.task_id)
+        except task_state.TaskFetchError:
+            return False
+        return bool(rec and rec.get("status") == "CANCELLED")
+
+    deadline = time.monotonic() + timeout_s
+    while True:
+        sha = _head_sha(setup.repo_dir)
+        progress.write_agent_milestone("ci_wait_started", f"sha={sha[:9]} round={ci.rounds}")
+        log(
+            "POST",
+            f"CI: waiting for checks on {sha[:9]} (up to {int(deadline - time.monotonic())}s)",
+        )
+        result = wait_for_ci(
+            config.repo_url,
+            sha,
+            setup.repo_dir,
+            max(0, int(deadline - time.monotonic())),
+            required=list(getattr(config, "ci_required_checks", None) or []),
+            is_cancelled=_cancelled,
+        )
+        ci.results.append(result)
+        names = ", ".join(f"{c['name']}={c['state']}" for c in result.checks) or "none"
+        log("POST", f"CI: {result.state} on {sha[:9]} after {result.waited_s}s ({names})")
+        progress.write_agent_milestone(
+            "ci_result", f"state={result.state} sha={sha[:9]} checks={names}"[:900]
+        )
+        if result.state != "fail":
+            ci.stopped_reason = f"ci {result.state}"
+            break
+        if ci.rounds >= max_rounds:
+            ci.stopped_reason = "max fix-up rounds reached"
+            break
+        budget = remaining_budget(config.max_budget_usd, agent_result.cost_usd)
+        if budget is not None and budget < MIN_FIXUP_BUDGET_USD:
+            ci.stopped_reason = "budget exhausted"
+            break
+        if not agent_result.session_id:
+            ci.stopped_reason = "no agent session to resume"
+            break
+        ci.rounds += 1
+        report = failure_report(
+            result, ci_comments_for(config.repo_url, pr_number, sha, setup.repo_dir)
+        )
+        progress.write_agent_milestone("ci_fixup_round_started", f"round={ci.rounds}/{max_rounds}")
+        try:
+            fix_result = asyncio.run(
+                run_agent(
+                    build_ci_fixup_prompt(report, ci.rounds, max_rounds),
+                    system_prompt,
+                    config,
+                    cwd=setup.repo_dir,
+                    trajectory=trajectory,
+                    resume_session_id=agent_result.session_id,
+                    max_budget_usd=budget,
+                )
+            )
+        except Exception as e:
+            log_error_cw(f"CI fix-up round {ci.rounds} failed: {e}", task_id=config.task_id or None)
+            ci.stopped_reason = f"fix-up agent error: {type(e).__name__}"
+            break
+        agent_result.cost_usd = (agent_result.cost_usd or 0.0) + (fix_result.cost_usd or 0.0)
+        agent_result.turns += fix_result.turns
+        agent_result.num_turns = (agent_result.num_turns or 0) + (fix_result.num_turns or 0)
+        if fix_result.session_id:
+            agent_result.session_id = fix_result.session_id
+        reconcile_agent_branch(setup.repo_dir, setup.branch)
+        ensure_committed(setup.repo_dir)
+        ensure_pushed(setup.repo_dir, setup.branch)
+        new_sha = _head_sha(setup.repo_dir)
+        if new_sha == sha:
+            ci.stopped_reason = "agent pushed no change (reported the failure as out of scope)"
+            break
+    return agent_result, ci
+
+
 def _apply_post_hook_gates(
     workflow: Workflow | None,
     *,
@@ -923,6 +1047,8 @@ def run_task(
     system_prompt_overrides: str = "",
     build_command: str = "",
     lint_command: str = "",
+    ci_wait_timeout_s: int = 0,
+    ci_required_checks: list[str] | None = None,
     prompt_version: str = "",
     memory_id: str = "",
     resolved_workflow: dict | None = None,
@@ -975,6 +1101,8 @@ def run_task(
         system_prompt_overrides=system_prompt_overrides,
         build_command=build_command,
         lint_command=lint_command,
+        ci_wait_timeout_s=ci_wait_timeout_s,
+        ci_required_checks=ci_required_checks,
         resolved_workflow=resolved_workflow,
         branch_name=branch_name,
         pr_number=pr_number,
@@ -1505,6 +1633,7 @@ def run_task(
             )
 
             # Post-hooks (agent_result is guaranteed set by the try/except above)
+            ci_conv = None  # set when the repo waits for PR CI (ci_wait_timeout_s)
             with task_span("task.post_hooks") as post_span:
                 if needs_input:
                     # Hold-and-ask: skip build/lint/PR entirely. The agent asked a
@@ -1618,6 +1747,19 @@ def run_task(
                         agent_result=agent_result,
                         strategy=ensure_pr_strategy,
                     )
+                    if pr_url and not workflow_read_only and build_passed:
+                        # Convergence on the PR's CI (per-repo ci_wait_timeout_s):
+                        # keep this session, wait for the checks, feed failures back.
+                        agent_result, ci_conv = _run_ci_rounds(
+                            agent_result,
+                            workflow=_workflow,
+                            config=config,
+                            setup=setup,
+                            pr_url=pr_url,
+                            system_prompt=system_prompt,
+                            trajectory=trajectory,
+                            progress=progress,
+                        )
                     if pr_url and not workflow_read_only:
                         # The platform's verdict in the PR even when the agent
                         # opened it (ensure_pr then returns early, leaving only
@@ -1634,6 +1776,7 @@ def run_task(
                                 fixup_rounds=fixup.rounds,
                                 fixup_history=fixup.history,
                                 agent_result=agent_result,
+                                extra_lines=render_ci_lines(ci_conv),
                             ),
                         )
                     post_span.set_attribute("build.passed", build_passed)
@@ -1703,6 +1846,19 @@ def run_task(
                 build_timed_out=build_timed_out,
                 build_infra_failed=build_infra_failed,
             )
+            # A PR whose CI is still red after the fix-up rounds did not converge.
+            if (
+                ci_conv
+                and ci_conv.final
+                and ci_conv.final.state == "fail"
+                and overall_status == "success"
+            ):
+                failing = ", ".join(c["name"] for c in ci_conv.final.failed) or "CI"
+                overall_status = "error"
+                result_error = (
+                    f"ci_ok=False: CI checks failing on the PR after {ci_conv.rounds} "
+                    f"fix-up round(s): {failing}"
+                )
             # Delivery gate: a create-strategy new-work task that
             # reported success but opened no PR AND landed no commit shipped
             # nothing — fail it loudly (retryable) instead of a false COMPLETED

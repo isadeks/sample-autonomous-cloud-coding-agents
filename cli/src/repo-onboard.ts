@@ -34,6 +34,9 @@ import {
 /** TTL (days) for soft-deleted repo rows — matches Blueprint construct. */
 export const REMOVED_REPO_TTL_DAYS = 30;
 
+/** Upper bound for ``--ci-wait-timeout`` (6 h; matches the agent's TaskConfig bound). */
+export const MAX_CI_WAIT_TIMEOUT_S = 21600;
+
 export interface OnboardRepoOptions {
   readonly computeType?: 'agentcore' | 'ecs' | 'lambda-microvm';
   readonly runtimeArn?: string;
@@ -41,6 +44,13 @@ export interface OnboardRepoOptions {
   readonly maxTurns?: number;
   readonly githubTokenSecretArn?: string;
   readonly pollIntervalMs?: number;
+  /** Post-agent build/lint verify commands (previously CDK Blueprint-only). */
+  readonly buildCommand?: string;
+  readonly lintCommand?: string;
+  /** In-session CI/CD convergence: seconds to wait for the PR's checks (0 = off). */
+  readonly ciWaitTimeoutS?: number;
+  /** Checks that must all report green, e.g. a CI status context and `deployment:Preview`. */
+  readonly ciRequiredChecks?: string[];
 }
 
 export interface OnboardRepoDependencies {
@@ -78,7 +88,13 @@ export async function onboardRepo(
     await requireLambdaMicrovmAvailability(region, dependencies.lambdaMicrovmClientFactory);
   }
 
+  // Start from the WHOLE existing row so fields this command does not manage
+  // (build/lint commands, mcp_servers, skills, cedar_policy_modules, ...) survive
+  // a re-onboard; PutCommand replaces the item. Drop the soft-delete TTL so a
+  // re-activated repo is not reaped.
+  const { ttl: _removedTtl, ...carried } = (existing ?? {}) as Record<string, unknown>;
   const item: Record<string, unknown> = {
+    ...carried,
     repo,
     status: 'active',
     onboarded_at: existing?.onboarded_at ?? now,
@@ -114,6 +130,20 @@ export async function onboardRepo(
     item.approval_gate_cap = existing.approval_gate_cap;
   }
   if (existing?.max_budget_usd !== undefined) item.max_budget_usd = existing.max_budget_usd;
+
+  if (options.buildCommand !== undefined) item.build_command = options.buildCommand;
+  if (options.lintCommand !== undefined) item.lint_command = options.lintCommand;
+  if (options.ciWaitTimeoutS !== undefined) {
+    if (!Number.isInteger(options.ciWaitTimeoutS) || options.ciWaitTimeoutS < 0 || options.ciWaitTimeoutS > MAX_CI_WAIT_TIMEOUT_S) {
+      throw new CliError(`--ci-wait-timeout must be an integer number of seconds between 0 and ${MAX_CI_WAIT_TIMEOUT_S}`);
+    }
+    if (options.ciWaitTimeoutS === 0) delete item.ci_wait_timeout_s;
+    else item.ci_wait_timeout_s = options.ciWaitTimeoutS;
+  }
+  if (options.ciRequiredChecks !== undefined) {
+    if (options.ciRequiredChecks.length) item.ci_required_checks = options.ciRequiredChecks;
+    else delete item.ci_required_checks;
+  }
 
   await ddb.send(new PutCommand({
     TableName: tableName,

@@ -48,6 +48,15 @@ export interface RepoConfig {
    */
   readonly build_command?: string;
   readonly lint_command?: string;
+  /**
+   * In-session CI/CD convergence: after the PR opens, the agent waits up to this
+   * many seconds for the PR's checks (commit statuses, check runs, deployments)
+   * and feeds failures back to its own session. Absent/0 = do not wait for CI.
+   */
+  readonly ci_wait_timeout_s?: number;
+  /** Check names that must all report green (e.g. a CI status context and
+   *  ``deployment:Preview``) before the PR counts as converged. */
+  readonly ci_required_checks?: string[];
   readonly egress_allowlist?: string[];
   readonly cedar_policies?: string[];
   /**
@@ -90,6 +99,15 @@ export interface BlueprintConfig {
   /** Per-repo build/lint verification commands (#1). Default mise when unset. The orchestrator threads these into the agent payload. */
   readonly build_command?: string;
   readonly lint_command?: string;
+  /**
+   * In-session CI/CD convergence: after the PR opens, the agent waits up to this
+   * many seconds for the PR's checks (commit statuses, check runs, deployments)
+   * and feeds failures back to its own session. Absent/0 = do not wait for CI.
+   */
+  readonly ci_wait_timeout_s?: number;
+  /** Check names that must all report green (e.g. a CI status context and
+   *  ``deployment:Preview``) before the PR counts as converged. */
+  readonly ci_required_checks?: string[];
   readonly egress_allowlist?: string[];
   readonly cedar_policies?: string[];
   /**

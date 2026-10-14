@@ -176,6 +176,12 @@ class TaskConfig(BaseModel):
     # gating actually runs the repo's real command.
     build_command: str = ""
     lint_command: str = ""
+    # Seconds to wait (in-session, after the PR opens) for the PR's CI checks;
+    # failures go back to the agent as convergence fix-up rounds. 0 = off.
+    ci_wait_timeout_s: int = Field(default=0, ge=0, le=6 * 3600)
+    # Checks that must all report green (status context / check name /
+    # "deployment:<env>") before the PR counts as converged.
+    ci_required_checks: list[str] = Field(default_factory=list)
     # The pinned workflow this task runs ({"id", "version"}), resolved at the
     # create-task boundary and threaded through the payload. None on local/batch
     # runs, where the pipeline defaults to coding/new-task-v1.

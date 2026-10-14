@@ -847,6 +847,7 @@ def render_verification_section(
     fixup_rounds: int = 0,
     fixup_history: list[bool] | None = None,
     agent_result: AgentResult | None = None,
+    extra_lines: list[str] | None = None,
 ) -> str:
     """The platform's own ``## Verification`` block, between stable markers.
 
@@ -873,6 +874,7 @@ def render_verification_section(
             f"- Convergence: **{fixup_rounds}** fix-up round(s) after a failing build"
             + (f" (results: {history})" if history else "")
         )
+    lines.extend(extra_lines or [])
     if agent_result and agent_result.cost_usd is not None:
         lines.append(f"- Agent cost: **${agent_result.cost_usd:.4f}**")
     lines.append(VERIFICATION_END)

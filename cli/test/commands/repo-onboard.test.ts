@@ -171,6 +171,65 @@ describe('repo onboard/offboard', () => {
     expect(put.input.Item?.cedar_policies).toEqual(['policy']);
   });
 
+  test('onboardRepo carries forward fields it does not manage (build/lint, registry refs) and drops the soft-delete ttl', async () => {
+    const { loadRepoConfig } = jest.requireMock('../../src/repo-lookup') as { loadRepoConfig: jest.Mock };
+    loadRepoConfig.mockResolvedValueOnce({
+      repo: 'acme/a',
+      status: 'removed',
+      ttl: 1234,
+      build_command: 'npm test',
+      lint_command: 'npm run lint',
+      mcp_servers: ['registry://mcp/x'],
+      skills: ['registry://skill/y'],
+      ci_wait_timeout_s: 900,
+    });
+
+    await onboardRepo('us-east-1', 'RepoTable', 'acme/a', { modelId: 'm' });
+
+    const item = (ddbSend.mock.calls[0][0] as PutCommand).input.Item!;
+    expect(item.status).toBe('active');
+    expect(item.ttl).toBeUndefined();
+    expect(item.build_command).toBe('npm test');
+    expect(item.lint_command).toBe('npm run lint');
+    expect(item.mcp_servers).toEqual(['registry://mcp/x']);
+    expect(item.skills).toEqual(['registry://skill/y']);
+    expect(item.ci_wait_timeout_s).toBe(900);
+  });
+
+  test('onboardRepo sets verify commands and CI/CD convergence fields', async () => {
+    await onboardRepo('us-east-1', 'RepoTable', 'acme/a', {
+      buildCommand: 'pnpm test',
+      lintCommand: 'true',
+      ciWaitTimeoutS: 2700,
+      ciRequiredChecks: ['AWS CodeBuild us-east-1 (ci)', 'deployment:Preview'],
+    });
+
+    const item = (ddbSend.mock.calls[0][0] as PutCommand).input.Item!;
+    expect(item.build_command).toBe('pnpm test');
+    expect(item.lint_command).toBe('true');
+    expect(item.ci_wait_timeout_s).toBe(2700);
+    expect(item.ci_required_checks).toEqual(['AWS CodeBuild us-east-1 (ci)', 'deployment:Preview']);
+  });
+
+  test('onboardRepo clears CI wait with 0 and required checks with an empty list', async () => {
+    const { loadRepoConfig } = jest.requireMock('../../src/repo-lookup') as { loadRepoConfig: jest.Mock };
+    loadRepoConfig.mockResolvedValueOnce({
+      repo: 'acme/a', status: 'active', ci_wait_timeout_s: 900, ci_required_checks: ['x'],
+    });
+
+    await onboardRepo('us-east-1', 'RepoTable', 'acme/a', { ciWaitTimeoutS: 0, ciRequiredChecks: [] });
+
+    const item = (ddbSend.mock.calls[0][0] as PutCommand).input.Item!;
+    expect(item.ci_wait_timeout_s).toBeUndefined();
+    expect(item.ci_required_checks).toBeUndefined();
+  });
+
+  test('onboardRepo rejects an out-of-range CI wait', async () => {
+    await expect(onboardRepo('us-east-1', 'RepoTable', 'acme/a', { ciWaitTimeoutS: 99999 }))
+      .rejects.toThrow(CliError);
+    expect(ddbSend).not.toHaveBeenCalled();
+  });
+
   test('onboardRepo persists --poll-interval override', async () => {
     await onboardRepo('us-east-1', 'RepoTable', 'acme/a', { pollIntervalMs: 12345 });
 

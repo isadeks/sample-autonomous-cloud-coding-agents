@@ -604,6 +604,8 @@ export async function loadBlueprintConfig(task: TaskRecord): Promise<BlueprintCo
     poll_interval_ms: pollIntervalMs,
     build_command: repoConfig?.build_command,
     lint_command: repoConfig?.lint_command,
+    ci_wait_timeout_s: repoConfig?.ci_wait_timeout_s,
+    ci_required_checks: repoConfig?.ci_required_checks,
     cedar_policies: repoConfig?.cedar_policies,
     approval_gate_cap: repoConfig?.approval_gate_cap,
     mcp_servers: repoConfig?.mcp_servers,
@@ -994,6 +996,9 @@ export async function hydrateAndTransition(task: TaskRecord, blueprintConfig?: B
     // build-regression gating actually runs the repo's real command.
     ...(blueprintConfig?.build_command && { build_command: blueprintConfig.build_command }),
     ...(blueprintConfig?.lint_command && { lint_command: blueprintConfig.lint_command }),
+    // In-session CI/CD convergence (absent → the agent does not wait for PR checks).
+    ...(blueprintConfig?.ci_wait_timeout_s && { ci_wait_timeout_s: blueprintConfig.ci_wait_timeout_s }),
+    ...(blueprintConfig?.ci_required_checks?.length && { ci_required_checks: blueprintConfig.ci_required_checks }),
     // cedarText is inline blueprint policies ++ resolved registry
     // cedar_policy_module text (#246), so it supersedes the raw
     // blueprintConfig.cedar_policies — byte-identical to inline when no
