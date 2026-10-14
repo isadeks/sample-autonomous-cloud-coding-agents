@@ -242,7 +242,7 @@
       "type": "object",
       "additionalProperties": false,
       "required": ["mode", "terminal_outcomes"],
-      "description": "Declarative contract for how a harness decides the workflow is done. In v1 this documents existing terminal behavior for conformance tooling; it does not change runtime success inference.",
+      "description": "Contract for how a harness decides the workflow is done. mode/required_sensors/terminal_outcomes are declarative; max_fixup_rounds (test_gated) is enforced at runtime by the coding post-hooks.",
       "properties": {
         "mode": {
           "type": "string",
@@ -264,6 +264,13 @@
           },
           "uniqueItems": true,
           "minItems": 1
+        },
+        "max_fixup_rounds": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 5,
+          "default": 0,
+          "description": "test_gated only: how many times a genuinely failing verify_build result is fed back to the agent (resuming its session) before finalization. 0 = report-only gate."
         },
         "early_exit": {
           "type": "object",

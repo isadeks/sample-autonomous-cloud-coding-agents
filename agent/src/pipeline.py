@@ -35,10 +35,14 @@ from linear_reactions import react_task_finished, react_task_started
 from models import AgentResult, HydratedContext, RepoSetup, TaskConfig, TaskResult
 from observability import current_otel_trace_id, task_span
 from post_hooks import (
+    DEFAULT_BUILD_COMMAND,
     _extract_agent_notes,
     ensure_committed,
     ensure_pr,
+    ensure_pushed,
     reconcile_agent_branch,
+    render_verification_section,
+    upsert_verification_section,
     verify_build,
     verify_lint,
 )
@@ -431,6 +435,109 @@ def _run_repoless_task(
     terminal_status = "COMPLETED" if overall_status == "success" else "FAILED"
     task_state.write_terminal(config.task_id, terminal_status, result_dict)
     return result_dict
+
+
+def _run_fixup_rounds(
+    build_outcome,
+    agent_result,
+    *,
+    workflow,
+    config,
+    setup,
+    system_prompt: str,
+    trajectory,
+    progress,
+    read_only: bool,
+):
+    """Feed a genuinely failing post-agent build back to the agent (see fixup.py).
+
+    Returns ``(build_outcome, agent_result, FixupResult)``: the LAST build
+    outcome, the agent result with cost/turns accumulated across rounds, and
+    what the loop did. With ``max_fixup_rounds == 0`` (the v1 default) this is
+    a no-op, so workflows that don't opt in keep the report-only gate.
+    """
+    import asyncio
+
+    from fixup import (
+        MIN_FIXUP_BUDGET_USD,
+        FixupResult,
+        build_fixup_prompt,
+        fixup_skip_reason,
+        log_round,
+        max_fixup_rounds,
+        remaining_budget,
+    )
+    from runner import run_agent
+
+    fixup = FixupResult()
+    max_rounds = max_fixup_rounds(workflow)
+    if max_rounds <= 0 or build_outcome.passed:
+        return build_outcome, agent_result, fixup
+    command = (config.build_command or DEFAULT_BUILD_COMMAND).strip()
+    while fixup.rounds < max_rounds:
+        reason = fixup_skip_reason(
+            build_outcome,
+            build_before=setup.build_before,
+            read_only=read_only,
+            session_id=agent_result.session_id,
+            agent_status=agent_result.status,
+        )
+        if reason:
+            fixup.stopped_reason = reason
+            log("POST", f"Convergence: not running a fix-up round ({reason})")
+            break
+        budget = remaining_budget(config.max_budget_usd, agent_result.cost_usd)
+        if budget is not None and budget < MIN_FIXUP_BUDGET_USD:
+            fixup.stopped_reason = "budget exhausted"
+            log("POST", "Convergence: budget exhausted, no fix-up round")
+            break
+        fixup.rounds += 1
+        progress.write_agent_milestone("fixup_round_started", f"round={fixup.rounds}/{max_rounds}")
+        try:
+            fix_result = asyncio.run(
+                run_agent(
+                    build_fixup_prompt(
+                        command, build_outcome.output_tail, fixup.rounds, max_rounds
+                    ),
+                    system_prompt,
+                    config,
+                    cwd=setup.repo_dir,
+                    trajectory=trajectory,
+                    resume_session_id=agent_result.session_id,
+                    max_budget_usd=budget,
+                )
+            )
+        except Exception as e:
+            log_error_cw(
+                f"Convergence fix-up round {fixup.rounds} failed: {e}",
+                task_id=config.task_id or None,
+            )
+            fixup.stopped_reason = f"fix-up agent error: {type(e).__name__}"
+            break
+        # Accumulate onto the task's agent result (cost/turns drive the task record).
+        fixup.extra_cost_usd += fix_result.cost_usd or 0.0
+        agent_result.cost_usd = (agent_result.cost_usd or 0.0) + (fix_result.cost_usd or 0.0)
+        agent_result.turns += fix_result.turns
+        agent_result.num_turns = (agent_result.num_turns or 0) + (fix_result.num_turns or 0)
+        if fix_result.session_id:
+            agent_result.session_id = fix_result.session_id
+        agent_result.status = fix_result.status
+        reconcile_agent_branch(setup.repo_dir, setup.branch)
+        ensure_committed(setup.repo_dir)
+        ensure_pushed(setup.repo_dir, setup.branch)
+        build_outcome = verify_build(setup.repo_dir, config.build_command)
+        fixup.history.append(build_outcome.passed)
+        log_round(fixup.rounds, max_rounds, build_outcome.passed)
+        progress.write_agent_milestone(
+            "fixup_round_result",
+            f"round={fixup.rounds}/{max_rounds} build={'pass' if build_outcome.passed else 'fail'}",
+        )
+        if build_outcome.passed:
+            fixup.stopped_reason = "build passed"
+            break
+    else:
+        fixup.stopped_reason = fixup.stopped_reason or "max fix-up rounds reached"
+    return build_outcome, agent_result, fixup
 
 
 def _apply_post_hook_gates(
@@ -1443,6 +1550,20 @@ def run_task(
                     post_span.set_attribute("safety_net.committed", safety_committed)
 
                     build_outcome = verify_build(setup.repo_dir, config.build_command)
+                    # Convergence (test_gated): hand a genuine failure back to the
+                    # agent's own session and re-verify, up to max_fixup_rounds.
+                    build_outcome, agent_result, fixup = _run_fixup_rounds(
+                        build_outcome,
+                        agent_result,
+                        workflow=_workflow,
+                        config=config,
+                        setup=setup,
+                        system_prompt=system_prompt,
+                        trajectory=trajectory,
+                        progress=progress,
+                        read_only=workflow_read_only,
+                    )
+                    post_span.set_attribute("convergence.fixup_rounds", fixup.rounds)
                     build_passed = build_outcome.passed
                     # Distinct diagnosis: a build that exceeded BUILD_VERIFY_TIMEOUT_S
                     # was KILLED, not failed — surface "timed out" rather than the
@@ -1497,6 +1618,24 @@ def run_task(
                         agent_result=agent_result,
                         strategy=ensure_pr_strategy,
                     )
+                    if pr_url and not workflow_read_only:
+                        # The platform's verdict in the PR even when the agent
+                        # opened it (ensure_pr then returns early, leaving only
+                        # the agent's own body).
+                        upsert_verification_section(
+                            setup.repo_dir,
+                            pr_url,
+                            config,
+                            render_verification_section(
+                                config,
+                                build_passed,
+                                lint_passed,
+                                build_inert=build_inert,
+                                fixup_rounds=fixup.rounds,
+                                fixup_history=fixup.history,
+                                agent_result=agent_result,
+                            ),
+                        )
                     post_span.set_attribute("build.passed", build_passed)
                     post_span.set_attribute("lint.passed", lint_passed)
                     post_span.set_attribute("pr.url", pr_url or "")

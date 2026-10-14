@@ -67,6 +67,21 @@ class VerifyOutcome:
     timed_out: bool = False
     inert: bool = False
     infra_failed: bool = False
+    # Last lines of a GENUINE failure's output (stdout+stderr), so the
+    # convergence loop can hand the agent what actually broke. Empty otherwise.
+    output_tail: str = ""
+
+
+# How much of a failing verify command's output the fix-up turn sees.
+VERIFY_OUTPUT_TAIL_LINES = int(os.environ.get("VERIFY_OUTPUT_TAIL_LINES") or 150)
+
+
+def _output_tail(
+    result: subprocess.CompletedProcess, max_lines: int = VERIFY_OUTPUT_TAIL_LINES
+) -> str:
+    """Last ``max_lines`` lines of a command's combined output."""
+    text = (getattr(result, "stdout", "") or "") + (getattr(result, "stderr", "") or "")
+    return "\n".join(text.rstrip().splitlines()[-max_lines:])
 
 
 # POSIX shell exit code for "command not found" — an inert build signal (the
@@ -231,7 +246,7 @@ def _run_verify(repo_dir: str, command: str, default: str, label: str) -> Verify
             )
             return VerifyOutcome(passed=False, inert=True)
         log("POST", f"Post-agent {label} FAILED (exit {result.returncode})")
-        return VerifyOutcome(passed=False)
+        return VerifyOutcome(passed=False, output_tail=_output_tail(result))
     log("POST", f"Post-agent {label}: OK")
     return VerifyOutcome(passed=True)
 
@@ -817,3 +832,97 @@ def _extract_agent_notes(repo_dir: str, branch: str, config: TaskConfig) -> str 
         log("WARN", f"Failed to extract agent notes from PR body: {type(e).__name__}: {e}")
         # nosemgrep: py-silent-success-masking -- PR body notes optional; extraction failure logged
         return None
+
+
+VERIFICATION_START = "<!-- abca-verification:start -->"
+VERIFICATION_END = "<!-- abca-verification:end -->"
+
+
+def render_verification_section(
+    config: TaskConfig,
+    build_passed: bool,
+    lint_passed: bool,
+    *,
+    build_inert: bool = False,
+    fixup_rounds: int = 0,
+    fixup_history: list[bool] | None = None,
+    agent_result: AgentResult | None = None,
+) -> str:
+    """The platform's own ``## Verification`` block, between stable markers.
+
+    Unlike the body ``ensure_pr`` writes on create, this is upserted into
+    whatever PR exists, so the platform's verdict is visible even when the
+    agent opened the PR itself (its body is otherwise whatever the agent wrote).
+    """
+    build_label = (config.build_command or DEFAULT_BUILD_COMMAND).strip()
+    lint_label = (config.lint_command or DEFAULT_LINT_COMMAND).strip()
+    if build_inert:
+        build_status = "NOT VERIFIED (command could not run)"
+    else:
+        build_status = "PASS" if build_passed else "FAIL"
+    lines = [
+        VERIFICATION_START,
+        "## Verification (ABCA platform)",
+        "",
+        f"- `{build_label}` (post-agent): **{build_status}**",
+        f"- `{lint_label}` (post-agent): **{'PASS' if lint_passed else 'FAIL'}**",
+    ]
+    if fixup_rounds:
+        history = ", ".join("PASS" if ok else "FAIL" for ok in (fixup_history or []))
+        lines.append(
+            f"- Convergence: **{fixup_rounds}** fix-up round(s) after a failing build"
+            + (f" (results: {history})" if history else "")
+        )
+    if agent_result and agent_result.cost_usd is not None:
+        lines.append(f"- Agent cost: **${agent_result.cost_usd:.4f}**")
+    lines.append(VERIFICATION_END)
+    return "\n".join(lines)
+
+
+def upsert_verification_section(
+    repo_dir: str, pr_url: str, config: TaskConfig, section: str
+) -> bool:
+    """Replace (or append) the marked verification block in the PR body. Best-effort."""
+    try:
+        view = subprocess.run(
+            ["gh", "pr", "view", pr_url, "--json", "body", "-q", ".body"],
+            cwd=repo_dir,
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+        if view.returncode != 0:
+            log(
+                "WARN", f"verification upsert: could not read PR body ({view.stderr.strip()[:200]})"
+            )
+            return False
+        body = view.stdout.rstrip("\n")
+        if VERIFICATION_START not in body and "(post-agent): **" in body:
+            # ensure_pr wrote this body on create; it already carries the verdict.
+            return True
+        pattern = re.compile(
+            re.escape(VERIFICATION_START) + r".*?" + re.escape(VERIFICATION_END), re.DOTALL
+        )
+        new_body = (
+            pattern.sub(lambda _m: section, body)
+            if pattern.search(body)
+            else f"{body}\n\n{section}\n"
+        )
+        if new_body == body:
+            return True
+        edit = subprocess.run(
+            ["gh", "pr", "edit", pr_url, "--body", new_body],
+            cwd=repo_dir,
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+        if edit.returncode != 0:
+            log("WARN", f"verification upsert: gh pr edit failed ({edit.stderr.strip()[:200]})")
+            return False
+        log("POST", "Verification section written to the PR body")
+        return True
+    except Exception as e:
+        log("WARN", f"verification upsert failed: {type(e).__name__}: {e}")
+        # nosemgrep: py-silent-success-masking -- best-effort PR body annotation; failure logged
+        return False

@@ -180,6 +180,10 @@ class Convergence(BaseModel):
     required_sensors: list[ConvergenceSensor] | None = Field(default=None, min_length=1)
     terminal_outcomes: list[ConvergenceTerminalOutcome]
     early_exit: ConvergenceEarlyExit | None = None
+    # test_gated only: how many times a GENUINELY failing verify_build is fed
+    # back to the agent (resuming its session) before the task is finalized.
+    # 0 keeps the v1 behaviour (report-only gate).
+    max_fixup_rounds: int = Field(default=0, ge=0, le=5)
 
 
 class Limits(BaseModel):

@@ -519,8 +519,15 @@ async def run_agent(
     config: TaskConfig,
     cwd: str = AGENT_WORKSPACE,
     trajectory: _TrajectoryWriter | None = None,
+    resume_session_id: str | None = None,
+    max_budget_usd: float | None = None,
 ) -> AgentResult:
-    """Invoke the Claude Agent SDK and stream output."""
+    """Invoke the Claude Agent SDK and stream output.
+
+    ``resume_session_id`` continues an earlier session (the convergence fix-up
+    turn keeps the agent's full context); ``max_budget_usd`` overrides the
+    task budget for this call (the fix-up gets what the first call left).
+    """
     from claude_agent_sdk import (
         AssistantMessage,
         ClaudeAgentOptions,
@@ -626,9 +633,10 @@ async def run_agent(
         max_turns=config.max_turns,
         setting_sources=_resolve_setting_sources(config),
         hooks=hooks,
-        max_budget_usd=config.max_budget_usd,
+        max_budget_usd=max_budget_usd if max_budget_usd is not None else config.max_budget_usd,
         stderr=_on_stderr,
-        # factory-eval local patch: the SDK's default 1 MiB stream buffer kills the session as soon as
+        **({"resume": resume_session_id} if resume_session_id else {}),
+        # factory-eval local patch: the SDK default 1 MiB stream buffer kills the session as soon as
         # the CLI echoes an Edit of a >1 MiB file (aidlc-lib.ts is 1.16 MB). Raise it to 64 MiB.
         max_buffer_size=64 * 1024 * 1024,
         **({"mcp_servers": mcp_servers} if mcp_servers else {}),
