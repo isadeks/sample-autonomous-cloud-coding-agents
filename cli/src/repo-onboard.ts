@@ -19,6 +19,7 @@
 
 import { PutCommand, UpdateCommand } from '@aws-sdk/lib-dynamodb';
 import { documentClient } from './dynamo-clients';
+import { CliError } from './errors';
 import {
   LambdaMicrovmProbeClientFactory,
   requireLambdaMicrovmAvailability,
