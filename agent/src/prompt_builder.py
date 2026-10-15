@@ -74,6 +74,13 @@ def build_system_prompt(
         n = len(overrides)
         log("TASK", f"Applied system prompt overrides ({n} chars)")
 
+    # Agent-written UI checks (per-repo ui_checks_dir): only for workflows that
+    # change code — a read-only review has nothing to demonstrate.
+    if not config.read_only and getattr(config, "ui_checks_dir", ""):
+        from prompts.ui_check import ui_check_addendum
+
+        system_prompt += ui_check_addendum(config.ui_checks_dir)
+
     # Channel-specific guidance (appended last so channel instructions sit
     # close to the end of the prompt, where the model weights recency).
     channel_addendum = _channel_prompt_addendum(config)

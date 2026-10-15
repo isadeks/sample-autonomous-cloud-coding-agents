@@ -204,7 +204,9 @@ describe('hydrateAndTransition', () => {
       compute_type: 'agentcore',
       ci_wait_timeout_s: 2700,
       ci_required_checks: ['AWS CodeBuild us-east-1 (ci)', 'deployment:Preview'],
+      ui_checks_dir: '.abca/ui-checks',
     } as any);
+    expect(payload.ui_checks_dir).toBe('.abca/ui-checks');
     expect(payload.ci_wait_timeout_s).toBe(2700);
     expect(payload.ci_required_checks).toEqual(['AWS CodeBuild us-east-1 (ci)', 'deployment:Preview']);
   });
@@ -215,6 +217,7 @@ describe('hydrateAndTransition', () => {
     const payload = await hydrateAndTransition(baseTask as any, { compute_type: 'agentcore', ci_required_checks: [] } as any);
     expect(payload).not.toHaveProperty('ci_wait_timeout_s');
     expect(payload).not.toHaveProperty('ci_required_checks');
+    expect(payload).not.toHaveProperty('ui_checks_dir');
   });
 
   test('omits trace from payload when task record has no trace flag (slim wire)', async () => {

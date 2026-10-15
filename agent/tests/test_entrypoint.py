@@ -309,6 +309,30 @@ class TestDiscoverProjectConfig:
 
 
 class TestBuildSystemPrompt:
+    def _cfg(self, **kw):
+        return TaskConfig(
+            repo_url="owner/repo",
+            task_id="t123",
+            max_turns=50,
+            github_token="ghp_test",
+            aws_region="us-east-1",
+            **kw,
+        )
+
+    _setup = RepoSetup(repo_dir="/workspace/t123", branch="b", default_branch="main")
+
+    def test_ui_check_section_when_repo_sets_ui_checks_dir(self):
+        result = _build_system_prompt(
+            self._cfg(ui_checks_dir=".abca/ui-checks"), self._setup, None, ""
+        )
+        assert "## UI check for your change" in result
+        assert ".abca/ui-checks/<short-slug>.spec.ts" in result
+
+    def test_no_ui_check_section_by_default_or_read_only(self):
+        assert "## UI check" not in _build_system_prompt(self._cfg(), self._setup, None, "")
+        ro = self._cfg(ui_checks_dir=".abca/ui-checks", read_only=True)
+        assert "## UI check" not in _build_system_prompt(ro, self._setup, None, "")
+
     def test_placeholder_substitution(self):
         config = TaskConfig(
             repo_url="owner/repo",

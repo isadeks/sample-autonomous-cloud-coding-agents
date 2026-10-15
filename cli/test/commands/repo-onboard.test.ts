@@ -202,6 +202,7 @@ describe('repo onboard/offboard', () => {
       lintCommand: 'true',
       ciWaitTimeoutS: 2700,
       ciRequiredChecks: ['AWS CodeBuild us-east-1 (ci)', 'deployment:Preview'],
+      uiChecksDir: '/.abca/ui-checks/',
     });
 
     const item = (ddbSend.mock.calls[0][0] as PutCommand).input.Item!;
@@ -209,6 +210,12 @@ describe('repo onboard/offboard', () => {
     expect(item.lint_command).toBe('true');
     expect(item.ci_wait_timeout_s).toBe(2700);
     expect(item.ci_required_checks).toEqual(['AWS CodeBuild us-east-1 (ci)', 'deployment:Preview']);
+    expect(item.ui_checks_dir).toBe('.abca/ui-checks');
+  });
+
+  test('onboardRepo rejects a UI checks dir outside the repo', async () => {
+    await expect(onboardRepo('us-east-1', 'RepoTable', 'acme/a', { uiChecksDir: '../x' })).rejects.toThrow(CliError);
+    expect(ddbSend).not.toHaveBeenCalled();
   });
 
   test('onboardRepo clears CI wait with 0 and required checks with an empty list', async () => {

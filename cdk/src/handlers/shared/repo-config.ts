@@ -57,6 +57,9 @@ export interface RepoConfig {
   /** Check names that must all report green (e.g. a CI status context and
    *  ``deployment:Preview``) before the PR counts as converged. */
   readonly ci_required_checks?: string[];
+  /** Repo-relative folder where the agent commits Playwright UI checks that the
+   *  repo's CD runs against the PR preview (absent = no UI check asked). */
+  readonly ui_checks_dir?: string;
   readonly egress_allowlist?: string[];
   readonly cedar_policies?: string[];
   /**
@@ -108,6 +111,9 @@ export interface BlueprintConfig {
   /** Check names that must all report green (e.g. a CI status context and
    *  ``deployment:Preview``) before the PR counts as converged. */
   readonly ci_required_checks?: string[];
+  /** Repo-relative folder where the agent commits Playwright UI checks that the
+   *  repo's CD runs against the PR preview (absent = no UI check asked). */
+  readonly ui_checks_dir?: string;
   readonly egress_allowlist?: string[];
   readonly cedar_policies?: string[];
   /**

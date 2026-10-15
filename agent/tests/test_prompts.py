@@ -351,3 +351,32 @@ class TestCrossLanguageHashParity:
         for v in vectors:
             actual = hashlib.sha256(v["input"].encode("utf-8")).hexdigest()
             assert actual == v["sha256"], f"Hash mismatch for: {v['note']}"
+
+
+class TestUiCheckAddendum:
+    """Per-repo ui_checks_dir asks the agent for a Playwright UI check of its change."""
+
+    def test_off_by_default(self):
+        from prompts.ui_check import ui_check_addendum
+
+        assert ui_check_addendum("") == ""
+        assert ui_check_addendum("  /  ") == ""
+
+    def test_contract_names_dir_and_env(self):
+        from prompts.ui_check import ui_check_addendum
+
+        text = ui_check_addendum(".abca/ui-checks/")
+        assert "`.abca/ui-checks/<short-slug>.spec.ts`" in text
+        for var in (
+            "PREVIEW_URL",
+            "PREVIEW_API_URL",
+            "PREVIEW_ADMIN_EMAIL",
+            "PREVIEW_ADMIN_PASSWORD",
+            "UI_CHECK_ASSETS",
+            "PREVIEW_IMPORT_DIR",
+            "UI_CHECK_SHOTS",
+        ):
+            assert var in text
+        assert (
+            "${process.env.UI_CHECK_SHOTS}/01-before-delete.png" in text
+        )  # braces survived format()

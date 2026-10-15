@@ -182,6 +182,9 @@ class TaskConfig(BaseModel):
     # Checks that must all report green (status context / check name /
     # "deployment:<env>") before the PR counts as converged.
     ci_required_checks: list[str] = Field(default_factory=list)
+    # Repo-relative folder for agent-written Playwright UI checks run by CD on the
+    # PR preview ("" = off). See prompts/ui_check.py.
+    ui_checks_dir: str = ""
     # The pinned workflow this task runs ({"id", "version"}), resolved at the
     # create-task boundary and threaded through the payload. None on local/batch
     # runs, where the pipeline defaults to coding/new-task-v1.

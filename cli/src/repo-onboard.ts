@@ -52,6 +52,8 @@ export interface OnboardRepoOptions {
   readonly ciWaitTimeoutS?: number;
   /** Checks that must all report green, e.g. a CI status context and `deployment:Preview`. */
   readonly ciRequiredChecks?: string[];
+  /** Folder for agent-written Playwright UI checks run by CD on the PR preview ('' clears). */
+  readonly uiChecksDir?: string;
 }
 
 export interface OnboardRepoDependencies {
@@ -140,6 +142,12 @@ export async function onboardRepo(
     }
     if (options.ciWaitTimeoutS === 0) delete item.ci_wait_timeout_s;
     else item.ci_wait_timeout_s = options.ciWaitTimeoutS;
+  }
+  if (options.uiChecksDir !== undefined) {
+    const dir = options.uiChecksDir.trim().replace(/^\/+|\/+$/g, '');
+    if (dir.split('/').includes('..')) throw new CliError('--ui-checks-dir must stay inside the repository');
+    if (dir) item.ui_checks_dir = dir;
+    else delete item.ui_checks_dir;
   }
   if (options.ciRequiredChecks !== undefined) {
     if (options.ciRequiredChecks.length) item.ci_required_checks = options.ciRequiredChecks;
