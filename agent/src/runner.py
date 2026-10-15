@@ -312,13 +312,14 @@ def _initialize_policy_engine_and_hooks(
     # DEFAULT_APPROVAL_GATE_CAP.
     if config.approval_gate_cap is not None:
         engine_kwargs["approval_gate_cap"] = config.approval_gate_cap
+    files_at_base = _files_at_base(cwd, config.base_branch or "") if cwd else frozenset()
     policy_engine = PolicyEngine(
         task_type=config.policy_principal,
         repo=config.repo_url,
         read_only=config.read_only,
         extra_policies=cedar_policies if cedar_policies else None,
         repo_root=cwd,
-        files_at_base=_files_at_base(cwd, config.base_branch or "") if cwd else None,
+        files_at_base=files_at_base,
         **engine_kwargs,
     )
     # Surface the resolved cap + its source so operators can distinguish a
@@ -355,6 +356,13 @@ def _initialize_policy_engine_and_hooks(
         scopes=list(config.initial_approvals),
     )
 
+    # Shell commands bypass the Edit/Write approval gate for existing tests; the
+    # guard restores such changes after each Bash call (read-only tasks write nothing).
+    test_guard = None
+    if cwd and files_at_base and not config.read_only:
+        from test_guard import ExistingTestGuard
+
+        test_guard = ExistingTestGuard(cwd, files_at_base)
     hooks = build_hook_matchers(
         engine=policy_engine,
         trajectory=trajectory,
@@ -362,6 +370,7 @@ def _initialize_policy_engine_and_hooks(
         progress=progress,
         user_id=config.user_id or "",
         repo_url=config.repo_url or "",
+        test_guard=test_guard,
     )
     return policy_engine, hooks
 

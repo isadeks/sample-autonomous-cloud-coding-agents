@@ -2239,6 +2239,7 @@ Built-in policies shipped with the agent:
 - `write_env_files` — `like "*.env"` — high, 600s
 - `write_credentials` — `like "*credentials*"` — high, 300s
 - `modify_existing_test` — Write/Edit of a test file or test config that exists on the PR's base (`context.existing_file`) — medium, 600s
+  - Shell commands are not matched by text (that is leaky). Instead the agent's PostToolUse hook runs an `ExistingTestGuard` (`agent/src/test_guard.py`) after every Bash call: protected test files (same globs as the rule; drift-tested) changed since the round started are restored to their base content, or to content a human approved through this gate, and the agent is told to use the Edit tool or to add tests in new files. A milestone `existing_test_edit_restored` records it.
 
 Users who want fully autonomous execution (no approval gates) pass `--pre-approve all_session --yes` at submit. Repos that want additional gates add them via `Blueprint.security.cedarPolicies.soft`. Repos that want a different policy set can override specific built-in **soft-deny** rules by `@rule_id` via the blueprint's `security.cedarPolicies.disable` list. The `disable:` mechanism is restricted: it may NOT include any built-in hard-deny rule_id, and the blueprint loader rejects such configurations at task start.
 

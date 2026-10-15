@@ -35,6 +35,7 @@ from policy import APPROVAL_RATE_LIMIT, FLOOR_TIMEOUT_S, Outcome
 from progress_writer import _generate_ulid
 from shell import log, log_error_cw
 from stuck_guard import StuckGuard
+from test_guard import REVERT_NOTICE, ExistingTestGuard
 
 if TYPE_CHECKING:
     from policy import PolicyEngine
@@ -1717,6 +1718,37 @@ async def stop_hook(
     return {"decision": "block", "reason": reason}
 
 
+def _apply_test_guard(
+    guard: ExistingTestGuard, hook_input: Any, result: dict, progress: Any
+) -> None:
+    """After a tool call: accept approved Edit/Write content, undo shell edits to existing tests.
+
+    Mutates ``result`` (the PostToolUse response) to tell the agent what was restored.
+    """
+    if not isinstance(hook_input, dict):
+        return
+    tool_name = hook_input.get("tool_name", "")
+    tool_input = hook_input.get("tool_input") or {}
+    if tool_name in ("Write", "Edit") and isinstance(tool_input, dict):
+        guard.record_tool_write(str(tool_input.get("file_path", "")))
+        return
+    if tool_name != "Bash":
+        return
+    restored = guard.after_shell()
+    if not restored:
+        return
+    _try_progress(
+        progress,
+        "write_agent_milestone",
+        milestone="existing_test_edit_restored",
+        details=", ".join(restored)[:500],
+    )
+    notice = REVERT_NOTICE.format(files=", ".join(f"`{p}`" for p in restored))
+    result.setdefault("hookSpecificOutput", {"hookEventName": "PostToolUse"})[
+        "additionalContext"
+    ] = notice
+
+
 def build_hook_matchers(
     engine: PolicyEngine,
     trajectory: _TrajectoryWriter | None = None,
@@ -1724,6 +1756,7 @@ def build_hook_matchers(
     progress: Any = None,
     user_id: str = "",
     repo_url: str = "",
+    test_guard: ExistingTestGuard | None = None,
 ) -> dict:
     """Build hook matchers dict for ClaudeAgentOptions.
 
@@ -1802,6 +1835,8 @@ def build_hook_matchers(
                 progress=progress,
                 stuck_guard=_stuck_guard,
             )
+            if test_guard is not None:
+                _apply_test_guard(test_guard, hook_input, result, progress)
             return SyncHookJSONOutput(**result)
         except Exception as exc:
             log("ERROR", f"PostToolUse wrapper crashed: {type(exc).__name__}: {exc}")
