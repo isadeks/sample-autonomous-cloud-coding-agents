@@ -253,9 +253,10 @@ def _run_rounds(results, *, ci_wait_timeout_s=1800, shas=("s1", "s2", "s3", "s4"
         patch("ci_wait.ci_comments_for", return_value=["<!-- feval-ci sha=s1 result=fail -->"]),
         patch("runner.run_agent", run_agent),
         patch("pipeline._head_sha", side_effect=list(shas)),
+        patch("pipeline._pr_head_sha", return_value=""),
         patch("pipeline.reconcile_agent_branch"),
         patch("pipeline.ensure_committed"),
-        patch("pipeline.ensure_pushed"),
+        patch("pipeline.ensure_pushed") as pushed,
         patch("pipeline.task_state.get_task", return_value={"status": "RUNNING"}),
     ):
         out_agent, ci = _run_ci_rounds(
@@ -268,10 +269,43 @@ def _run_rounds(results, *, ci_wait_timeout_s=1800, shas=("s1", "s2", "s3", "s4"
             trajectory=None,
             progress=MagicMock(),
         )
+    if ci_wait_timeout_s:
+        pushed.assert_called()  # always push before waiting
     return out_agent, ci, run_agent, waited
 
 
 class TestCiRounds:
+    def test_waits_on_the_prs_head_from_github_not_local_head(self):
+        config = SimpleNamespace(
+            ci_wait_timeout_s=600,
+            ci_required_checks=[],
+            repo_url="o/r",
+            task_id="t",
+            max_budget_usd=None,
+        )
+        setup = RepoSetup(repo_dir="/w/repo", branch="b")
+        agent = AgentResult(status="success", session_id="s")
+        green = CiResult("pass", "remote1", [_chk("ci", "success")])
+        with (
+            patch("ci_wait.wait_for_ci", return_value=green) as waited,
+            patch("pipeline._pr_head_sha", return_value="remote1") as pr_head,
+            patch("pipeline._head_sha", return_value="local-unpushed"),
+            patch("pipeline.ensure_pushed") as pushed,
+        ):
+            _run_ci_rounds(
+                agent,
+                workflow=_wf(),
+                config=config,
+                setup=setup,
+                pr_url="https://github.com/o/r/pull/9",
+                system_prompt="s",
+                trajectory=None,
+                progress=MagicMock(),
+            )
+        pushed.assert_called_once_with("/w/repo", "b")
+        pr_head.assert_called_once_with("o/r", "9", "/w/repo")
+        assert waited.call_args.args[1] == "remote1"
+
     def test_off_by_default(self):
         _a, ci, run_agent, _w = _run_rounds([], ci_wait_timeout_s=0)
         assert ci is None

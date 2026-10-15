@@ -548,6 +548,32 @@ def _head_sha(repo_dir: str) -> str:
     return r.stdout.strip()
 
 
+def _pr_head_sha(repo: str, pr_number: str, repo_dir: str) -> str:
+    """The PR's head commit as GitHub sees it ("" if it can't be read)."""
+    if not pr_number:
+        return ""
+    r = subprocess.run(
+        [
+            "gh",
+            "pr",
+            "view",
+            pr_number,
+            "--repo",
+            repo,
+            "--json",
+            "headRefOid",
+            "-q",
+            ".headRefOid",
+        ],
+        cwd=repo_dir,
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=60,
+    )
+    return r.stdout.strip() if r.returncode == 0 else ""
+
+
 def _run_ci_rounds(
     agent_result,
     *,
@@ -595,7 +621,11 @@ def _run_ci_rounds(
 
     deadline = time.monotonic() + timeout_s
     while True:
-        sha = _head_sha(setup.repo_dir)
+        # Wait on what CI actually builds: push anything local first (the
+        # safety-net commit can land after the agent's own push when the agent
+        # opened the PR itself), then take the PR's head SHA from GitHub.
+        ensure_pushed(setup.repo_dir, setup.branch)
+        sha = _pr_head_sha(config.repo_url, pr_number, setup.repo_dir) or _head_sha(setup.repo_dir)
         progress.write_agent_milestone("ci_wait_started", f"sha={sha[:9]} round={ci.rounds}")
         log(
             "POST",
