@@ -45,7 +45,7 @@ import { GetCommand } from '@aws-sdk/lib-dynamodb';
 import { ulid } from 'ulid';
 import { resolveGitHubToken } from './shared/context-hydration';
 import { createTaskCore } from './shared/create-task-core';
-import { ABCA_BRANCH, type GitHubCommentTrigger } from './shared/github-comment-trigger';
+import { ABCA_BRANCH, ABCA_COMMENT_TAG, type GitHubCommentTrigger } from './shared/github-comment-trigger';
 import { logger } from './shared/logger';
 import { loadRepoConfig } from './shared/repo-config';
 import { makeDocClient } from './shared/ua';
@@ -59,7 +59,6 @@ const WRITE_PERMISSIONS = new Set(['admin', 'maintain', 'write']);
 export type CommentTriggerResult = { readonly status: string; readonly task_id?: string };
 
 /** Login behind each token, cached for the Lambda's lifetime (a rotated token is looked up again). */
-const tokenLogins = new Map<string, string>();
 
 async function github(token: string, method: string, path: string, body?: unknown): Promise<Response> {
   return fetch(`https://api.github.com${path}`, {
@@ -77,21 +76,11 @@ async function github(token: string, method: string, path: string, body?: unknow
 }
 
 async function reply(token: string, repo: string, prNumber: number, text: string): Promise<void> {
-  const res = await github(token, 'POST', `/repos/${repo}/issues/${prNumber}/comments`, { body: text });
+  const body = `${ABCA_COMMENT_TAG}\n${text}`;
+  const res = await github(token, 'POST', `/repos/${repo}/issues/${prNumber}/comments`, { body });
   if (!res.ok) {
     logger.warn('PR comment trigger: reply failed', { repo, pr_number: prNumber, status: res.status });
   }
-}
-
-async function tokenLogin(token: string): Promise<string> {
-  const cached = tokenLogins.get(token);
-  if (cached) return cached;
-  const res = await github(token, 'GET', '/user');
-  if (!res.ok) throw new Error(`GitHub GET /user failed (HTTP ${res.status})`);
-  const login = ((await res.json()) as { login?: string }).login ?? '';
-  if (!login) throw new Error('GitHub GET /user returned no login');
-  tokenLogins.set(token, login);
-  return login;
 }
 
 async function hasWriteAccess(token: string, repo: string, login: string): Promise<boolean> {
@@ -113,9 +102,6 @@ export async function handler(event: GitHubCommentTrigger): Promise<CommentTrigg
   const secretArn = repoConfig?.github_token_secret_arn ?? platformSecretArn;
   const token = await resolveGitHubToken(secretArn);
 
-  if (author.toLowerCase() === (await tokenLogin(token)).toLowerCase()) {
-    return { status: 'skipped:self_comment' };
-  }
   if (!await hasWriteAccess(token, repo, author)) {
     logger.info('PR comment trigger: commenter lacks write access', { repo, pr_number: prNumber, author });
     return { status: 'skipped:insufficient_permission' };

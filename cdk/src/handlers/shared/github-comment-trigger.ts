@@ -21,7 +21,7 @@
  * Pure gate for the `@bgagent` GitHub PR-comment trigger, shared by the webhook
  * receiver (cheap pre-filter, no I/O) and the trigger handler
  * (github-comment-task.ts), which does the authoritative checks: the
- * commenter's repository permission, the token's own login, and the PR.
+ * commenter's repository permission, and the PR; ABCA's own comments carry ABCA_COMMENT_TAG and are ignored.
  */
 
 /**
@@ -34,6 +34,12 @@ const CANDIDATE_ASSOCIATIONS = new Set(['OWNER', 'MEMBER', 'COLLABORATOR']);
 const MENTION = /(^|\s)@bgagent\b/i;
 export const ABCA_BRANCH = /^bgagent\/([0-9A-HJKMNP-TV-Z]{26})\//;
 const MAX_INSTRUCTION_CHARS = 4000;
+/**
+ * Hidden tag on every comment ABCA itself posts (trigger replies, agent answers).
+ * Self-loop protection keys on it rather than on the author: the platform token
+ * may belong to the same GitHub user who steers ABCA with `@bgagent` comments.
+ */
+export const ABCA_COMMENT_TAG = '<!-- abca:comment -->';
 
 /** What the receiver hands the trigger handler (an async Lambda invoke). */
 export interface GitHubCommentTrigger {
@@ -87,6 +93,7 @@ export function decideTrigger(payload: IssueCommentPayload): TriggerDecision {
   if (payload.action !== 'created') return { ok: false, reason: 'not_created' };
   if (!payload.issue?.pull_request) return { ok: false, reason: 'not_a_pull_request' };
   const c = payload.comment;
+  if ((c?.body ?? '').includes(ABCA_COMMENT_TAG)) return { ok: false, reason: 'platform_comment' };
   const text = addressableText(c?.body ?? '');
   if (!MENTION.test(text)) return { ok: false, reason: 'no_mention' };
   if (c?.user?.type === 'Bot') return { ok: false, reason: 'bot_author' };

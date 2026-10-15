@@ -54,7 +54,7 @@ See also: [Using the CLI — operator commands](../guides/USER_GUIDE.md#operator
 
 A comment containing `@bgagent <instruction>` on an open ABCA pull request (head branch `bgagent/<task_id>/…` in the same repository) starts a `coding/pr-iteration-v1` task with the instruction as its description. The repository's GitHub webhook (the one `bgagent github webhook-info` prints) must subscribe to **Issue comments** in addition to its screenshot events.
 
-- **Who can trigger:** only commenters with write, maintain or admin permission on the repository. Bot accounts, the platform's own token user and quoted text are ignored. Pull requests from forks are rejected.
+- **Who can trigger:** only commenters with write, maintain or admin permission on the repository. Bot accounts, quoted text and code are ignored, and so is every comment ABCA posts itself: those carry a hidden `<!-- abca:comment -->` tag. The tag is used instead of the author because the platform token can belong to the same GitHub user who writes the `@bgagent` comments. Pull requests from forks are rejected.
 - **Whose task it is:** the iteration runs as the user who owns the PR's original task, against that user's budget. There is no GitHub-to-ABCA user mapping yet.
 - **What it does:** the receiver verifies the HMAC and dedups per comment; the instruction is screened by the input guardrail like any task description; ABCA replies on the PR with the task id.
 - PR iteration checks whether the PR is behind its base; if merging the base conflicts, resolving the conflicts becomes part of the task.

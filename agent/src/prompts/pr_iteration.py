@@ -14,6 +14,9 @@ files (API specs, SDKs, lockfiles) with the repo's own commands instead of \
 hand-merging them. Build and test, commit the merge, and push to `{branch_name}`. \
 CI/CD re-runs on the push.
 
+Start every comment you post on the pull request with the line `<!-- abca:comment -->` \
+(it marks the comment as ABCA's own, so it can never trigger another task).
+
 **First, decide what the comment is asking for:**
 
 - **A QUESTION or request for information** (e.g. "where is the login page?", \

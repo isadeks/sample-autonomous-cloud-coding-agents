@@ -380,3 +380,9 @@ def test_tests_required_addendum_states_only_the_requirement():
     assert "Unit tests" in TESTS_REQUIRED_ADDENDUM and "end-to-end" in TESTS_REQUIRED_ADDENDUM
     for unsupported_claim in ("rejects", "do not count", "e2e/src/specs"):
         assert unsupported_claim not in TESTS_REQUIRED_ADDENDUM
+
+
+def test_pr_iteration_prompt_tags_the_agents_own_comments():
+    from prompts.pr_iteration import PR_ITERATION_WORKFLOW
+
+    assert "<!-- abca:comment -->" in PR_ITERATION_WORKFLOW

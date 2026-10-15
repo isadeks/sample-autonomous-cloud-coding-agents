@@ -40,7 +40,7 @@ process.env.TASK_TABLE_NAME = 'Tasks';
 process.env.GITHUB_TOKEN_SECRET_ARN = 'arn:aws:secretsmanager:us-east-1:1:secret:gh';
 
 import { handler } from '../../src/handlers/github-comment-task';
-import { addressableText, decideTrigger, type GitHubCommentTrigger } from '../../src/handlers/shared/github-comment-trigger';
+import { ABCA_COMMENT_TAG, addressableText, decideTrigger, type GitHubCommentTrigger } from '../../src/handlers/shared/github-comment-trigger';
 
 const ORIGIN = '01M4YGVR62SHKJPEFZQN716HRP';
 const payload = (o: Record<string, unknown> = {}) => ({
@@ -185,11 +185,22 @@ describe('github-comment-task handler', () => {
     expect((await handler(trigger())).status).toBe('skipped:insufficient_permission');
   });
 
-  test('ignores comments posted with the platform\'s own token (no self-trigger loop)', async () => {
-    resolveGitHubToken.mockResolvedValueOnce('ghp_other_token'); // not cached yet
+  test('a comment by the token owner still triggers (the platform token may be the human\'s)', async () => {
     github(happyRoutes({ 'GET /user': json(200, { login: 'Sphia' }) }));
-    expect((await handler(trigger({ author: 'sphia' }))).status).toBe('skipped:self_comment');
-    expect(createTaskCore).not.toHaveBeenCalled();
+    ddbSend.mockResolvedValueOnce({ Item: { task_id: ORIGIN, user_id: 'user-1', repo: 'o/r' } });
+    createTaskCore.mockResolvedValueOnce({ statusCode: 201, body: '{}' });
+    expect((await handler(trigger({ author: 'sphia' }))).status).toBe('created');
+  });
+
+  test('ABCA tags its own replies so they can never re-trigger it', async () => {
+    github(happyRoutes());
+    ddbSend.mockResolvedValueOnce({ Item: { task_id: ORIGIN, user_id: 'user-1', repo: 'o/r' } });
+    createTaskCore.mockResolvedValueOnce({ statusCode: 201, body: '{}' });
+    await handler(trigger());
+    expect(postedComments().length).toBeGreaterThan(0);
+    expect(postedComments().every((c) => c.startsWith(ABCA_COMMENT_TAG))).toBe(true);
+    const own = { ...payload(), comment: { ...payload().comment, body: `${ABCA_COMMENT_TAG}\n@bgagent quoted reply` } };
+    expect(decideTrigger(own)).toEqual({ ok: false, reason: 'platform_comment' });
   });
 
   test.each([
