@@ -185,6 +185,42 @@ def _assert_clone_root(repo_dir: str) -> None:
         )
 
 
+# file names listed in the setup note when setup churned tracked files
+_CHURN_SHOWN = 5
+
+
+def restore_setup_churn(repo_dir: str) -> list[str]:
+    """Revert tracked-file changes made by the platform's own setup steps.
+
+    Runs right after clone + ``mise install`` + baseline build, before the agent
+    starts, so anything modified here was changed by setup, not by the agent.
+    Returns setup notes (empty when the tree was already clean). Best-effort.
+    """
+    if not os.path.isdir(os.path.join(repo_dir, ".git")):
+        return []
+    diff = subprocess.run(
+        ["git", "diff", "--name-only"], cwd=repo_dir, capture_output=True, text=True, check=False
+    )
+    changed = [f for f in diff.stdout.splitlines() if f.strip()] if diff.returncode == 0 else []
+    if not changed:
+        return []
+    restore = subprocess.run(
+        ["git", "checkout", "--", *changed],
+        cwd=repo_dir,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if restore.returncode != 0:
+        err = restore.stderr.strip()[:200]
+        log("WARN", f"setup changed tracked files but restoring them failed: {err}")
+        return [f"setup modified tracked files (not restored): {', '.join(changed[:_CHURN_SHOWN])}"]
+    head, rest = changed[:_CHURN_SHOWN], len(changed) - _CHURN_SHOWN
+    shown = ", ".join(head) + (f" (+{rest} more)" if rest > 0 else "")
+    log("SETUP", f"Restored tracked files changed by setup: {shown}")
+    return [f"setup changes to tracked files reverted: {shown}"]
+
+
 def setup_repo(config: TaskConfig, progress: Any = None) -> RepoSetup:
     """Clone repo, create branch, configure git auth, run mise install.
 
@@ -598,6 +634,11 @@ def setup_repo(config: TaskConfig, progress: Any = None) -> RepoSetup:
 
     # Install prepare-commit-msg hook for code attribution
     _install_commit_hook(repo_dir)
+
+    # Setup must leave the tree clean: `mise install` and the baseline build can
+    # rewrite TRACKED files (observed: mise.lock re-sorted per platform), which the
+    # post-agent safety net then commits into the PR as unrelated churn.
+    notes.extend(restore_setup_churn(repo_dir))
 
     # Ensure the cloned HEAD sha is captured for NON-PR workflows too (the PR
     # branch above already set it). A read-only planner echoes this

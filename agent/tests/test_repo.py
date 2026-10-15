@@ -823,3 +823,47 @@ class TestCloneWorkspaceGuards:
 
         with pytest.raises(RuntimeError, match="git repository at the workspace root"):
             repo._assert_clone_root(str(repo_dir))
+
+
+class TestRestoreSetupChurn:
+    """Setup must not leave tracked-file changes for the safety net to commit (mise.lock churn)."""
+
+    def _repo(self, tmp_path):
+        import subprocess as sp
+
+        sp.run(["git", "init", "-q", str(tmp_path)], check=True)
+        (tmp_path / "mise.lock").write_text("a\n")
+        (tmp_path / "keep.txt").write_text("k\n")
+        sp.run(["git", "-C", str(tmp_path), "add", "-A"], check=True)
+        sp.run(
+            [
+                "git",
+                "-C",
+                str(tmp_path),
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@x",
+                "commit",
+                "-qm",
+                "i",
+            ],
+            check=True,
+        )
+        return tmp_path
+
+    def test_clean_tree_is_noop(self, tmp_path):
+        from repo import restore_setup_churn
+
+        assert restore_setup_churn(str(self._repo(tmp_path))) == []
+
+    def test_reverts_tracked_changes_but_keeps_untracked(self, tmp_path):
+        from repo import restore_setup_churn
+
+        repo = self._repo(tmp_path)
+        (repo / "mise.lock").write_text("re-sorted by mise install\n")
+        (repo / "node_modules.txt").write_text("untracked build output\n")
+        notes = restore_setup_churn(str(repo))
+        assert (repo / "mise.lock").read_text() == "a\n"
+        assert (repo / "node_modules.txt").exists()
+        assert notes == ["setup changes to tracked files reverted: mise.lock"]
