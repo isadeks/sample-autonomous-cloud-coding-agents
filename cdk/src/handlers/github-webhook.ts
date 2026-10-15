@@ -21,6 +21,7 @@ import { ConditionalCheckFailedException } from '@aws-sdk/client-dynamodb';
 import { InvokeCommand, LambdaClient } from '@aws-sdk/client-lambda';
 import { DeleteCommand, PutCommand } from '@aws-sdk/lib-dynamodb';
 import type { APIGatewayProxyEvent, APIGatewayProxyResult } from 'aws-lambda';
+import { decideTrigger } from './shared/github-comment-trigger';
 import {
   type GitHubDeploymentStatusPayload,
   type ProcessorEvent,
@@ -37,6 +38,8 @@ const lambdaClient = makeClient(LambdaClient);
 const WEBHOOK_SECRET_ARN = process.env.GITHUB_WEBHOOK_SECRET_ARN!;
 const DEDUP_TABLE_NAME = process.env.GITHUB_WEBHOOK_DEDUP_TABLE_NAME!;
 const PROCESSOR_FUNCTION_NAME = process.env.GITHUB_WEBHOOK_PROCESSOR_FUNCTION_NAME!;
+/** `@bgagent` PR-comment trigger Lambda (github-comment-task.ts); unset = comments ignored. */
+const COMMENT_TASK_FUNCTION_NAME = process.env.GITHUB_COMMENT_TASK_FUNCTION_NAME ?? '';
 
 /**
  * Dedup window. GitHub redelivers a webhook up to 5 times when our
@@ -88,6 +91,10 @@ export async function handler(event: APIGatewayProxyEvent): Promise<APIGatewayPr
     // operators don't think setup failed.
     if (eventType === 'ping') {
       return jsonResponse(200, { ok: true, ping: true });
+    }
+
+    if (eventType === 'issue_comment') {
+      return await handleIssueComment(event);
     }
 
     if (eventType !== 'deployment_status' && eventType !== 'check_run') {
@@ -238,4 +245,55 @@ function jsonResponse(statusCode: number, body: Record<string, unknown>): APIGat
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(body),
   };
+}
+
+/**
+ * `@bgagent <instruction>` on a PR → async invoke of the comment-trigger Lambda.
+ * The cheap payload gate runs here so ordinary comments never cost a Lambda
+ * invoke; the delivery id dedups GitHub retries (the trigger also passes an
+ * idempotency key per comment id to createTaskCore).
+ */
+async function handleIssueComment(event: APIGatewayProxyEvent): Promise<APIGatewayProxyResult> {
+  if (!COMMENT_TASK_FUNCTION_NAME) {
+    return jsonResponse(200, { ok: true, comment_trigger: 'disabled' });
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(event.body ?? '');
+  } catch {
+    return jsonResponse(400, { error: 'Invalid JSON' });
+  }
+  const decision = decideTrigger(parsed as Parameters<typeof decideTrigger>[0]);
+  if (!decision.ok) {
+    return jsonResponse(200, { ok: true, skipped: decision.reason });
+  }
+  const delivery = event.headers['X-GitHub-Delivery'] ?? event.headers['x-github-delivery'] ?? '';
+  try {
+    await ddb.send(new PutCommand({
+      TableName: DEDUP_TABLE_NAME,
+      Item: {
+        dedup_key: `comment#${decision.repo}#${decision.commentId}`,
+        created_at: new Date().toISOString(),
+        ttl: Math.floor(Date.now() / 1000) + DEDUP_TTL_SECONDS,
+      },
+      ConditionExpression: 'attribute_not_exists(dedup_key)',
+    }));
+  } catch (err) {
+    if (err instanceof ConditionalCheckFailedException) {
+      return jsonResponse(200, { ok: true, deduped: true });
+    }
+    throw err;
+  }
+  await lambdaClient.send(new InvokeCommand({
+    FunctionName: COMMENT_TASK_FUNCTION_NAME,
+    InvocationType: 'Event',
+    Payload: new TextEncoder().encode(JSON.stringify({ raw_body: event.body })),
+  }));
+  logger.info('PR comment trigger dispatched', {
+    repo: decision.repo,
+    pr_number: decision.prNumber,
+    comment_id: decision.commentId,
+    ...(/^[0-9a-f-]{36}$/i.test(delivery) && { delivery_id: delivery }),
+  });
+  return jsonResponse(202, { ok: true, comment_trigger: 'dispatched' });
 }

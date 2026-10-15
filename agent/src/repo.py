@@ -185,6 +185,58 @@ def _assert_clone_root(repo_dir: str) -> None:
         )
 
 
+def check_base_conflicts(repo_dir: str, base: str) -> list[str]:
+    """Trial-merge ``origin/<base>`` into the checked-out PR branch, then abort.
+
+    Leaves the tree exactly as checked out. Returns a setup note: nothing when the
+    branch already contains the base, "merges cleanly" when it is behind but
+    conflict-free, or the conflicting files. Best-effort (a git failure → no note).
+    """
+    if not os.path.isdir(os.path.join(repo_dir, ".git")):
+        return []
+    fetch = subprocess.run(
+        ["git", "fetch", "origin", base], cwd=repo_dir, capture_output=True, text=True, check=False
+    )
+    if fetch.returncode != 0:
+        return []
+    behind = subprocess.run(
+        ["git", "rev-list", "--count", f"HEAD..origin/{base}"],
+        cwd=repo_dir,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if behind.returncode != 0 or behind.stdout.strip() in ("", "0"):
+        return []
+    n = behind.stdout.strip()
+    trial = subprocess.run(
+        ["git", "merge", "--no-commit", "--no-ff", f"origin/{base}"],
+        cwd=repo_dir,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    conflicted: list[str] = []
+    if trial.returncode != 0:
+        unmerged = subprocess.run(
+            ["git", "diff", "--name-only", "--diff-filter=U"],
+            cwd=repo_dir,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        conflicted = [f for f in unmerged.stdout.splitlines() if f.strip()]
+    subprocess.run(["git", "merge", "--abort"], cwd=repo_dir, capture_output=True, check=False)
+    if not conflicted:
+        log("SETUP", f"PR branch is {n} commit(s) behind origin/{base}; merges cleanly")
+        return [f"This PR branch is {n} commit(s) behind `origin/{base}` and merges cleanly."]
+    log("SETUP", f"PR branch conflicts with origin/{base}: {', '.join(conflicted)}")
+    return [
+        f"MERGE CONFLICTS: this PR branch is {n} commit(s) behind `origin/{base}` and merging "
+        f"it conflicts in: {', '.join(conflicted)}. Resolve them as described in the workflow."
+    ]
+
+
 # file names listed in the setup note when setup churned tracked files
 _CHURN_SHOWN = 5
 
@@ -358,6 +410,16 @@ def setup_repo(config: TaskConfig, progress: Any = None) -> RepoSetup:
         # for them — only the restack path threads predecessors here.)
         for pred_branch in config.merge_branches:
             _merge_predecessor_branch(repo_dir, pred_branch, notes)
+        # A writable PR iteration on a PR that fell behind its base (e.g. a
+        # sibling PR merged first): record whether the base merges cleanly or
+        # which files conflict, so resolving it is part of the agent's job.
+        if (
+            not config.read_only
+            and not config.merge_branches
+            and os.path.isdir(os.path.join(repo_dir, ".git"))
+        ):
+            base = config.base_branch or detect_default_branch(config.repo_url, repo_dir)
+            notes.extend(check_base_conflicts(repo_dir, base))
     elif config.base_branch:
         # Stacked child. Branch from the predecessor's branch (linear) or from
         # the repo default (diamond) so the child sees predecessor code without

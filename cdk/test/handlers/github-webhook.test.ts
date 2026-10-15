@@ -50,6 +50,7 @@ jest.mock('../../src/handlers/shared/github-webhook-verify', () => ({
 process.env.GITHUB_WEBHOOK_SECRET_ARN = 'arn:aws:secretsmanager:us-east-1:123:secret:gh-webhook';
 process.env.GITHUB_WEBHOOK_DEDUP_TABLE_NAME = 'GhWebhookDedup';
 process.env.GITHUB_WEBHOOK_PROCESSOR_FUNCTION_NAME = 'gh-webhook-processor';
+process.env.GITHUB_COMMENT_TASK_FUNCTION_NAME = 'gh-comment-task';
 
 import { handler } from '../../src/handlers/github-webhook';
 import { logger } from '../../src/handlers/shared/logger';
@@ -125,6 +126,56 @@ describe('github-webhook receiver', () => {
     lambdaSend.mockReset();
     verifyMock.mockReset();
     verifyMock.mockResolvedValue(true);
+  });
+
+  describe('issue_comment (@bgagent PR-comment trigger)', () => {
+    const comment = (o: Record<string, unknown> = {}) => JSON.stringify({
+      action: 'created',
+      issue: { number: 7, pull_request: { url: 'x' } },
+      comment: { id: 555, body: '@bgagent resolve the merge conflicts with main', author_association: 'OWNER', user: { login: 'sphia', type: 'User' }, html_url: 'https://github.com/o/r/pull/7#c555' },
+      repository: { full_name: 'o/r' },
+      ...o,
+    });
+    const ev = (body: string) => event(body, { 'X-GitHub-Event': 'issue_comment' });
+
+    test('dispatches a qualifying comment to the trigger Lambda (202) after dedup', async () => {
+      ddbSend.mockResolvedValueOnce({});
+      lambdaSend.mockResolvedValueOnce({});
+      const res = await handler(ev(comment()));
+      expect(res.statusCode).toBe(202);
+      expect(ddbSend.mock.calls[0][0].input.Item.dedup_key).toBe('comment#o/r#555');
+      const invoke = lambdaSend.mock.calls[0][0].input;
+      expect(invoke.FunctionName).toBe('gh-comment-task');
+      expect(invoke.InvocationType).toBe('Event');
+    });
+
+    test.each([
+      ['no mention', { comment: { id: 1, body: 'looks good', author_association: 'OWNER', user: { type: 'User' } } }, 'no_mention'],
+      ['plain issue, not a PR', { issue: { number: 7 } }, 'not_a_pull_request'],
+      ['untrusted author', { comment: { id: 1, body: '@bgagent do x', author_association: 'NONE', user: { type: 'User' } } }, 'untrusted_author'],
+      ['bot author', { comment: { id: 1, body: '@bgagent do x', author_association: 'OWNER', user: { type: 'Bot' } } }, 'bot_author'],
+      ['edited, not created', { action: 'edited' }, 'not_created'],
+    ])('ignores %s without invoking anything', async (_label, override, reason) => {
+      const res = await handler(ev(comment(override)));
+      expect(res.statusCode).toBe(200);
+      expect(JSON.parse(res.body).skipped).toBe(reason);
+      expect(lambdaSend).not.toHaveBeenCalled();
+      expect(ddbSend).not.toHaveBeenCalled();
+    });
+
+    test('a redelivered comment is deduped', async () => {
+      ddbSend.mockRejectedValueOnce(new FakeConditionalCheckFailedException());
+      const res = await handler(ev(comment()));
+      expect(JSON.parse(res.body).deduped).toBe(true);
+      expect(lambdaSend).not.toHaveBeenCalled();
+    });
+
+    test('rejects an unsigned comment like any other event', async () => {
+      verifyMock.mockResolvedValueOnce(false);
+      const res = await handler(ev(comment()));
+      expect(res.statusCode).toBe(401);
+      expect(lambdaSend).not.toHaveBeenCalled();
+    });
   });
 
   test('400 when body is missing', async () => {

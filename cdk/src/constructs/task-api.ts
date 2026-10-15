@@ -162,6 +162,13 @@ export interface TaskApiProps {
   readonly guardrailId?: string;
 
   /**
+   * ABCA's GitHub token secret. When provided, the webhook task Lambda also
+   * serves the `@bgagent` PR-comment trigger (github-comment-task.ts) that the
+   * GitHub webhook receiver invokes for `issue_comment` events.
+   */
+  readonly githubTokenSecret?: import('aws-cdk-lib/aws-secretsmanager').ISecret;
+
+  /**
    * Bedrock Guardrail version for screening task input.
    */
   readonly guardrailVersion?: string;
@@ -265,6 +272,14 @@ export class TaskApi extends Construct {
    * The API Gateway REST API.
    */
   public readonly api: apigw.RestApi;
+
+  /**
+   * `@bgagent` PR-comment trigger (pr-iteration tasks): the webhook task Lambda,
+   * which also serves async GitHub comment events (no extra resources — the stack
+   * is at its resource budget). Set when `githubTokenSecret` and the webhook table
+   * are configured.
+   */
+  public readonly githubCommentTaskFn?: lambda.NodejsFunction;
 
   /**
    * The Cognito User Pool for authentication.
@@ -1290,6 +1305,14 @@ export class TaskApi extends Construct {
         memorySize: HEAVY_ATTACHMENT_HANDLER_MEMORY_MB,
         timeout: Duration.seconds(API_HANDLER_TIMEOUT_SECONDS),
       });
+
+      // `@bgagent` PR-comment trigger shares this Lambda (createTaskCore grants
+      // already here); it also needs the GitHub token for the PR lookup + reply.
+      if (props.githubTokenSecret) {
+        webhookCreateTaskFn.addEnvironment('GITHUB_TOKEN_SECRET_ARN', props.githubTokenSecret.secretArn);
+        props.githubTokenSecret.grantRead(webhookCreateTaskFn);
+        this.githubCommentTaskFn = webhookCreateTaskFn;
+      }
 
       // --- IAM grants for webhook Lambdas ---
       props.webhookTable.grantReadWriteData(createWebhookFn);

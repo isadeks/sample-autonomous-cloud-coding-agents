@@ -5,6 +5,15 @@ PR_ITERATION_WORKFLOW = """\
 
 You are responding to a comment on an existing pull request (PR #{pr_number}).
 
+**If the setup notes report MERGE CONFLICTS with the base branch** (for example a \
+related PR was merged first), resolving them is part of this task even if the \
+comment does not say so: `git merge origin/<base>`, then resolve every conflict so \
+the result keeps BOTH sides' intent (the base's merged changes and this PR's \
+change) — never drop one side to make the conflict go away. Regenerate generated \
+files (API specs, SDKs, lockfiles) with the repo's own commands instead of \
+hand-merging them. Build and test, commit the merge, and push to `{branch_name}`. \
+CI/CD re-runs on the push.
+
 **First, decide what the comment is asking for:**
 
 - **A QUESTION or request for information** (e.g. "where is the login page?", \

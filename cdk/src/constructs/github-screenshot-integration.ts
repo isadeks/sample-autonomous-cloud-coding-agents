@@ -61,6 +61,12 @@ export interface GitHubScreenshotIntegrationProps {
   readonly api: apigw.RestApi;
 
   /**
+   * `@bgagent` PR-comment trigger Lambda (TaskApi.githubCommentTaskFn). When
+   * set, the receiver dispatches qualifying `issue_comment` events to it.
+   */
+  readonly commentTaskFn?: import('aws-cdk-lib/aws-lambda').IFunction;
+
+  /**
    * Existing GitHub PAT secret. The processor reuses ABCA's main GitHub
    * token to (a) look up which PR a deploy SHA belongs to via the
    * Commits API, and (b) post the screenshot comment on that PR.
@@ -427,6 +433,7 @@ export class GitHubScreenshotIntegration extends Construct {
         GITHUB_WEBHOOK_SECRET_ARN: this.webhookSecret.secretArn,
         GITHUB_WEBHOOK_DEDUP_TABLE_NAME: this.webhookDedupTable.tableName,
         GITHUB_WEBHOOK_PROCESSOR_FUNCTION_NAME: this.webhookProcessorFn.functionName,
+        ...(props.commentTaskFn && { GITHUB_COMMENT_TASK_FUNCTION_NAME: props.commentTaskFn.functionName }),
         ...(props.screenshotTargetEnvironment && {
           SCREENSHOT_TARGET_ENVIRONMENT: props.screenshotTargetEnvironment,
         }),
@@ -437,6 +444,7 @@ export class GitHubScreenshotIntegration extends Construct {
     this.webhookSecret.grantRead(this.webhookFn);
     this.webhookDedupTable.grantReadWriteData(this.webhookFn);
     this.webhookProcessorFn.grantInvoke(this.webhookFn);
+    props.commentTaskFn?.grantInvoke(this.webhookFn);
 
     // --- API Gateway route ---
     const githubResource = props.api.root.addResource('github');

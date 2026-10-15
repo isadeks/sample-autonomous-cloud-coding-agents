@@ -518,6 +518,7 @@ export class AgentStack extends Stack {
     // --- Task API (REST API + Cognito + Lambda handlers) ---
     const taskApi = new TaskApi(this, 'TaskApi', {
       taskTable: taskTable.table,
+      githubTokenSecret,
       taskEventsTable: taskEventsTable.table,
       taskNudgesTable: taskNudgesTable.table,
       taskApprovalsTable: taskApprovalsTable.table,
@@ -1974,6 +1975,7 @@ export class AgentStack extends Stack {
     // screenshotted on successful preview deploys; no opt-in flag.
     const githubScreenshot = new GitHubScreenshotIntegration(this, 'GitHubScreenshotIntegration', {
       api: taskApi.api,
+      commentTaskFn: taskApi.githubCommentTaskFn,
       githubTokenSecret,
       // When the screenshot lands on a PR linked to a Linear issue
       // (identifier in the PR title/body), also post the screenshot

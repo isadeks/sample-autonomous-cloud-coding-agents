@@ -21,8 +21,10 @@ import * as crypto from 'crypto';
 import { GetSecretValueCommand, SecretsManagerClient } from '@aws-sdk/client-secrets-manager';
 import type { APIGatewayProxyEvent, APIGatewayProxyResult } from 'aws-lambda';
 import { ulid } from 'ulid';
+import { handler as handleGitHubComment } from './github-comment-task';
 import { createTaskCore } from './shared/create-task-core';
 import { buildWebhookChannelMetadata, extractWebhookContext } from './shared/gateway';
+import type { GitHubCommentEvent } from './shared/github-comment-trigger';
 import { isUsableHmacSecret } from './shared/hmac-secret';
 import { logger } from './shared/logger';
 import { ErrorCode, errorResponse } from './shared/response';
@@ -107,7 +109,16 @@ function verifySignature(body: string, secret: string, signature: string): boole
  * cannot do this because API Gateway REST API v1 does not pass the request
  * body to REQUEST authorizers).
  */
-export async function handler(event: APIGatewayProxyEvent): Promise<APIGatewayProxyResult> {
+export async function handler(event: APIGatewayProxyEvent): Promise<APIGatewayProxyResult>;
+export async function handler(event: GitHubCommentEvent): Promise<{ status: string; task_id?: string }>;
+export async function handler(
+  event: APIGatewayProxyEvent | GitHubCommentEvent,
+): Promise<APIGatewayProxyResult | { status: string; task_id?: string }> {
+  // Async invoke from the GitHub webhook receiver: `@bgagent` PR-comment trigger.
+  // (Same Lambda as webhook ingest so the stack gains no resources.)
+  if ('raw_body' in event) {
+    return handleGitHubComment(event);
+  }
   const requestId = ulid();
 
   try {
