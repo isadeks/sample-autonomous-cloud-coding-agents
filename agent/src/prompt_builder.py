@@ -80,6 +80,10 @@ def build_system_prompt(
         from prompts.ui_check import ui_check_addendum
 
         system_prompt += ui_check_addendum(config.ui_checks_dir)
+    if not config.read_only and getattr(config, "require_tests", False):
+        from prompts.ui_check import tests_required_addendum
+
+        system_prompt += tests_required_addendum(True)
 
     # Channel-specific guidance (appended last so channel instructions sit
     # close to the end of the prompt, where the model weights recency).

@@ -282,20 +282,36 @@ class TestLoop:
 
 
 class TestVerificationSection:
-    def test_marked_and_reports_rounds(self):
+    def test_one_summary_line_details_collapsed(self):
         s = render_verification_section(
-            _config(),
+            _config(lint_command="true"),
             True,
             True,
             fixup_rounds=2,
             fixup_history=[False, True],
             agent_result=_agent(),
+            ci_summary="CI/CD ✅ (CI ✅ Preview ✅)",
+            extra_lines=["- CI/CD on `abc`: **PASS**"],
         )
-        assert s.startswith(VERIFICATION_START) and s.endswith(VERIFICATION_END)
-        assert "`npm test` (post-agent): **PASS**" in s
-        assert "**2** fix-up round(s)" in s and "FAIL, PASS" in s
+        lines = s.splitlines()
+        assert lines[0] == VERIFICATION_START and lines[-1] == VERIFICATION_END
+        assert lines[1] == (
+            "**ABCA verification** · build gate ✅ · CI/CD ✅ (CI ✅ Preview ✅)"
+            " · 2 fix-up round(s) · $1.00"
+        )
+        assert "<details><summary>Details</summary>" in s
+        assert "- Build gate: `npm test` → PASS" in s
+        assert "- Local build fix-up rounds: 2 (FAIL, PASS)" in s
+        assert "- CI/CD on `abc`: **PASS**" in s
+        assert "Lint" not in s  # a no-op lint command ("true") is not shown
 
     def test_inert_is_not_pass(self):
         s = render_verification_section(_config(), True, True, build_inert=True)
-        build_line = s.splitlines()[3]
-        assert "NOT VERIFIED" in build_line and "PASS" not in build_line
+        assert "build gate ⚠️ not verified" in s.splitlines()[1]
+        assert "not verified (command could not run)" in s
+
+    def test_long_commands_are_shortened(self):
+        cmd = "pnpm install --frozen-lockfile --filter x && pnpm --filter y run build && pnpm build"
+        s = render_verification_section(_config(build_command=cmd), True, True)
+        line = next(x for x in s.splitlines() if x.startswith("- Build gate:"))
+        assert "…" in line and len(line) < 100

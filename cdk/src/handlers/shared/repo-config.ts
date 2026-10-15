@@ -60,6 +60,8 @@ export interface RepoConfig {
   /** Repo-relative folder where the agent commits Playwright UI checks that the
    *  repo's CD runs against the PR preview (absent = no UI check asked). */
   readonly ui_checks_dir?: string;
+  /** Behaviour changes must add tests to the project's own suites (agent prompt; CI enforces). */
+  readonly require_tests?: boolean;
   readonly egress_allowlist?: string[];
   readonly cedar_policies?: string[];
   /**
@@ -114,6 +116,8 @@ export interface BlueprintConfig {
   /** Repo-relative folder where the agent commits Playwright UI checks that the
    *  repo's CD runs against the PR preview (absent = no UI check asked). */
   readonly ui_checks_dir?: string;
+  /** Behaviour changes must add tests to the project's own suites (agent prompt; CI enforces). */
+  readonly require_tests?: boolean;
   readonly egress_allowlist?: string[];
   readonly cedar_policies?: string[];
   /**

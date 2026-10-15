@@ -47,3 +47,26 @@ def ui_check_addendum(ui_checks_dir: str) -> str:
     if not d:
         return ""
     return UI_CHECK_ADDENDUM.format(ui_checks_dir=d)
+
+
+TESTS_REQUIRED_ADDENDUM = """
+
+## Tests (required for this repository)
+
+Every behaviour change must come with tests in the project's OWN test suites, following
+the conventions of the neighbouring tests:
+
+- **Unit tests** next to the code you changed (look at the existing `*.spec.ts` /
+  `*_test.*` files beside it and extend them, or add one in the same style).
+- **An end-to-end test** in the repository's e2e suite for the user-visible behaviour, if
+  the repo has one (for example `e2e/src/specs/...`), reusing its existing helpers.
+- CI rejects a pull request that changes source files without changing project tests.
+  Files under `.abca/` (such as the UI check above) do not count.
+- e2e tests may need services you do not have here (e.g. Docker); write them carefully —
+  CI runs them against a real server and reports failures back to you.
+"""
+
+
+def tests_required_addendum(required: bool) -> str:
+    """The prompt section for a repo that requires project tests ("" when off)."""
+    return TESTS_REQUIRED_ADDENDUM if required else ""

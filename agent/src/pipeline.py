@@ -16,7 +16,7 @@ from pydantic import ValidationError
 import memory as agent_memory
 import task_state
 from channel_mcp import configure_channel_mcp, strip_linear_mcp_servers
-from ci_wait import render_ci_lines
+from ci_wait import render_ci_summary
 from config import (
     AGENT_WORKSPACE,
     NEEDS_INPUT_MARKER,
@@ -1080,6 +1080,7 @@ def run_task(
     ci_wait_timeout_s: int = 0,
     ci_required_checks: list[str] | None = None,
     ui_checks_dir: str = "",
+    require_tests: bool = False,
     prompt_version: str = "",
     memory_id: str = "",
     resolved_workflow: dict | None = None,
@@ -1135,6 +1136,7 @@ def run_task(
         ci_wait_timeout_s=ci_wait_timeout_s,
         ci_required_checks=ci_required_checks,
         ui_checks_dir=ui_checks_dir,
+        require_tests=require_tests,
         resolved_workflow=resolved_workflow,
         branch_name=branch_name,
         pr_number=pr_number,
@@ -1808,7 +1810,8 @@ def run_task(
                                 fixup_rounds=fixup.rounds,
                                 fixup_history=fixup.history,
                                 agent_result=agent_result,
-                                extra_lines=render_ci_lines(ci_conv),
+                                extra_lines=render_ci_summary(ci_conv)[1],
+                                ci_summary=render_ci_summary(ci_conv)[0],
                             ),
                         )
                     post_span.set_attribute("build.passed", build_passed)

@@ -328,6 +328,11 @@ class TestBuildSystemPrompt:
         assert "## UI check for your change" in result
         assert ".abca/ui-checks/<short-slug>.spec.ts" in result
 
+    def test_tests_required_section(self):
+        on = _build_system_prompt(self._cfg(require_tests=True), self._setup, None, "")
+        assert "## Tests (required for this repository)" in on
+        assert "## Tests (required" not in _build_system_prompt(self._cfg(), self._setup, None, "")
+
     def test_no_ui_check_section_by_default_or_read_only(self):
         assert "## UI check" not in _build_system_prompt(self._cfg(), self._setup, None, "")
         ro = self._cfg(ui_checks_dir=".abca/ui-checks", read_only=True)

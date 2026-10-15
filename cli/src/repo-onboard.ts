@@ -54,6 +54,8 @@ export interface OnboardRepoOptions {
   readonly ciRequiredChecks?: string[];
   /** Folder for agent-written Playwright UI checks run by CD on the PR preview ('' clears). */
   readonly uiChecksDir?: string;
+  /** Require project tests for behaviour changes (true/false; undefined keeps the stored value). */
+  readonly requireTests?: boolean;
 }
 
 export interface OnboardRepoDependencies {
@@ -148,6 +150,10 @@ export async function onboardRepo(
     if (dir.split('/').includes('..')) throw new CliError('--ui-checks-dir must stay inside the repository');
     if (dir) item.ui_checks_dir = dir;
     else delete item.ui_checks_dir;
+  }
+  if (options.requireTests !== undefined) {
+    if (options.requireTests) item.require_tests = true;
+    else delete item.require_tests;
   }
   if (options.ciRequiredChecks !== undefined) {
     if (options.ciRequiredChecks.length) item.ci_required_checks = options.ciRequiredChecks;

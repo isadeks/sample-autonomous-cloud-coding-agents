@@ -380,3 +380,12 @@ class TestUiCheckAddendum:
         assert (
             "${process.env.UI_CHECK_SHOTS}/01-before-delete.png" in text
         )  # braces survived format()
+
+
+def test_tests_required_addendum():
+    from prompts.ui_check import tests_required_addendum
+
+    assert tests_required_addendum(False) == ""
+    text = tests_required_addendum(True)
+    assert "## Tests (required for this repository)" in text
+    assert "e2e/src/specs" in text and "`.abca/`" in text

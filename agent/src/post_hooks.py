@@ -838,6 +838,11 @@ VERIFICATION_START = "<!-- abca-verification:start -->"
 VERIFICATION_END = "<!-- abca-verification:end -->"
 
 
+def _short_cmd(cmd: str, limit: int = 60) -> str:
+    cmd = " ".join(cmd.split())
+    return cmd if len(cmd) <= limit else cmd[: limit - 1] + "…"
+
+
 def render_verification_section(
     config: TaskConfig,
     build_passed: bool,
@@ -848,37 +853,51 @@ def render_verification_section(
     fixup_history: list[bool] | None = None,
     agent_result: AgentResult | None = None,
     extra_lines: list[str] | None = None,
+    ci_summary: str = "",
 ) -> str:
-    """The platform's own ``## Verification`` block, between stable markers.
+    """The platform's verdict between stable markers: ONE summary line, details collapsed.
 
-    Unlike the body ``ensure_pr`` writes on create, this is upserted into
-    whatever PR exists, so the platform's verdict is visible even when the
-    agent opened the PR itself (its body is otherwise whatever the agent wrote).
+    Upserted into whatever PR exists, so the platform's verdict is visible even
+    when the agent opened the PR itself. ``ci_summary`` / ``extra_lines`` come
+    from the CI convergence loop (``ci_wait.render_ci_summary``).
     """
     build_label = (config.build_command or DEFAULT_BUILD_COMMAND).strip()
     lint_label = (config.lint_command or DEFAULT_LINT_COMMAND).strip()
+    build = "⚠️ not verified" if build_inert else ("✅" if build_passed else "❌")
+    parts = [f"build gate {build}"]
+    if lint_label not in ("true", ":"):
+        parts.append(f"lint {'✅' if lint_passed else '❌'}")
+    if ci_summary:
+        parts.append(ci_summary)
+    if fixup_rounds:
+        parts.append(f"{fixup_rounds} fix-up round(s)")
+    if agent_result and agent_result.cost_usd is not None:
+        parts.append(f"${agent_result.cost_usd:.2f}")
+    verdict = "PASS" if build_passed else "FAIL"
     if build_inert:
-        build_status = "NOT VERIFIED (command could not run)"
-    else:
-        build_status = "PASS" if build_passed else "FAIL"
-    lines = [
-        VERIFICATION_START,
-        "## Verification (ABCA platform)",
-        "",
-        f"- `{build_label}` (post-agent): **{build_status}**",
-        f"- `{lint_label}` (post-agent): **{'PASS' if lint_passed else 'FAIL'}**",
-    ]
+        verdict = "not verified (command could not run)"
+    details = [f"- Build gate: `{_short_cmd(build_label)}` → {verdict}"]
+    if lint_label not in ("true", ":"):
+        details.append(f"- Lint: `{_short_cmd(lint_label)}` → {'PASS' if lint_passed else 'FAIL'}")
     if fixup_rounds:
         history = ", ".join("PASS" if ok else "FAIL" for ok in (fixup_history or []))
-        lines.append(
-            f"- Convergence: **{fixup_rounds}** fix-up round(s) after a failing build"
-            + (f" (results: {history})" if history else "")
+        details.append(
+            f"- Local build fix-up rounds: {fixup_rounds}" + (f" ({history})" if history else "")
         )
-    lines.extend(extra_lines or [])
-    if agent_result and agent_result.cost_usd is not None:
-        lines.append(f"- Agent cost: **${agent_result.cost_usd:.4f}**")
-    lines.append(VERIFICATION_END)
-    return "\n".join(lines)
+    details.extend(extra_lines or [])
+    return "\n".join(
+        [
+            VERIFICATION_START,
+            f"**ABCA verification** · {' · '.join(parts)}",
+            "",
+            "<details><summary>Details</summary>",
+            "",
+            *details,
+            "",
+            "</details>",
+            VERIFICATION_END,
+        ]
+    )
 
 
 def upsert_verification_section(

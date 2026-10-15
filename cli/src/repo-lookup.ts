@@ -48,6 +48,7 @@ export interface RepoConfigRow {
   readonly ci_wait_timeout_s?: number;
   readonly ci_required_checks?: string[];
   readonly ui_checks_dir?: string;
+  readonly require_tests?: boolean;
 }
 
 /**

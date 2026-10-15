@@ -205,8 +205,10 @@ describe('hydrateAndTransition', () => {
       ci_wait_timeout_s: 2700,
       ci_required_checks: ['AWS CodeBuild us-east-1 (ci)', 'deployment:Preview'],
       ui_checks_dir: '.abca/ui-checks',
+      require_tests: true,
     } as any);
     expect(payload.ui_checks_dir).toBe('.abca/ui-checks');
+    expect(payload.require_tests).toBe(true);
     expect(payload.ci_wait_timeout_s).toBe(2700);
     expect(payload.ci_required_checks).toEqual(['AWS CodeBuild us-east-1 (ci)', 'deployment:Preview']);
   });
@@ -218,6 +220,7 @@ describe('hydrateAndTransition', () => {
     expect(payload).not.toHaveProperty('ci_wait_timeout_s');
     expect(payload).not.toHaveProperty('ci_required_checks');
     expect(payload).not.toHaveProperty('ui_checks_dir');
+    expect(payload).not.toHaveProperty('require_tests');
   });
 
   test('omits trace from payload when task record has no trace flag (slim wire)', async () => {

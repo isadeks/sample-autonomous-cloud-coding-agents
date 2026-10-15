@@ -185,6 +185,8 @@ class TaskConfig(BaseModel):
     # Repo-relative folder for agent-written Playwright UI checks run by CD on the
     # PR preview ("" = off). See prompts/ui_check.py.
     ui_checks_dir: str = ""
+    # Behaviour changes must add tests to the project's own suites (prompt + CI gate).
+    require_tests: bool = False
     # The pinned workflow this task runs ({"id", "version"}), resolved at the
     # create-task boundary and threaded through the payload. None on local/batch
     # runs, where the pipeline defaults to coding/new-task-v1.

@@ -24,7 +24,7 @@ from ci_wait import (
     classify,
     collect_checks,
     failure_report,
-    render_ci_lines,
+    render_ci_summary,
     wait_for_ci,
 )
 from models import AgentResult, RepoSetup
@@ -183,21 +183,28 @@ def test_ci_prompt():
     assert "REPORT" in p and "round 1 of 2" in p and "untrusted" in p and "push" in p
 
 
-def test_render_ci_lines():
+def test_render_ci_summary():
     ci = CiConvergence(
         rounds=1,
         results=[
             CiResult("fail", "abcdef1234", [_chk("ci", "failure")]),
             CiResult(
-                "pass", "1234567890", [_chk("ci", "success"), _chk("deployment:Preview", "success")]
+                "pass",
+                "1234567890",
+                [
+                    _chk("AWS CodeBuild us-east-1 (feval-immich-ci-x)", "success"),
+                    _chk("deployment:Preview", "success"),
+                    _chk("feval/ui-check", "success"),
+                ],
             ),
         ],
     )
-    lines = render_ci_lines(ci)
-    assert lines[0] == "- CI on `123456789`: **PASS**"
-    assert "  - deployment:Preview: success" in lines
-    assert lines[-1] == "- CI convergence: **1** fix-up round(s) (results: FAIL, PASS)"
-    assert render_ci_lines(None) == []
+    summary, details = render_ci_summary(ci)
+    assert summary == "CI/CD ✅ (CI ✅ Preview ✅ ui-check ✅)"
+    assert details[0] == "- CI/CD on `123456789`: **PASS**"
+    assert "  - deployment:Preview: success" in details
+    assert details[-1] == "- CI fix-up rounds: 1 (FAIL, PASS)"
+    assert render_ci_summary(None) == ("", [])
 
 
 def _wf() -> Workflow:

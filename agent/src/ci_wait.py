@@ -244,25 +244,43 @@ def build_ci_fixup_prompt(report: str, round_no: int, max_rounds: int) -> str:
     )
 
 
-def render_ci_lines(ci: CiConvergence | None) -> list[str]:
-    """Lines for the PR's platform Verification section."""
+def _short_check_name(name: str) -> str:
+    """Compact labels for the summary line (full names stay in the details)."""
+    if name.startswith("AWS CodeBuild"):
+        return "CI"
+    if name.startswith("deployment:"):
+        return name.split(":", 1)[1]
+    return name.split("/")[-1]
+
+
+def render_ci_summary(ci: CiConvergence | None) -> tuple[str, list[str]]:
+    """(summary fragment for the one-line verdict, detail lines) for the PR's Verification block."""
     if ci is None or ci.final is None:
-        return []
+        return "", []
     final = ci.final
+    icon = {"pass": "✅", "fail": "❌"}.get(final.state, "⚠️")
     label = {
-        "pass": "PASS",
-        "fail": "FAIL",
         "none": "no CI reported",
         "timeout": "still running when the wait ended",
         "cancelled": "wait cancelled",
         "error": "could not be read",
-    }.get(final.state, final.state)
-    lines = [f"- CI on `{final.sha[:9]}`: **{label}**"]
+    }.get(final.state, "")
+
+    def _mark(state: str) -> str:
+        return "✅" if state == "success" else ("❌" if state in _FAILED else "⏳")
+
+    checks = " ".join(f"{_short_check_name(c['name'])} {_mark(c['state'])}" for c in final.checks)
+    summary = f"CI/CD {icon}" + (f" {label}" if label else "") + (f" ({checks})" if checks else "")
+    details = [f"- CI/CD on `{final.sha[:9]}`: **{final.state.upper()}**"]
     for c in final.checks:
-        lines.append(
-            f"  - {c['name']}: {c['state']}" + (f" ([details]({c['url']}))" if c["url"] else "")
-        )
+        link = f" ([details]({c['url']}))" if c["url"] else ""
+        details.append(f"  - {c['name']}: {c['state']}{link}")
     if ci.rounds:
         history = ", ".join(r.state.upper() for r in ci.results)
-        lines.append(f"- CI convergence: **{ci.rounds}** fix-up round(s) (results: {history})")
-    return lines
+        details.append(f"- CI fix-up rounds: {ci.rounds} ({history})")
+    return summary, details
+
+
+def render_ci_lines(ci: CiConvergence | None) -> list[str]:
+    """Detail lines only (kept for callers that do not show a summary)."""
+    return render_ci_summary(ci)[1]

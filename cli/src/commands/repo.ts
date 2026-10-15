@@ -165,6 +165,8 @@ export function makeRepoCommand(): Command {
       .option('--ci-wait-timeout <seconds>', 'Wait in-session for the PR\'s CI/CD checks and fix failures (0 = off)', parseInt)
       .option('--ci-required-check <name>', 'Check that must report green before the PR converges (repeatable; e.g. deployment:Preview)', (v: string, acc: string[] = []) => [...acc, v])
       .option('--clear-ci-required-checks', 'Remove the stored required checks')
+      .option('--require-tests', 'Behaviour changes must add tests to the project\'s own suites (agent prompt; enforce in CI)')
+      .option('--no-require-tests', 'Stop requiring project tests')
       .option('--ui-checks-dir <dir>', 'Ask the agent to commit Playwright UI checks here, run by CD on the PR preview (\'\' clears)')
       .option('--output <format>', 'Output format: text or json', 'text')
       .action(async (repoId: string, opts) => {
@@ -247,6 +249,7 @@ export function makeRepoCommand(): Command {
           ciWaitTimeoutS: opts.ciWaitTimeout,
           ciRequiredChecks: opts.clearCiRequiredChecks ? [] : opts.ciRequiredCheck,
           uiChecksDir: opts.uiChecksDir,
+          requireTests: opts.requireTests,
         });
         const notes = buildRepoOnboardNotes({
           config,
