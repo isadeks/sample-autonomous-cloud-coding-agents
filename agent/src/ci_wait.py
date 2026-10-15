@@ -60,6 +60,9 @@ class CiConvergence:
     rounds: int = 0
     results: list[CiResult] = field(default_factory=list)
     stopped_reason: str = ""
+    # baseline probe of an "unrelated to my change" claim: refuted | confirmed | unverified
+    claim_check: str = ""
+    baseline: CiResult | None = None
 
     @property
     def final(self) -> CiResult | None:
@@ -227,6 +230,39 @@ def failure_report(result: CiResult, comments: list[str]) -> str:
     return text
 
 
+BASELINE_BRANCH_PREFIX = "abca-baseline/"
+
+
+def judge_claim(head: CiResult, base: CiResult) -> str:
+    """Verdict on "the failing checks are not caused by my change", from the same checks on base.
+
+    refuted: every check failing on the PR head passes on the base commit.
+    confirmed: at least one of them also fails on the base (pre-existing).
+    unverified: the base did not report (no CI on pushes, timeout, ...).
+    """
+    failing = {c["name"] for c in head.failed}
+    if not failing or base.state in ("none", "timeout", "cancelled", "error"):
+        return "unverified"
+    on_base = {c["name"]: c["state"] for c in base.checks}
+    if any(on_base.get(n) in _FAILED for n in failing):
+        return "confirmed"
+    if all(on_base.get(n) == "success" for n in failing):
+        return "refuted"
+    return "unverified"
+
+
+def refutation_evidence(head: CiResult, base: CiResult, base_ref: str) -> str:
+    """The note handed back to the agent when its "unrelated" claim is refuted."""
+    names = ", ".join(sorted(c["name"] for c in head.failed))
+    return (
+        f"You reported the failing check(s) as unrelated to your change. The platform verified "
+        f"that claim by running the same CI on the unchanged base `{base_ref}` @ `{base.sha[:9]}`: "
+        f"{names} PASS there and FAIL on your branch @ `{head.sha[:9]}`. So your change causes "
+        "the failure. Find the cause (compare what your change does on the failing code path), "
+        "fix it, and push."
+    )
+
+
 def build_ci_fixup_prompt(report: str, round_no: int, max_rounds: int) -> str:
     """The user turn that resumes the agent's session after a red CI run."""
     return (
@@ -278,6 +314,9 @@ def render_ci_summary(ci: CiConvergence | None) -> tuple[str, list[str]]:
     if ci.rounds:
         history = ", ".join(r.state.upper() for r in ci.results)
         details.append(f"- CI fix-up rounds: {ci.rounds} ({history})")
+    if ci.claim_check:
+        base = f" on base `{ci.baseline.sha[:9]}`" if ci.baseline and ci.baseline.sha else ""
+        details.append(f"- Agent's 'unrelated failure' claim: **{ci.claim_check}**{base}")
     return summary, details
 
 

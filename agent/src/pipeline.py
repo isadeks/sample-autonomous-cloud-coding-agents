@@ -574,6 +574,71 @@ def _pr_head_sha(repo: str, pr_number: str, repo_dir: str) -> str:
     return r.stdout.strip() if r.returncode == 0 else ""
 
 
+def _probe_baseline(config, setup, head_result, deadline, cancelled, ci, progress) -> str:
+    """Run the repo's CI on the unchanged base commit; return judge_claim's verdict.
+
+    Pushes ``abca-baseline/<task_id>`` at ``origin/<base>`` (no new commit), waits
+    for the PR's failing checks on that SHA, deletes the branch. The repo's CI must
+    build pushes to ``abca-baseline/*``; if it reports nothing the verdict is
+    "unverified".
+    """
+    from ci_wait import BASELINE_BRANCH_PREFIX, judge_claim, wait_for_ci
+
+    base = setup.default_branch
+    branch = f"{BASELINE_BRANCH_PREFIX}{config.task_id}"
+    subprocess.run(
+        ["git", "fetch", "origin", base], cwd=setup.repo_dir, capture_output=True, check=False
+    )
+    rev = subprocess.run(
+        ["git", "rev-parse", f"origin/{base}"],
+        cwd=setup.repo_dir,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    base_sha = rev.stdout.strip()
+    if rev.returncode != 0 or not base_sha:
+        ci.claim_check = "unverified"
+        return "unverified"
+    push = subprocess.run(
+        ["git", "push", "--force", "origin", f"{base_sha}:refs/heads/{branch}"],
+        cwd=setup.repo_dir,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if push.returncode != 0:
+        log("WARN", f"CI: baseline probe push failed: {push.stderr.strip()[:200]}")
+        ci.claim_check = "unverified"
+        return "unverified"
+    progress.write_agent_milestone("ci_baseline_probe_started", f"base={base} sha={base_sha[:9]}")
+    try:
+        failing = [c["name"] for c in head_result.failed]
+        base_result = wait_for_ci(
+            config.repo_url,
+            base_sha,
+            setup.repo_dir,
+            max(0, int(deadline - time.monotonic())),
+            required=failing,
+            is_cancelled=cancelled,
+        )
+    finally:
+        subprocess.run(
+            ["git", "push", "origin", "--delete", branch],
+            cwd=setup.repo_dir,
+            capture_output=True,
+            check=False,
+        )
+    verdict = judge_claim(head_result, base_result)
+    ci.claim_check, ci.baseline = verdict, base_result
+    states = ", ".join(f"{c['name']}={c['state']}" for c in base_result.checks) or base_result.state
+    log("POST", f"CI: baseline probe on {base}@{base_sha[:9]}: {states} -> claim {verdict}")
+    progress.write_agent_milestone(
+        "ci_baseline_probe_result", f"claim={verdict} base={states}"[:900]
+    )
+    return verdict
+
+
 def _run_ci_rounds(
     agent_result,
     *,
@@ -599,6 +664,7 @@ def _run_ci_rounds(
         build_ci_fixup_prompt,
         ci_comments_for,
         failure_report,
+        refutation_evidence,
         wait_for_ci,
     )
     from fixup import MIN_FIXUP_BUDGET_USD, max_fixup_rounds, remaining_budget
@@ -620,6 +686,7 @@ def _run_ci_rounds(
         return bool(rec and rec.get("status") == "CANCELLED")
 
     deadline = time.monotonic() + timeout_s
+    evidence = ""  # set when a baseline probe refuted the agent's "unrelated" claim
     while True:
         # Wait on what CI actually builds: push anything local first (the
         # safety-net commit can land after the agent's own push when the agent
@@ -662,6 +729,8 @@ def _run_ci_rounds(
         report = failure_report(
             result, ci_comments_for(config.repo_url, pr_number, sha, setup.repo_dir)
         )
+        if evidence:
+            report = f"{evidence}\n\n{report}"
         progress.write_agent_milestone("ci_fixup_round_started", f"round={ci.rounds}/{max_rounds}")
         try:
             fix_result = asyncio.run(
@@ -689,8 +758,22 @@ def _run_ci_rounds(
         ensure_pushed(setup.repo_dir, setup.branch)
         new_sha = _head_sha(setup.repo_dir)
         if new_sha == sha:
-            ci.stopped_reason = "agent pushed no change (reported the failure as out of scope)"
+            # The agent judged the failure unrelated to its change and pushed
+            # nothing. Verify that claim instead of taking it: the same CI on the
+            # unchanged base commit.
+            verdict = _probe_baseline(config, setup, result, deadline, _cancelled, ci, progress)
+            if verdict == "refuted" and ci.rounds < max_rounds and ci.baseline is not None:
+                evidence = refutation_evidence(result, ci.baseline, setup.default_branch)
+                continue
+            ci.stopped_reason = {
+                "refuted": "agent's 'unrelated' claim refuted on the base; no rounds left",
+                "confirmed": "failure also on the base branch (pre-existing)",
+            }.get(
+                verdict,
+                "agent pushed no change; its 'unrelated failure' claim could not be verified",
+            )
             break
+        evidence = ""
     return agent_result, ci
 
 
@@ -1894,6 +1977,15 @@ def run_task(
                     f"ci_ok=False: CI checks failing on the PR after {ci_conv.rounds} "
                     f"fix-up round(s): {failing}"
                 )
+                if ci_conv.claim_check == "confirmed":
+                    result_error = (
+                        f"ci_ok=preexisting: {failing} also fail on the base branch "
+                        "(not caused by this change); the PR needs the base fixed first"
+                    )
+                elif ci_conv.claim_check == "refuted":
+                    result_error += (
+                        " (the agent's 'unrelated' claim was refuted on the base branch)"
+                    )
             # Delivery gate: a create-strategy new-work task that
             # reported success but opened no PR AND landed no commit shipped
             # nothing — fail it loudly (retryable) instead of a false COMPLETED

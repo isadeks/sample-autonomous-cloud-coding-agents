@@ -24,6 +24,7 @@ from ci_wait import (
     classify,
     collect_checks,
     failure_report,
+    judge_claim,
     render_ci_summary,
     wait_for_ci,
 )
@@ -205,6 +206,11 @@ def test_render_ci_summary():
     assert "  - deployment:Preview: success" in details
     assert details[-1] == "- CI fix-up rounds: 1 (FAIL, PASS)"
     assert render_ci_summary(None) == ("", [])
+    ci.claim_check, ci.baseline = "refuted", CiResult("pass", "base999999", [])
+    assert (
+        render_ci_summary(ci)[1][-1]
+        == "- Agent's 'unrelated failure' claim: **refuted** on base `base99999`"
+    )
 
 
 def _wf() -> Workflow:
@@ -343,7 +349,63 @@ class TestCiRounds:
         assert ci is not None and ci.rounds == 2 and ci.final.state == "fail"
         assert ci.stopped_reason == "max fix-up rounds reached" and run_agent.call_count == 2
 
-    def test_agent_pushes_nothing_stops(self):
+    def test_agent_pushes_nothing_unverified_claim_stops(self):
         red = CiResult("fail", "s1", [_chk("ci", "failure")])
-        _a, ci, _r, _w = _run_rounds([red], shas=("s1", "s1"))
-        assert ci is not None and ci.rounds == 1 and "pushed no change" in ci.stopped_reason
+        with patch("pipeline._probe_baseline", return_value="unverified"):
+            _a, ci, _r, _w = _run_rounds([red], shas=("s1", "s1"))
+        assert ci is not None and ci.rounds == 1 and "could not be verified" in ci.stopped_reason
+
+    def test_refuted_claim_goes_back_to_the_agent_with_evidence(self):
+        red = CiResult("fail", "s1", [_chk("feval/e2e", "failure")])
+        green = CiResult("pass", "s2", [_chk("feval/e2e", "success")])
+
+        def _probe(config, setup, head, deadline, cancelled, ci, progress):
+            ci.claim_check, ci.baseline = (
+                "refuted",
+                CiResult("pass", "base123456", [_chk("feval/e2e", "success")]),
+            )
+            return "refuted"
+
+        with patch("pipeline._probe_baseline", side_effect=_probe):
+            # round 1: agent pushes nothing (s1 stays); refuted; round 2: agent fixes (s2) -> green
+            _a, ci, run_agent, _w = _run_rounds(
+                [red, red, green], shas=("s1", "s1", "s1", "s2", "s2")
+            )
+        assert ci is not None and ci.rounds == 2 and ci.final.state == "pass"
+        second_prompt = run_agent.call_args_list[1].args[0]
+        assert "PASS there and FAIL on your branch" in second_prompt and "base1234" in second_prompt
+
+    def test_confirmed_preexisting_failure_stops(self):
+        red = CiResult("fail", "s1", [_chk("feval/e2e", "failure")])
+
+        def _probe(config, setup, head, deadline, cancelled, ci, progress):
+            ci.claim_check = "confirmed"
+            return "confirmed"
+
+        with patch("pipeline._probe_baseline", side_effect=_probe):
+            _a, ci, run_agent, _w = _run_rounds([red], shas=("s1", "s1"))
+        assert (
+            ci is not None and ci.stopped_reason == "failure also on the base branch (pre-existing)"
+        )
+        assert run_agent.call_count == 1
+
+
+class TestJudgeClaim:
+    head = CiResult("fail", "h", [_chk("feval/e2e", "failure"), _chk("ci", "success")])
+
+    def test_refuted_when_failing_checks_pass_on_base(self):
+        base = CiResult("pass", "b", [_chk("feval/e2e", "success"), _chk("ci", "success")])
+        assert judge_claim(self.head, base) == "refuted"
+
+    def test_confirmed_when_also_failing_on_base(self):
+        assert (
+            judge_claim(self.head, CiResult("fail", "b", [_chk("feval/e2e", "failure")]))
+            == "confirmed"
+        )
+
+    def test_unverified_without_base_ci(self):
+        assert judge_claim(self.head, CiResult("none", "b", [])) == "unverified"
+        assert (
+            judge_claim(self.head, CiResult("timeout", "b", [_chk("feval/e2e", "pending")]))
+            == "unverified"
+        )
