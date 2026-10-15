@@ -63,6 +63,7 @@ import {
   hydrateContext,
   resolveGitHubToken,
   screenWithGuardrail,
+  issueContentForScreening,
   type GitHubIssueContext,
   type GuardrailScreeningResult,
   type IssueComment,
@@ -1477,6 +1478,20 @@ describe('hydrateContext — guardrail screening', () => {
     expect(result.sources).toContain('issue');
   });
 
+  test('screens only the issue content, not the platform-authored prompt framing', async () => {
+    mockIssueFetch();
+    mockBedrockSend.mockResolvedValueOnce({ action: 'NONE' });
+
+    const result = await hydrateContext({ ...baseNewTask, issue_number: 42 } as any);
+    const screened = (mockBedrockSend.mock.calls[0][0] as { input: { content: { text: { text: string } }[] } })
+      .input.content[0].text.text;
+    // the agent still gets the full framed prompt ...
+    expect(result.user_prompt).toContain('Task ID: TASK-NEW-001');
+    expect(result.user_prompt).toContain('## Task');
+    // ... but the guardrail sees only the attacker-controlled issue text
+    expect(screened).toBe('Bug\n\nDetails');
+  });
+
   test('throws when guardrail screening fails for new_task (fail-closed)', async () => {
     mockIssueFetch();
     mockBedrockSend.mockRejectedValueOnce(new Error('Bedrock timeout'));
@@ -1490,6 +1505,18 @@ describe('hydrateContext — guardrail screening', () => {
 // ---------------------------------------------------------------------------
 // buildContentTrust
 // ---------------------------------------------------------------------------
+
+describe('issueContentForScreening', () => {
+  test('joins title, body and comment bodies, without framing or authors', () => {
+    const text = issueContentForScreening({
+      number: 1,
+      title: 'Stacks not removed',
+      body: 'Delete a library',
+      comments: [{ id: 1, author: 'mallory', body: 'same here' }],
+    } as any);
+    expect(text).toBe('Stacks not removed\n\nDelete a library\n\nsame here');
+  });
+});
 
 describe('buildContentTrust', () => {
   test('maps issue and pull_request to untrusted-external', () => {

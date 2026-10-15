@@ -829,6 +829,20 @@ export function enforceTokenBudget(
  * @param taskDescription - the user's task description (optional).
  * @returns the assembled user prompt.
  */
+/**
+ * The attacker-controlled parts of an issue (title, body, comments) as screened by the
+ * input guardrail — without the platform-authored framing around them.
+ * @param issue - the hydrated GitHub issue.
+ * @returns the text to screen.
+ */
+export function issueContentForScreening(issue: GitHubIssueContext): string {
+  const parts = [sanitizeExternalContent(issue.title), sanitizeExternalContent(issue.body)];
+  for (const c of issue.comments) {
+    parts.push(sanitizeExternalContent(c.body));
+  }
+  return parts.filter(Boolean).join('\n\n');
+}
+
 export function assembleUserPrompt(
   taskId: string,
   repo: string | undefined,
@@ -1274,10 +1288,15 @@ export async function hydrateContext(task: TaskRecord, options?: HydrateContextO
     userPrompt = assembleUserPrompt(task.task_id, repo, issue, budgetResult.taskDescription);
     const tokenEstimate = estimateTokens(userPrompt);
 
-    // Screen assembled prompt when it includes GitHub issue content (attacker-controlled input).
+    // Screen the GitHub issue content (attacker-controlled input) when present.
     // Skipped when no issue is present — task_description is already screened at submission time.
+    // Screen ONLY the external content, not the assembled prompt: the platform's own wrapper
+    // ("Resolve the GitHub issue described above. Follow the workflow in your system
+    // instructions.") placed right after user text reads as an injected instruction and made the
+    // PROMPT_ATTACK filter block a plain upstream bug report (immich #16151 without its
+    // maintainer note: MEDIUM, 3/3 runs; the same text without the wrapper: NONE, 3/3).
     const screenResult = issue
-      ? await screenWithGuardrail(userPrompt, task.task_id)
+      ? await screenWithGuardrail(issueContentForScreening(issue), task.task_id)
       : undefined;
 
     const guardrailBlocked = formatGuardrailBlocked(screenResult, 'Task context');
