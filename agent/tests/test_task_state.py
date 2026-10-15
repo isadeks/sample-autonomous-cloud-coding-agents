@@ -1045,3 +1045,23 @@ class TestCancellationHelpers:
 
     def test_extract_cancellation_reasons_none_on_plain_exception(self):
         assert task_state._extract_cancellation_reasons(RuntimeError()) == []
+
+
+class TestWriteHeartbeat:
+    """The heartbeat keeps flowing while the agent waits for a human approval."""
+
+    def test_written_while_running_or_awaiting_approval(self, monkeypatch):
+        from unittest.mock import MagicMock
+
+        import task_state
+
+        table = MagicMock()
+        monkeypatch.setattr(task_state, "_get_table", lambda: table)
+        task_state.write_heartbeat("t1")
+        kwargs = table.update_item.call_args.kwargs
+        allowed = {
+            v
+            for k, v in kwargs["ExpressionAttributeValues"].items()
+            if k in kwargs["ConditionExpression"]
+        }
+        assert {"RUNNING", "AWAITING_APPROVAL"} <= allowed

@@ -104,7 +104,14 @@ def write_submitted(
 
 
 def write_heartbeat(task_id: str) -> None:
-    """Update ``agent_heartbeat_at`` while the task is RUNNING (orchestrator crash detection)."""
+    """Update ``agent_heartbeat_at`` while the task is RUNNING or AWAITING_APPROVAL.
+
+    The orchestrator treats a stale heartbeat as a lost session. The agent is
+    alive while it waits for a human approval, so the heartbeat must keep
+    flowing then too: otherwise a wait longer than the stale window makes the
+    task fail the moment it returns to RUNNING (observed: ``agent_heartbeat_stale``
+    3 s after a 300 s approval timeout, while the agent kept working).
+    """
     try:
         table = _get_table()
         if table is None:
@@ -112,9 +119,13 @@ def write_heartbeat(task_id: str) -> None:
         table.update_item(
             Key={"task_id": task_id},
             UpdateExpression="SET agent_heartbeat_at = :t",
-            ConditionExpression="#s = :running",
+            ConditionExpression="#s IN (:running, :awaiting)",
             ExpressionAttributeNames={"#s": "status"},
-            ExpressionAttributeValues={":t": _now_iso(), ":running": "RUNNING"},
+            ExpressionAttributeValues={
+                ":t": _now_iso(),
+                ":running": "RUNNING",
+                ":awaiting": "AWAITING_APPROVAL",
+            },
         )
     except Exception as e:
         from botocore.exceptions import ClientError
