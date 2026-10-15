@@ -62,6 +62,8 @@ export interface RepoConfig {
   readonly ui_checks_dir?: string;
   /** Behaviour changes must add tests to the project's own suites (agent prompt; CI enforces). */
   readonly require_tests?: boolean;
+  /** Verify an agent's "unrelated CI failure" claim by running CI on the base commit (opt-in; pushes a probe branch). */
+  readonly ci_baseline_probe?: boolean;
   readonly egress_allowlist?: string[];
   readonly cedar_policies?: string[];
   /**
@@ -118,6 +120,8 @@ export interface BlueprintConfig {
   readonly ui_checks_dir?: string;
   /** Behaviour changes must add tests to the project's own suites (agent prompt; CI enforces). */
   readonly require_tests?: boolean;
+  /** Verify an agent's "unrelated CI failure" claim by running CI on the base commit (opt-in; pushes a probe branch). */
+  readonly ci_baseline_probe?: boolean;
   readonly egress_allowlist?: string[];
   readonly cedar_policies?: string[];
   /**

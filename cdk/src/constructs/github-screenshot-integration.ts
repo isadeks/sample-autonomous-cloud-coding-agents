@@ -23,7 +23,7 @@ import * as apigw from 'aws-cdk-lib/aws-apigateway';
 import * as cloudwatch from 'aws-cdk-lib/aws-cloudwatch';
 import * as dynamodb from 'aws-cdk-lib/aws-dynamodb';
 import * as iam from 'aws-cdk-lib/aws-iam';
-import { Architecture, Runtime } from 'aws-cdk-lib/aws-lambda';
+import { Architecture, Runtime, type IFunction } from 'aws-cdk-lib/aws-lambda';
 import * as lambda from 'aws-cdk-lib/aws-lambda-nodejs';
 import * as secretsmanager from 'aws-cdk-lib/aws-secretsmanager';
 import * as sqs from 'aws-cdk-lib/aws-sqs';
@@ -64,7 +64,7 @@ export interface GitHubScreenshotIntegrationProps {
    * `@bgagent` PR-comment trigger Lambda (TaskApi.githubCommentTaskFn). When
    * set, the receiver dispatches qualifying `issue_comment` events to it.
    */
-  readonly commentTaskFn?: import('aws-cdk-lib/aws-lambda').IFunction;
+  readonly commentTaskFn?: IFunction;
 
   /**
    * Existing GitHub PAT secret. The processor reuses ABCA's main GitHub

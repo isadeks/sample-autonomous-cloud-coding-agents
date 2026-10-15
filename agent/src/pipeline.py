@@ -27,6 +27,8 @@ from config import (
     resolve_linear_api_token,
 )
 from context import assemble_prompt, fetch_github_issue
+from convergence import RoundContext, ci_failure_message, run_ci_rounds, run_fixup_rounds
+from fixup import max_fixup_rounds
 from jira_reactions import (
     comment_task_started,
     transition_pr_opened,
@@ -36,11 +38,9 @@ from linear_reactions import react_task_finished, react_task_started
 from models import AgentResult, HydratedContext, RepoSetup, TaskConfig, TaskResult
 from observability import current_otel_trace_id, task_span
 from post_hooks import (
-    DEFAULT_BUILD_COMMAND,
     _extract_agent_notes,
     ensure_committed,
     ensure_pr,
-    ensure_pushed,
     reconcile_agent_branch,
     render_verification_section,
     upsert_verification_section,
@@ -438,345 +438,6 @@ def _run_repoless_task(
     return result_dict
 
 
-def _run_fixup_rounds(
-    build_outcome,
-    agent_result,
-    *,
-    workflow,
-    config,
-    setup,
-    system_prompt: str,
-    trajectory,
-    progress,
-    read_only: bool,
-):
-    """Feed a genuinely failing post-agent build back to the agent (see fixup.py).
-
-    Returns ``(build_outcome, agent_result, FixupResult)``: the LAST build
-    outcome, the agent result with cost/turns accumulated across rounds, and
-    what the loop did. With ``max_fixup_rounds == 0`` (the v1 default) this is
-    a no-op, so workflows that don't opt in keep the report-only gate.
-    """
-    import asyncio
-
-    from fixup import (
-        MIN_FIXUP_BUDGET_USD,
-        FixupResult,
-        build_fixup_prompt,
-        fixup_skip_reason,
-        log_round,
-        max_fixup_rounds,
-        remaining_budget,
-    )
-    from runner import run_agent
-
-    fixup = FixupResult()
-    max_rounds = max_fixup_rounds(workflow)
-    if max_rounds <= 0 or build_outcome.passed:
-        return build_outcome, agent_result, fixup
-    command = (config.build_command or DEFAULT_BUILD_COMMAND).strip()
-    while fixup.rounds < max_rounds:
-        reason = fixup_skip_reason(
-            build_outcome,
-            build_before=setup.build_before,
-            read_only=read_only,
-            session_id=agent_result.session_id,
-            agent_status=agent_result.status,
-        )
-        if reason:
-            fixup.stopped_reason = reason
-            log("POST", f"Convergence: not running a fix-up round ({reason})")
-            break
-        budget = remaining_budget(config.max_budget_usd, agent_result.cost_usd)
-        if budget is not None and budget < MIN_FIXUP_BUDGET_USD:
-            fixup.stopped_reason = "budget exhausted"
-            log("POST", "Convergence: budget exhausted, no fix-up round")
-            break
-        fixup.rounds += 1
-        progress.write_agent_milestone("fixup_round_started", f"round={fixup.rounds}/{max_rounds}")
-        try:
-            fix_result = asyncio.run(
-                run_agent(
-                    build_fixup_prompt(
-                        command, build_outcome.output_tail, fixup.rounds, max_rounds
-                    ),
-                    system_prompt,
-                    config,
-                    cwd=setup.repo_dir,
-                    trajectory=trajectory,
-                    resume_session_id=agent_result.session_id,
-                    max_budget_usd=budget,
-                )
-            )
-        except Exception as e:
-            log_error_cw(
-                f"Convergence fix-up round {fixup.rounds} failed: {e}",
-                task_id=config.task_id or None,
-            )
-            fixup.stopped_reason = f"fix-up agent error: {type(e).__name__}"
-            break
-        # Accumulate onto the task's agent result (cost/turns drive the task record).
-        fixup.extra_cost_usd += fix_result.cost_usd or 0.0
-        agent_result.cost_usd = (agent_result.cost_usd or 0.0) + (fix_result.cost_usd or 0.0)
-        agent_result.turns += fix_result.turns
-        agent_result.num_turns = (agent_result.num_turns or 0) + (fix_result.num_turns or 0)
-        if fix_result.session_id:
-            agent_result.session_id = fix_result.session_id
-        agent_result.status = fix_result.status
-        reconcile_agent_branch(setup.repo_dir, setup.branch)
-        ensure_committed(setup.repo_dir)
-        ensure_pushed(setup.repo_dir, setup.branch)
-        build_outcome = verify_build(setup.repo_dir, config.build_command)
-        fixup.history.append(build_outcome.passed)
-        log_round(fixup.rounds, max_rounds, build_outcome.passed)
-        progress.write_agent_milestone(
-            "fixup_round_result",
-            f"round={fixup.rounds}/{max_rounds} build={'pass' if build_outcome.passed else 'fail'}",
-        )
-        if build_outcome.passed:
-            fixup.stopped_reason = "build passed"
-            break
-    else:
-        fixup.stopped_reason = fixup.stopped_reason or "max fix-up rounds reached"
-    return build_outcome, agent_result, fixup
-
-
-def _head_sha(repo_dir: str) -> str:
-    r = subprocess.run(
-        ["git", "rev-parse", "HEAD"], cwd=repo_dir, capture_output=True, text=True, check=False
-    )
-    return r.stdout.strip()
-
-
-def _pr_head_sha(repo: str, pr_number: str, repo_dir: str) -> str:
-    """The PR's head commit as GitHub sees it ("" if it can't be read)."""
-    if not pr_number:
-        return ""
-    r = subprocess.run(
-        [
-            "gh",
-            "pr",
-            "view",
-            pr_number,
-            "--repo",
-            repo,
-            "--json",
-            "headRefOid",
-            "-q",
-            ".headRefOid",
-        ],
-        cwd=repo_dir,
-        capture_output=True,
-        text=True,
-        check=False,
-        timeout=60,
-    )
-    return r.stdout.strip() if r.returncode == 0 else ""
-
-
-def _probe_baseline(config, setup, head_result, deadline, cancelled, ci, progress) -> str:
-    """Run the repo's CI on the unchanged base commit; return judge_claim's verdict.
-
-    Pushes ``abca-baseline/<task_id>`` at ``origin/<base>`` (no new commit), waits
-    for the PR's failing checks on that SHA, deletes the branch. The repo's CI must
-    build pushes to ``abca-baseline/*``; if it reports nothing the verdict is
-    "unverified".
-    """
-    from ci_wait import BASELINE_BRANCH_PREFIX, judge_claim, wait_for_ci
-
-    base = setup.default_branch
-    branch = f"{BASELINE_BRANCH_PREFIX}{config.task_id}"
-    subprocess.run(
-        ["git", "fetch", "origin", base], cwd=setup.repo_dir, capture_output=True, check=False
-    )
-    rev = subprocess.run(
-        ["git", "rev-parse", f"origin/{base}"],
-        cwd=setup.repo_dir,
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    base_sha = rev.stdout.strip()
-    if rev.returncode != 0 or not base_sha:
-        ci.claim_check = "unverified"
-        return "unverified"
-    push = subprocess.run(
-        ["git", "push", "--force", "origin", f"{base_sha}:refs/heads/{branch}"],
-        cwd=setup.repo_dir,
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    if push.returncode != 0:
-        log("WARN", f"CI: baseline probe push failed: {push.stderr.strip()[:200]}")
-        ci.claim_check = "unverified"
-        return "unverified"
-    progress.write_agent_milestone("ci_baseline_probe_started", f"base={base} sha={base_sha[:9]}")
-    try:
-        failing = [c["name"] for c in head_result.failed]
-        base_result = wait_for_ci(
-            config.repo_url,
-            base_sha,
-            setup.repo_dir,
-            max(0, int(deadline - time.monotonic())),
-            required=failing,
-            is_cancelled=cancelled,
-        )
-    finally:
-        subprocess.run(
-            ["git", "push", "origin", "--delete", branch],
-            cwd=setup.repo_dir,
-            capture_output=True,
-            check=False,
-        )
-    verdict = judge_claim(head_result, base_result)
-    ci.claim_check, ci.baseline = verdict, base_result
-    states = ", ".join(f"{c['name']}={c['state']}" for c in base_result.checks) or base_result.state
-    log("POST", f"CI: baseline probe on {base}@{base_sha[:9]}: {states} -> claim {verdict}")
-    progress.write_agent_milestone(
-        "ci_baseline_probe_result", f"claim={verdict} base={states}"[:900]
-    )
-    return verdict
-
-
-def _run_ci_rounds(
-    agent_result,
-    *,
-    workflow,
-    config,
-    setup,
-    pr_url: str,
-    system_prompt: str,
-    trajectory,
-    progress,
-):
-    """Wait for the PR's CI in-session; on red, resume the agent with the report (see ci_wait.py).
-
-    No-op (returns ``(agent_result, None)``) unless the repo sets
-    ``ci_wait_timeout_s``. Rounds come from the workflow's
-    ``convergence.max_fixup_rounds``; each round re-waits on the new head SHA.
-    """
-    import asyncio
-    import re
-
-    from ci_wait import (
-        CiConvergence,
-        build_ci_fixup_prompt,
-        ci_comments_for,
-        failure_report,
-        refutation_evidence,
-        wait_for_ci,
-    )
-    from fixup import MIN_FIXUP_BUDGET_USD, max_fixup_rounds, remaining_budget
-    from runner import run_agent
-
-    timeout_s = int(getattr(config, "ci_wait_timeout_s", 0) or 0)
-    if timeout_s <= 0:
-        return agent_result, None
-    max_rounds = max_fixup_rounds(workflow)
-    match = re.search(r"/pull/(\d+)", pr_url)
-    pr_number = match.group(1) if match else ""
-    ci = CiConvergence()
-
-    def _cancelled() -> bool:
-        try:
-            rec = task_state.get_task(config.task_id)
-        except task_state.TaskFetchError:
-            return False
-        return bool(rec and rec.get("status") == "CANCELLED")
-
-    deadline = time.monotonic() + timeout_s
-    evidence = ""  # set when a baseline probe refuted the agent's "unrelated" claim
-    while True:
-        # Wait on what CI actually builds: push anything local first (the
-        # safety-net commit can land after the agent's own push when the agent
-        # opened the PR itself), then take the PR's head SHA from GitHub.
-        ensure_pushed(setup.repo_dir, setup.branch)
-        sha = _pr_head_sha(config.repo_url, pr_number, setup.repo_dir) or _head_sha(setup.repo_dir)
-        progress.write_agent_milestone("ci_wait_started", f"sha={sha[:9]} round={ci.rounds}")
-        log(
-            "POST",
-            f"CI: waiting for checks on {sha[:9]} (up to {int(deadline - time.monotonic())}s)",
-        )
-        result = wait_for_ci(
-            config.repo_url,
-            sha,
-            setup.repo_dir,
-            max(0, int(deadline - time.monotonic())),
-            required=list(getattr(config, "ci_required_checks", None) or []),
-            is_cancelled=_cancelled,
-        )
-        ci.results.append(result)
-        names = ", ".join(f"{c['name']}={c['state']}" for c in result.checks) or "none"
-        log("POST", f"CI: {result.state} on {sha[:9]} after {result.waited_s}s ({names})")
-        progress.write_agent_milestone(
-            "ci_result", f"state={result.state} sha={sha[:9]} checks={names}"[:900]
-        )
-        if result.state != "fail":
-            ci.stopped_reason = f"ci {result.state}"
-            break
-        if ci.rounds >= max_rounds:
-            ci.stopped_reason = "max fix-up rounds reached"
-            break
-        budget = remaining_budget(config.max_budget_usd, agent_result.cost_usd)
-        if budget is not None and budget < MIN_FIXUP_BUDGET_USD:
-            ci.stopped_reason = "budget exhausted"
-            break
-        if not agent_result.session_id:
-            ci.stopped_reason = "no agent session to resume"
-            break
-        ci.rounds += 1
-        report = failure_report(
-            result, ci_comments_for(config.repo_url, pr_number, sha, setup.repo_dir)
-        )
-        if evidence:
-            report = f"{evidence}\n\n{report}"
-        progress.write_agent_milestone("ci_fixup_round_started", f"round={ci.rounds}/{max_rounds}")
-        try:
-            fix_result = asyncio.run(
-                run_agent(
-                    build_ci_fixup_prompt(report, ci.rounds, max_rounds),
-                    system_prompt,
-                    config,
-                    cwd=setup.repo_dir,
-                    trajectory=trajectory,
-                    resume_session_id=agent_result.session_id,
-                    max_budget_usd=budget,
-                )
-            )
-        except Exception as e:
-            log_error_cw(f"CI fix-up round {ci.rounds} failed: {e}", task_id=config.task_id or None)
-            ci.stopped_reason = f"fix-up agent error: {type(e).__name__}"
-            break
-        agent_result.cost_usd = (agent_result.cost_usd or 0.0) + (fix_result.cost_usd or 0.0)
-        agent_result.turns += fix_result.turns
-        agent_result.num_turns = (agent_result.num_turns or 0) + (fix_result.num_turns or 0)
-        if fix_result.session_id:
-            agent_result.session_id = fix_result.session_id
-        reconcile_agent_branch(setup.repo_dir, setup.branch)
-        ensure_committed(setup.repo_dir)
-        ensure_pushed(setup.repo_dir, setup.branch)
-        new_sha = _head_sha(setup.repo_dir)
-        if new_sha == sha:
-            # The agent judged the failure unrelated to its change and pushed
-            # nothing. Verify that claim instead of taking it: the same CI on the
-            # unchanged base commit.
-            verdict = _probe_baseline(config, setup, result, deadline, _cancelled, ci, progress)
-            if verdict == "refuted" and ci.rounds < max_rounds and ci.baseline is not None:
-                evidence = refutation_evidence(result, ci.baseline, setup.default_branch)
-                continue
-            ci.stopped_reason = {
-                "refuted": "agent's 'unrelated' claim refuted on the base; no rounds left",
-                "confirmed": "failure also on the base branch (pre-existing)",
-            }.get(
-                verdict,
-                "agent pushed no change; its 'unrelated failure' claim could not be verified",
-            )
-            break
-        evidence = ""
-    return agent_result, ci
-
-
 def _apply_post_hook_gates(
     workflow: Workflow | None,
     *,
@@ -890,6 +551,7 @@ def _resolve_overall_task_status(
     pr_url: str | None,
     build_timed_out: bool = False,
     build_infra_failed: bool = False,
+    ci_error: str | None = None,
 ) -> tuple[str, str | None]:
     """Map agent outcome + build gate to (overall_status, error_for_task_result).
 
@@ -907,6 +569,9 @@ def _resolve_overall_task_status(
     which would wrongly report ✅ success on unverified code — an observed false
     ✅). The ``build_ok=infra`` marker makes the platform surface a retryable
     infrastructure fault, not "build/tests failed" or a bogus success.
+
+    ``ci_error`` (``convergence.ci_failure_message``) is the PR's CI/CD not
+    converging; it turns an otherwise successful task into an error.
     """
     agent_status = agent_result.status
     err = agent_result.error
@@ -934,6 +599,8 @@ def _resolve_overall_task_status(
         return "error", (f"Task did not succeed (agent_status={agent_status!r}, build_ok=infra)")
 
     if agent_status in ("success", "end_turn") and build_ok:
+        if ci_error:
+            return "error", ci_error
         return "success", err
 
     # #251 carry-path: a hook may have detected an environmental blocker mid-run
@@ -1164,6 +831,7 @@ def run_task(
     ci_required_checks: list[str] | None = None,
     ui_checks_dir: str = "",
     require_tests: bool = False,
+    ci_baseline_probe: bool = False,
     prompt_version: str = "",
     memory_id: str = "",
     resolved_workflow: dict | None = None,
@@ -1220,6 +888,7 @@ def run_task(
         ci_required_checks=ci_required_checks,
         ui_checks_dir=ui_checks_dir,
         require_tests=require_tests,
+        ci_baseline_probe=ci_baseline_probe,
         resolved_workflow=resolved_workflow,
         branch_name=branch_name,
         pr_number=pr_number,
@@ -1798,18 +1467,19 @@ def run_task(
                     build_outcome = verify_build(setup.repo_dir, config.build_command)
                     # Convergence (test_gated): hand a genuine failure back to the
                     # agent's own session and re-verify, up to max_fixup_rounds.
-                    build_outcome, agent_result, fixup = _run_fixup_rounds(
-                        build_outcome,
-                        agent_result,
-                        workflow=_workflow,
+                    rounds_ctx = RoundContext(
                         config=config,
                         setup=setup,
                         system_prompt=system_prompt,
                         trajectory=trajectory,
                         progress=progress,
-                        read_only=workflow_read_only,
+                        max_rounds=max_fixup_rounds(_workflow),
+                    )
+                    build_outcome, fixup = run_fixup_rounds(
+                        build_outcome, agent_result, rounds_ctx, read_only=workflow_read_only
                     )
                     post_span.set_attribute("convergence.fixup_rounds", fixup.rounds)
+                    post_span.set_attribute("convergence.fixup_stopped", fixup.stopped_reason)
                     build_passed = build_outcome.passed
                     # Distinct diagnosis: a build that exceeded BUILD_VERIFY_TIMEOUT_S
                     # was KILLED, not failed — surface "timed out" rather than the
@@ -1867,20 +1537,11 @@ def run_task(
                     if pr_url and not workflow_read_only and build_passed:
                         # Convergence on the PR's CI (per-repo ci_wait_timeout_s):
                         # keep this session, wait for the checks, feed failures back.
-                        agent_result, ci_conv = _run_ci_rounds(
-                            agent_result,
-                            workflow=_workflow,
-                            config=config,
-                            setup=setup,
-                            pr_url=pr_url,
-                            system_prompt=system_prompt,
-                            trajectory=trajectory,
-                            progress=progress,
-                        )
+                        ci_conv = run_ci_rounds(agent_result, rounds_ctx, pr_url)
                     if pr_url and not workflow_read_only:
-                        # The platform's verdict in the PR even when the agent
-                        # opened it (ensure_pr then returns early, leaving only
-                        # the agent's own body).
+                        # The platform's verdict in the PR, also when the agent
+                        # opened it or a later round changed the outcome.
+                        ci_summary, ci_details = render_ci_summary(ci_conv)
                         upsert_verification_section(
                             setup.repo_dir,
                             pr_url,
@@ -1893,8 +1554,8 @@ def run_task(
                                 fixup_rounds=fixup.rounds,
                                 fixup_history=fixup.history,
                                 agent_result=agent_result,
-                                extra_lines=render_ci_summary(ci_conv)[1],
-                                ci_summary=render_ci_summary(ci_conv)[0],
+                                extra_lines=ci_details,
+                                ci_summary=ci_summary,
                             ),
                         )
                     post_span.set_attribute("build.passed", build_passed)
@@ -1963,29 +1624,8 @@ def run_task(
                 pr_url=pr_url,
                 build_timed_out=build_timed_out,
                 build_infra_failed=build_infra_failed,
+                ci_error=ci_failure_message(ci_conv, config.ci_required_checks),
             )
-            # A PR whose CI is still red after the fix-up rounds did not converge.
-            if (
-                ci_conv
-                and ci_conv.final
-                and ci_conv.final.state == "fail"
-                and overall_status == "success"
-            ):
-                failing = ", ".join(c["name"] for c in ci_conv.final.failed) or "CI"
-                overall_status = "error"
-                result_error = (
-                    f"ci_ok=False: CI checks failing on the PR after {ci_conv.rounds} "
-                    f"fix-up round(s): {failing}"
-                )
-                if ci_conv.claim_check == "confirmed":
-                    result_error = (
-                        f"ci_ok=preexisting: {failing} also fail on the base branch "
-                        "(not caused by this change); the PR needs the base fixed first"
-                    )
-                elif ci_conv.claim_check == "refuted":
-                    result_error += (
-                        " (the agent's 'unrelated' claim was refuted on the base branch)"
-                    )
             # Delivery gate: a create-strategy new-work task that
             # reported success but opened no PR AND landed no commit shipped
             # nothing — fail it loudly (retryable) instead of a false COMPLETED

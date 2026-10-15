@@ -402,6 +402,7 @@ def _run_task_background(
     ci_required_checks: list[str] | None = None,
     ui_checks_dir: str = "",
     require_tests: bool = False,
+    ci_baseline_probe: bool = False,
     prompt_version: str = "",
     memory_id: str = "",
     resolved_workflow: dict | None = None,
@@ -497,6 +498,7 @@ def _run_task_background(
             ci_required_checks=ci_required_checks,
             ui_checks_dir=ui_checks_dir,
             require_tests=require_tests,
+            ci_baseline_probe=ci_baseline_probe,
             prompt_version=prompt_version,
             memory_id=memory_id,
             resolved_workflow=resolved_workflow,
@@ -534,6 +536,30 @@ def _run_task_background(
             hb_thread.join(timeout=3)
 
 
+def _payload_bool(inp: dict, key: str) -> bool:
+    """A boolean payload field: JSON true/false (or "true"/"false"); absent = False."""
+    value = inp.get(key, False)
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str) and value.lower() in ("true", "false"):
+        return value.lower() == "true"
+    raise ValueError(f"payload field {key!r} must be a boolean, got {value!r}")
+
+
+def _payload_int(inp: dict, key: str) -> int:
+    """A non-negative integer payload field; absent/null = 0."""
+    value = inp.get(key) or 0
+    if isinstance(value, bool) or not isinstance(value, (int, str)):
+        raise ValueError(f"payload field {key!r} must be an integer, got {value!r}")
+    try:
+        number = int(value)
+    except ValueError as e:
+        raise ValueError(f"payload field {key!r} must be an integer, got {value!r}") from e
+    if number < 0:
+        raise ValueError(f"payload field {key!r} must be >= 0, got {number}")
+    return number
+
+
 def _extract_invocation_params(inp: dict, request: Request) -> dict:
     """Normalise ``input`` payload into keyword args for ``_run_task_background``."""
     repo_url = inp.get("repo_url") or os.environ.get("REPO_URL", "")
@@ -554,15 +580,16 @@ def _extract_invocation_params(inp: dict, request: Request) -> dict:
     lint_command = inp.get("lint_command", "")
     # Per-repo: after the PR opens, wait this long (s) for its CI checks in-session
     # and feed failures back to the agent. 0/absent = do not wait for CI.
-    ci_wait_timeout_s = int(inp.get("ci_wait_timeout_s") or 0)
+    ci_wait_timeout_s = _payload_int(inp, "ci_wait_timeout_s")
     # Check names that must all report before the PR counts as green (e.g. the
     # CI status context and "deployment:Preview" for a CD stage).
     ci_required_checks = [str(c) for c in (inp.get("ci_required_checks") or []) if c]
+    ci_baseline_probe = _payload_bool(inp, "ci_baseline_probe")
     # Per-repo: folder where the agent commits Playwright UI checks that CD runs
     # against the PR preview. Empty = no UI check asked of the agent.
     ui_checks_dir = str(inp.get("ui_checks_dir") or "")
     # Per-repo: behaviour changes must add tests to the project's own suites.
-    require_tests = bool(inp.get("require_tests") or False)
+    require_tests = _payload_bool(inp, "require_tests")
     max_turns = int(inp.get("max_turns", 0)) or int(os.environ.get("MAX_TURNS", "100"))
     max_budget_usd = float(inp.get("max_budget_usd", 0)) or None
     aws_region = inp.get("aws_region") or os.environ.get("AWS_REGION", "")
@@ -689,6 +716,7 @@ def _extract_invocation_params(inp: dict, request: Request) -> dict:
         "ci_required_checks": ci_required_checks,
         "ui_checks_dir": ui_checks_dir,
         "require_tests": require_tests,
+        "ci_baseline_probe": ci_baseline_probe,
         "prompt_version": prompt_version,
         "memory_id": memory_id,
         "resolved_workflow": resolved_workflow,

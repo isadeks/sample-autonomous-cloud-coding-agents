@@ -166,9 +166,46 @@ describe('repo onboard/offboard', () => {
 
     await onboardRepo('us-east-1', 'RepoTable', 'acme/a');
 
-    const put = ddbSend.mock.calls[0][0] as PutCommand;
-    expect(put.input.Item?.onboarded_at).toBe('2025-01-01T00:00:00Z');
-    expect(put.input.Item?.cedar_policies).toEqual(['policy']);
+    const item = (ddbSend.mock.calls[0][0] as PutCommand).input.Item!;
+    expect(item).toMatchObject({
+      onboarded_at: '2025-01-01T00:00:00Z',
+      compute_type: 'agentcore',
+      runtime_arn: 'arn:runtime',
+      model_id: 'model',
+      max_turns: 50,
+      github_token_secret_arn: 'arn:secret',
+      poll_interval_ms: 1000,
+      system_prompt_overrides: 'custom',
+      egress_allowlist: ['example.com'],
+      cedar_policies: ['policy'],
+      approval_gate_cap: 10,
+      max_budget_usd: 5,
+    });
+  });
+
+  test('explicit options override carried values; empty or false values clear them', async () => {
+    const { loadRepoConfig } = jest.requireMock('../../src/repo-lookup') as { loadRepoConfig: jest.Mock };
+    loadRepoConfig.mockResolvedValueOnce({
+      repo: 'acme/a', status: 'active', model_id: 'old', system_prompt_overrides: 'old', ci_baseline_probe: true,
+    });
+
+    await onboardRepo('us-east-1', 'RepoTable', 'acme/a', { modelId: 'new', systemPromptOverrides: '  ', ciBaselineProbe: false });
+
+    const item = (ddbSend.mock.calls[0][0] as PutCommand).input.Item!;
+    expect(item.model_id).toBe('new');
+    expect(item).not.toHaveProperty('system_prompt_overrides');
+    expect(item).not.toHaveProperty('ci_baseline_probe');
+  });
+
+  test('onboardRepo stores repo-specific agent instructions and the baseline probe opt-in', async () => {
+    await onboardRepo('us-east-1', 'RepoTable', 'acme/a', {
+      systemPromptOverrides: 'UI checks are Playwright specs.\n',
+      ciBaselineProbe: true,
+    });
+
+    const item = (ddbSend.mock.calls[0][0] as PutCommand).input.Item!;
+    expect(item.system_prompt_overrides).toBe('UI checks are Playwright specs.');
+    expect(item.ci_baseline_probe).toBe(true);
   });
 
   test('onboardRepo carries forward fields it does not manage (build/lint, registry refs) and drops the soft-delete ttl', async () => {
@@ -201,8 +238,8 @@ describe('repo onboard/offboard', () => {
       buildCommand: 'pnpm test',
       lintCommand: 'true',
       ciWaitTimeoutS: 2700,
-      ciRequiredChecks: ['AWS CodeBuild us-east-1 (ci)', 'deployment:Preview'],
-      uiChecksDir: '/.abca/ui-checks/',
+      ciRequiredChecks: ['ci/build', 'deployment:Preview'],
+      uiChecksDir: '/checks/ui/',
       requireTests: true,
     });
 
@@ -210,8 +247,8 @@ describe('repo onboard/offboard', () => {
     expect(item.build_command).toBe('pnpm test');
     expect(item.lint_command).toBe('true');
     expect(item.ci_wait_timeout_s).toBe(2700);
-    expect(item.ci_required_checks).toEqual(['AWS CodeBuild us-east-1 (ci)', 'deployment:Preview']);
-    expect(item.ui_checks_dir).toBe('.abca/ui-checks');
+    expect(item.ci_required_checks).toEqual(['ci/build', 'deployment:Preview']);
+    expect(item.ui_checks_dir).toBe('checks/ui');
     expect(item.require_tests).toBe(true);
   });
 

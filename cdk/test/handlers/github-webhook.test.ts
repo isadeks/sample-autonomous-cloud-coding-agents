@@ -147,6 +147,24 @@ describe('github-webhook receiver', () => {
       const invoke = lambdaSend.mock.calls[0][0].input;
       expect(invoke.FunctionName).toBe('gh-comment-task');
       expect(invoke.InvocationType).toBe('Event');
+      // the handler gets the already-decided fields, not the raw webhook body
+      expect(JSON.parse(new TextDecoder().decode(invoke.Payload))).toEqual({
+        kind: 'github_pr_comment',
+        repo: 'o/r',
+        prNumber: 7,
+        instruction: 'resolve the merge conflicts with main',
+        commentId: 555,
+        commentUrl: 'https://github.com/o/r/pull/7#c555',
+        author: 'sphia',
+      });
+    });
+
+    test('a failed dispatch rolls the dedup row back so GitHub\'s redelivery can retry', async () => {
+      ddbSend.mockResolvedValueOnce({}).mockResolvedValueOnce({});
+      lambdaSend.mockRejectedValueOnce(new Error('throttled'));
+      const res = await handler(ev(comment()));
+      expect(res.statusCode).toBe(500);
+      expect(ddbSend.mock.calls[1][0]).toMatchObject({ _type: 'Delete', input: { Key: { dedup_key: 'comment#o/r#555' } } });
     });
 
     test.each([
@@ -155,6 +173,7 @@ describe('github-webhook receiver', () => {
       ['untrusted author', { comment: { id: 1, body: '@bgagent do x', author_association: 'NONE', user: { type: 'User' } } }, 'untrusted_author'],
       ['bot author', { comment: { id: 1, body: '@bgagent do x', author_association: 'OWNER', user: { type: 'Bot' } } }, 'bot_author'],
       ['edited, not created', { action: 'edited' }, 'not_created'],
+      ['a quoted earlier request', { comment: { id: 1, body: '> @bgagent do x\n\nagreed', author_association: 'OWNER', user: { login: 'a', type: 'User' } } }, 'no_mention'],
     ])('ignores %s without invoking anything', async (_label, override, reason) => {
       const res = await handler(ev(comment(override)));
       expect(res.statusCode).toBe(200);

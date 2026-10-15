@@ -192,4 +192,33 @@ when { context.file_path like "*.env" };
 @category("auth")
 forbid (principal, action == Agent::Action::"write_file", resource)
 when { context.file_path like "*credentials*" };
+
+// Changing a test or test config that ALREADY EXISTED on the PR's base commit
+// (context.existing_file, set by the engine from the base tree) — the classic
+// way an agent makes a red check green without fixing the code. New test files
+// the agent adds are not gated. Medium severity: legitimate test fixes happen,
+// but a human decides. Only Write/Edit tool calls are seen here; edits made
+// through the shell are not, so a CI check on the final diff is the backstop.
+@tier("soft")
+@rule_id("modify_existing_test")
+@approval_timeout_s("600")
+@severity("medium")
+@category("tests")
+forbid (principal, action == Agent::Action::"write_file", resource)
+when { context has existing_file && context.existing_file
+    && (context.file_path like "*.spec.*"
+     || context.file_path like "*.test.*"
+     || context.file_path like "*_test.*"
+     || context.file_path like "*/test_*.py"
+     || context.file_path like "*/test/*"
+     || context.file_path like "*/tests/*"
+     || context.file_path like "*/__tests__/*"
+     || context.file_path like "*e2e-spec*"
+     || context.file_path like "*/e2e/*"
+     || context.file_path like "e2e/*"
+     || context.file_path like "test/*"
+     || context.file_path like "tests/*"
+     || context.file_path like "*vitest.config*"
+     || context.file_path like "*playwright.config*"
+     || context.file_path like "*jest.config*") };
 `;

@@ -21,7 +21,7 @@ import { ConditionalCheckFailedException } from '@aws-sdk/client-dynamodb';
 import { InvokeCommand, LambdaClient } from '@aws-sdk/client-lambda';
 import { DeleteCommand, PutCommand } from '@aws-sdk/lib-dynamodb';
 import type { APIGatewayProxyEvent, APIGatewayProxyResult } from 'aws-lambda';
-import { decideTrigger } from './shared/github-comment-trigger';
+import { decideTrigger, type GitHubCommentTrigger, type IssueCommentPayload } from './shared/github-comment-trigger';
 import {
   type GitHubDeploymentStatusPayload,
   type ProcessorEvent,
@@ -248,10 +248,11 @@ function jsonResponse(statusCode: number, body: Record<string, unknown>): APIGat
 }
 
 /**
- * `@bgagent <instruction>` on a PR → async invoke of the comment-trigger Lambda.
- * The cheap payload gate runs here so ordinary comments never cost a Lambda
- * invoke; the delivery id dedups GitHub retries (the trigger also passes an
- * idempotency key per comment id to createTaskCore).
+ * `@bgagent <instruction>` on a PR → async invoke of the comment-trigger handler.
+ * The payload gate runs here so ordinary comments never cost an invoke; the
+ * comment id dedups GitHub retries (the handler also passes an idempotency key
+ * per comment to createTaskCore). Permission and PR checks happen in the
+ * handler, which has the GitHub token.
  */
 async function handleIssueComment(event: APIGatewayProxyEvent): Promise<APIGatewayProxyResult> {
   if (!COMMENT_TASK_FUNCTION_NAME) {
@@ -263,16 +264,18 @@ async function handleIssueComment(event: APIGatewayProxyEvent): Promise<APIGatew
   } catch {
     return jsonResponse(400, { error: 'Invalid JSON' });
   }
-  const decision = decideTrigger(parsed as Parameters<typeof decideTrigger>[0]);
+  const decision = decideTrigger(parsed as IssueCommentPayload);
   if (!decision.ok) {
     return jsonResponse(200, { ok: true, skipped: decision.reason });
   }
-  const delivery = event.headers['X-GitHub-Delivery'] ?? event.headers['x-github-delivery'] ?? '';
+  const { ok: _ok, ...fields } = decision;
+  const trigger: GitHubCommentTrigger = { kind: 'github_pr_comment', ...fields };
+  const dedupKey = `comment#${decision.repo}#${decision.commentId}`;
   try {
     await ddb.send(new PutCommand({
       TableName: DEDUP_TABLE_NAME,
       Item: {
-        dedup_key: `comment#${decision.repo}#${decision.commentId}`,
+        dedup_key: dedupKey,
         created_at: new Date().toISOString(),
         ttl: Math.floor(Date.now() / 1000) + DEDUP_TTL_SECONDS,
       },
@@ -284,16 +287,34 @@ async function handleIssueComment(event: APIGatewayProxyEvent): Promise<APIGatew
     }
     throw err;
   }
-  await lambdaClient.send(new InvokeCommand({
-    FunctionName: COMMENT_TASK_FUNCTION_NAME,
-    InvocationType: 'Event',
-    Payload: new TextEncoder().encode(JSON.stringify({ raw_body: event.body })),
-  }));
+  try {
+    await lambdaClient.send(new InvokeCommand({
+      FunctionName: COMMENT_TASK_FUNCTION_NAME,
+      InvocationType: 'Event',
+      Payload: new TextEncoder().encode(JSON.stringify(trigger)),
+    }));
+  } catch (invokeErr) {
+    logger.error('Failed to invoke the PR-comment trigger', {
+      error: invokeErr instanceof Error ? invokeErr.message : String(invokeErr),
+      repo: decision.repo,
+      comment_id: decision.commentId,
+    });
+    // Roll the dedup row back so GitHub's retry can try dispatch again.
+    try {
+      await ddb.send(new DeleteCommand({ TableName: DEDUP_TABLE_NAME, Key: { dedup_key: dedupKey } }));
+    } catch (cleanupErr) {
+      logger.warn('Failed to roll back PR-comment dedup row after invoke failure', {
+        error: cleanupErr instanceof Error ? cleanupErr.message : String(cleanupErr),
+        dedup_key: dedupKey,
+      });
+    }
+    return jsonResponse(500, { error: 'Dispatch failed' });
+  }
   logger.info('PR comment trigger dispatched', {
     repo: decision.repo,
     pr_number: decision.prNumber,
     comment_id: decision.commentId,
-    ...(/^[0-9a-f-]{36}$/i.test(delivery) && { delivery_id: delivery }),
+    delivery_id: event.headers['X-GitHub-Delivery'] ?? event.headers['x-github-delivery'],
   });
   return jsonResponse(202, { ok: true, comment_trigger: 'dispatched' });
 }

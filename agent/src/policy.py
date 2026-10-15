@@ -57,6 +57,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import time
 from collections import OrderedDict, deque
 from dataclasses import dataclass
@@ -775,8 +776,15 @@ class PolicyEngine:
         approval_gate_cap: int = DEFAULT_APPROVAL_GATE_CAP,
         initial_approval_gate_count: int = 0,
         task_default_timeout_s: int = DEFAULT_TASK_TIMEOUT_S,
+        repo_root: str = "",
+        files_at_base: frozenset[str] | None = None,
     ) -> None:
         self._task_type = task_type
+        # Repo-relative paths that exist on the PR's base commit. A write to one of
+        # them sets ``context.existing_file`` (e.g. the modify_existing_test rule);
+        # files the agent created in this PR are not in it.
+        self._repo_root = repo_root
+        self._files_at_base = files_at_base or frozenset()
         self._repo = repo
         self._read_only = read_only
         self._disabled = False
@@ -1150,6 +1158,10 @@ class PolicyEngine:
 
     # ---- Three-outcome pipeline -------------------------------------------
 
+    def _existed_at_base(self, file_path: str) -> bool:
+        rel = _relative_to(self._repo_root, file_path) if self._repo_root else ""
+        return bool(rel) and rel in self._files_at_base
+
     def evaluate_tool_use(self, tool_name: str, tool_input: dict) -> PolicyDecision:
         """Walk the three-outcome pipeline for a single tool call.
 
@@ -1374,7 +1386,11 @@ class PolicyEngine:
                     "write_file",
                     "Agent::File",
                     "file",
-                    {**base_context, "file_path": file_path},
+                    {
+                        **base_context,
+                        "file_path": file_path,
+                        "existing_file": self._existed_at_base(file_path),
+                    },
                 )
                 if write_decision == "deny":
                     return ("deny", write_reasons)
@@ -1393,6 +1409,13 @@ class PolicyEngine:
                     return ("deny", bash_reasons)
 
         return None
+
+
+def _relative_to(root: str, file_path: str) -> str:
+    """``file_path`` relative to ``root`` (normalized), or "" when outside it."""
+    full = os.path.normpath(os.path.join(root, file_path))
+    rel = os.path.relpath(full, os.path.normpath(root))
+    return "" if rel.startswith("..") else rel
 
 
 def _matching_rule_ids(

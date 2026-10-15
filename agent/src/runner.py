@@ -39,7 +39,7 @@ from config import AGENT_WORKSPACE
 from gateway_tools import GATEWAY_SERVER_NAME, build_gateway_server
 from models import AgentResult, TaskConfig, TokenUsage
 from progress_writer import _ProgressWriter
-from shell import log, log_error_cw, truncate
+from shell import log, log_error_cw, truncate, try_cmd
 from telemetry import _TrajectoryWriter
 
 
@@ -241,11 +241,40 @@ def _setup_agent_env(config: TaskConfig) -> tuple[str | None, str | None]:
     return otlp_endpoint, otlp_protocol
 
 
+def _files_at_base(repo_dir: str, base_branch: str = "") -> frozenset[str]:
+    """Repo-relative paths on the merge-base of HEAD and the PR's base.
+
+    The base is ``origin/<base_branch>`` (set for PR workflows and stacked
+    tasks), else ``origin/HEAD`` (the repo default). Lets policy rules tell a file
+    that already existed (e.g. a project test) from one the agent created in this
+    PR. Empty when not a git checkout or the base cannot be resolved.
+    """
+    if not os.path.isdir(os.path.join(repo_dir, ".git")):
+        return frozenset()
+    base_ref = f"origin/{base_branch}" if base_branch else "origin/HEAD"
+    merge_base = try_cmd(["git", "merge-base", "HEAD", base_ref], label="merge-base", cwd=repo_dir)
+    ref = merge_base.stdout.strip()
+    if merge_base.returncode != 0 or not ref:
+        log("WARN", f"policy: no merge-base with {base_ref}; existing-file rules will not match")
+        return frozenset()
+    tree = try_cmd(
+        ["git", "ls-tree", "-r", "--name-only", "-z", ref], label="base-tree", cwd=repo_dir
+    )
+    if tree.returncode != 0:
+        log(
+            "WARN",
+            f"policy: could not list the base tree {ref[:9]}; existing-file rules will not match",
+        )
+        return frozenset()
+    return frozenset(p for p in tree.stdout.split("\0") if p)
+
+
 def _initialize_policy_engine_and_hooks(
     *,
     config: TaskConfig,
     trajectory: _TrajectoryWriter | None,
     progress: _ProgressWriter,
+    cwd: str = "",
 ) -> tuple[Any, dict]:
     """Construct the per-task ``PolicyEngine`` and wire its hook matchers.
 
@@ -288,6 +317,8 @@ def _initialize_policy_engine_and_hooks(
         repo=config.repo_url,
         read_only=config.read_only,
         extra_policies=cedar_policies if cedar_policies else None,
+        repo_root=cwd,
+        files_at_base=_files_at_base(cwd, config.base_branch or "") if cwd else None,
         **engine_kwargs,
     )
     # Surface the resolved cap + its source so operators can distinguish a
@@ -521,12 +552,13 @@ async def run_agent(
     trajectory: _TrajectoryWriter | None = None,
     resume_session_id: str | None = None,
     max_budget_usd: float | None = None,
+    max_turns: int | None = None,
 ) -> AgentResult:
     """Invoke the Claude Agent SDK and stream output.
 
     ``resume_session_id`` continues an earlier session (the convergence fix-up
-    turn keeps the agent's full context); ``max_budget_usd`` overrides the
-    task budget for this call (the fix-up gets what the first call left).
+    turn keeps the agent's full context); ``max_budget_usd`` and ``max_turns``
+    override the task's limits for this call (a fix-up gets what is left).
     """
     from claude_agent_sdk import (
         AssistantMessage,
@@ -591,6 +623,7 @@ async def run_agent(
         config=config,
         trajectory=trajectory,
         progress=progress,
+        cwd=cwd,
     )
 
     # Clarify-before-spend (UX #4): register the in-process request_clarification
@@ -630,7 +663,7 @@ async def run_agent(
         disallowed_tools=list(_DISALLOWED_TOOLS),
         permission_mode="bypassPermissions",
         cwd=cwd,
-        max_turns=config.max_turns,
+        max_turns=max_turns if max_turns is not None else config.max_turns,
         setting_sources=_resolve_setting_sources(config),
         hooks=hooks,
         max_budget_usd=max_budget_usd if max_budget_usd is not None else config.max_budget_usd,

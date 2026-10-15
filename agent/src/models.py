@@ -140,6 +140,10 @@ class HydratedContext(BaseModel):
         return self
 
 
+# Upper bound for ``TaskConfig.ci_wait_timeout_s`` (seconds).
+CI_WAIT_TIMEOUT_MAX_S = 4 * 3600
+
+
 class TaskConfig(BaseModel):
     model_config = ConfigDict(validate_assignment=True)
 
@@ -177,13 +181,19 @@ class TaskConfig(BaseModel):
     build_command: str = ""
     lint_command: str = ""
     # Seconds to wait (in-session, after the PR opens) for the PR's CI checks;
-    # failures go back to the agent as convergence fix-up rounds. 0 = off.
-    ci_wait_timeout_s: int = Field(default=0, ge=0, le=6 * 3600)
+    # failures go back to the agent as convergence fix-up rounds. 0 = off. Capped
+    # well inside the agent session / orchestrator limits (~8 h / 9 h), which also
+    # cover the agent's own work and the fix-up rounds.
+    ci_wait_timeout_s: int = Field(default=0, ge=0, le=CI_WAIT_TIMEOUT_MAX_S)
     # Checks that must all report green (status context / check name /
     # "deployment:<env>") before the PR counts as converged.
     ci_required_checks: list[str] = Field(default_factory=list)
-    # Repo-relative folder for agent-written Playwright UI checks run by CD on the
-    # PR preview ("" = off). See prompts/ui_check.py.
+    # When an agent calls a CI failure unrelated to its change and the base commit
+    # has no CI results for those checks: push abca-baseline/<task_id> at the base
+    # commit so the repo's CI builds it (opt-in: it triggers push CI on the repo).
+    ci_baseline_probe: bool = False
+    # Repo-relative folder for agent-written UI checks run by CD on the PR
+    # preview ("" = off); prompt_builder adds the matching prompt section.
     ui_checks_dir: str = ""
     # Behaviour changes must add tests to the project's own suites (prompt + CI gate).
     require_tests: bool = False

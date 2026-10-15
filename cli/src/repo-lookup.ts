@@ -49,6 +49,7 @@ export interface RepoConfigRow {
   readonly ci_required_checks?: string[];
   readonly ui_checks_dir?: string;
   readonly require_tests?: boolean;
+  readonly ci_baseline_probe?: boolean;
 }
 
 /**

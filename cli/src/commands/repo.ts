@@ -17,6 +17,7 @@
  *  SOFTWARE.
  */
 
+import * as fs from 'fs';
 import { Command } from 'commander';
 import { assertComputeSubstrateDeployed } from '../compute-substrate';
 import { CliError } from '../errors';
@@ -165,9 +166,13 @@ export function makeRepoCommand(): Command {
       .option('--ci-wait-timeout <seconds>', 'Wait in-session for the PR\'s CI/CD checks and fix failures (0 = off)', parseInt)
       .option('--ci-required-check <name>', 'Check that must report green before the PR converges (repeatable; e.g. deployment:Preview)', (v: string, acc: string[] = []) => [...acc, v])
       .option('--clear-ci-required-checks', 'Remove the stored required checks')
-      .option('--require-tests', 'Behaviour changes must add tests to the project\'s own suites (agent prompt; enforce in CI)')
+      .option('--require-tests', 'Ask the agent to add unit and e2e tests to the project\'s own suites for every behaviour change')
       .option('--no-require-tests', 'Stop requiring project tests')
-      .option('--ui-checks-dir <dir>', 'Ask the agent to commit Playwright UI checks here, run by CD on the PR preview (\'\' clears)')
+      .option('--ui-checks-dir <dir>', 'Ask the agent to commit a UI check here, which the repo\'s CD runs on the PR preview (\'\' clears)')
+      .option('--system-prompt-overrides-file <path>', 'Repo-specific agent instructions (e.g. the CD\'s UI-check contract) from a file')
+      .option('--clear-system-prompt-overrides', 'Remove the stored repo-specific agent instructions')
+      .option('--ci-baseline-probe', 'Verify an agent\'s "unrelated CI failure" claim by running CI on the base branch (pushes abca-baseline/<task-id>)')
+      .option('--no-ci-baseline-probe', 'Do not run the baseline probe')
       .option('--output <format>', 'Output format: text or json', 'text')
       .action(async (repoId: string, opts) => {
         assertRepoFormat(repoId);
@@ -250,6 +255,10 @@ export function makeRepoCommand(): Command {
           ciRequiredChecks: opts.clearCiRequiredChecks ? [] : opts.ciRequiredCheck,
           uiChecksDir: opts.uiChecksDir,
           requireTests: opts.requireTests,
+          ciBaselineProbe: opts.ciBaselineProbe,
+          systemPromptOverrides: opts.clearSystemPromptOverrides
+            ? ''
+            : readOverridesFile(opts.systemPromptOverridesFile),
         });
         const notes = buildRepoOnboardNotes({
           config,
@@ -300,4 +309,14 @@ export function makeRepoCommand(): Command {
   );
 
   return repo;
+}
+
+/** Contents of ``--system-prompt-overrides-file`` (undefined when the flag is absent). */
+function readOverridesFile(path: string | undefined): string | undefined {
+  if (path === undefined) return undefined;
+  try {
+    return fs.readFileSync(path, 'utf-8');
+  } catch (err) {
+    throw new CliError(`--system-prompt-overrides-file: cannot read ${path}: ${(err as Error).message}`);
+  }
 }

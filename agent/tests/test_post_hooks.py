@@ -263,11 +263,12 @@ class TestEnsurePrCreate:
         # PR title derived from first commit subject.
         assert "--title" in create_cmd
         assert create_cmd[create_cmd.index("--title") + 1] == "feat: do the thing"
-        # Body carries verification statuses and the issue link.
+        # Body carries the issue link and the platform's marked verification block
+        # (later rounds replace that block in place).
         body = create_cmd[create_cmd.index("--body") + 1]
         assert "Resolves #55" in body
-        assert "**PASS**" in body  # build passed
-        assert "**FAIL**" in body  # lint failed
+        assert post_hooks.VERIFICATION_START in body and post_hooks.VERIFICATION_END in body
+        assert "build gate ✅" in body and "lint ❌" in body
 
 
 class TestReconcileAgentBranch:

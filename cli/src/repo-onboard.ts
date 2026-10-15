@@ -52,8 +52,12 @@ export interface OnboardRepoOptions {
   readonly ciWaitTimeoutS?: number;
   /** Checks that must all report green, e.g. a CI status context and `deployment:Preview`. */
   readonly ciRequiredChecks?: string[];
-  /** Folder for agent-written Playwright UI checks run by CD on the PR preview ('' clears). */
+  /** Repo-relative folder of agent-written UI checks that the repo's CD runs on the PR preview ('' clears). */
   readonly uiChecksDir?: string;
+  /** Extra system-prompt text for this repo, e.g. its CD's UI-check contract ('' clears). */
+  readonly systemPromptOverrides?: string;
+  /** Verify an agent's "unrelated CI failure" claim by running CI on the base branch (pushes `abca-baseline/<task>`). */
+  readonly ciBaselineProbe?: boolean;
   /** Require project tests for behaviour changes (true/false; undefined keeps the stored value). */
   readonly requireTests?: boolean;
 }
@@ -106,59 +110,34 @@ export async function onboardRepo(
     updated_at: now,
   };
 
+  // Explicit options override the carried row; `undefined` keeps the stored value.
   if (options.computeType) item.compute_type = options.computeType;
-  else if (existing?.compute_type) item.compute_type = existing.compute_type;
-
   if (options.runtimeArn) item.runtime_arn = options.runtimeArn;
-  else if (existing?.runtime_arn) item.runtime_arn = existing.runtime_arn;
-
   if (options.modelId) item.model_id = options.modelId;
-  else if (existing?.model_id) item.model_id = existing.model_id;
-
   if (options.maxTurns !== undefined) item.max_turns = options.maxTurns;
-  else if (existing?.max_turns !== undefined) item.max_turns = existing.max_turns;
-
-  if (options.githubTokenSecretArn) {item.github_token_secret_arn = options.githubTokenSecretArn;} else if (existing?.github_token_secret_arn) {
-    item.github_token_secret_arn = existing.github_token_secret_arn;
-  }
-
-  if (options.pollIntervalMs !== undefined) {item.poll_interval_ms = options.pollIntervalMs;} else if (existing?.poll_interval_ms !== undefined) {
-    item.poll_interval_ms = existing.poll_interval_ms;
-  }
-
-  if (existing?.system_prompt_overrides) {
-    item.system_prompt_overrides = existing.system_prompt_overrides;
-  }
-  if (existing?.egress_allowlist?.length) item.egress_allowlist = existing.egress_allowlist;
-  if (existing?.cedar_policies?.length) item.cedar_policies = existing.cedar_policies;
-  if (existing?.approval_gate_cap !== undefined) {
-    item.approval_gate_cap = existing.approval_gate_cap;
-  }
-  if (existing?.max_budget_usd !== undefined) item.max_budget_usd = existing.max_budget_usd;
-
+  if (options.githubTokenSecretArn) item.github_token_secret_arn = options.githubTokenSecretArn;
+  if (options.pollIntervalMs !== undefined) item.poll_interval_ms = options.pollIntervalMs;
   if (options.buildCommand !== undefined) item.build_command = options.buildCommand;
   if (options.lintCommand !== undefined) item.lint_command = options.lintCommand;
+  if (options.systemPromptOverrides !== undefined) {
+    setOrDelete(item, 'system_prompt_overrides', options.systemPromptOverrides.trim() || undefined);
+  }
   if (options.ciWaitTimeoutS !== undefined) {
     if (!Number.isInteger(options.ciWaitTimeoutS) || options.ciWaitTimeoutS < 0 || options.ciWaitTimeoutS > MAX_CI_WAIT_TIMEOUT_S) {
       throw new CliError(`--ci-wait-timeout must be an integer number of seconds between 0 and ${MAX_CI_WAIT_TIMEOUT_S}`);
     }
-    if (options.ciWaitTimeoutS === 0) delete item.ci_wait_timeout_s;
-    else item.ci_wait_timeout_s = options.ciWaitTimeoutS;
+    setOrDelete(item, 'ci_wait_timeout_s', options.ciWaitTimeoutS || undefined);
   }
+  if (options.ciRequiredChecks !== undefined) {
+    setOrDelete(item, 'ci_required_checks', options.ciRequiredChecks.length ? options.ciRequiredChecks : undefined);
+  }
+  if (options.ciBaselineProbe !== undefined) setOrDelete(item, 'ci_baseline_probe', options.ciBaselineProbe || undefined);
   if (options.uiChecksDir !== undefined) {
     const dir = options.uiChecksDir.trim().replace(/^\/+|\/+$/g, '');
     if (dir.split('/').includes('..')) throw new CliError('--ui-checks-dir must stay inside the repository');
-    if (dir) item.ui_checks_dir = dir;
-    else delete item.ui_checks_dir;
+    setOrDelete(item, 'ui_checks_dir', dir || undefined);
   }
-  if (options.requireTests !== undefined) {
-    if (options.requireTests) item.require_tests = true;
-    else delete item.require_tests;
-  }
-  if (options.ciRequiredChecks !== undefined) {
-    if (options.ciRequiredChecks.length) item.ci_required_checks = options.ciRequiredChecks;
-    else delete item.ci_required_checks;
-  }
+  if (options.requireTests !== undefined) setOrDelete(item, 'require_tests', options.requireTests || undefined);
 
   await ddb.send(new PutCommand({
     TableName: tableName,
@@ -166,6 +145,12 @@ export async function onboardRepo(
   }));
 
   return parseRepoConfigRow(item);
+}
+
+/** Set ``key`` to ``value``, or remove it from the row when ``value`` is undefined. */
+function setOrDelete(item: Record<string, unknown>, key: string, value: unknown): void {
+  if (value === undefined) delete item[key];
+  else item[key] = value;
 }
 
 /** Soft-delete a repository (Blueprint delete semantics). */

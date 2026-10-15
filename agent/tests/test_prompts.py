@@ -354,38 +354,29 @@ class TestCrossLanguageHashParity:
 
 
 class TestUiCheckAddendum:
-    """Per-repo ui_checks_dir asks the agent for a Playwright UI check of its change."""
+    """Per-repo ui_checks_dir asks the agent for a UI check of its change."""
 
-    def test_off_by_default(self):
+    def test_off_when_no_dir(self):
         from prompts.ui_check import ui_check_addendum
 
         assert ui_check_addendum("") == ""
         assert ui_check_addendum("  /  ") == ""
 
-    def test_contract_names_dir_and_env(self):
+    def test_names_the_dir_and_stays_repo_neutral(self):
         from prompts.ui_check import ui_check_addendum
 
-        text = ui_check_addendum(".abca/ui-checks/")
-        assert "`.abca/ui-checks/<short-slug>.spec.ts`" in text
-        for var in (
-            "PREVIEW_URL",
-            "PREVIEW_API_URL",
-            "PREVIEW_ADMIN_EMAIL",
-            "PREVIEW_ADMIN_PASSWORD",
-            "UI_CHECK_ASSETS",
-            "PREVIEW_IMPORT_DIR",
-            "UI_CHECK_SHOTS",
-        ):
-            assert var in text
-        assert (
-            "${process.env.UI_CHECK_SHOTS}/01-before-delete.png" in text
-        )  # braces survived format()
+        text = ui_check_addendum("checks/ui/")
+        assert "`checks/ui/`" in text
+        assert "UI_CHECK_SHOTS" in text
+        # the repo's CD contract (env vars, assets, framework) is not the platform's to state
+        for repo_specific in ("PREVIEW_", "Playwright", "JPEG", ".abca"):
+            assert repo_specific not in text
 
 
-def test_tests_required_addendum():
-    from prompts.ui_check import tests_required_addendum
+def test_tests_required_addendum_states_only_the_requirement():
+    from prompts.repo_requirements import TESTS_REQUIRED_ADDENDUM
 
-    assert tests_required_addendum(False) == ""
-    text = tests_required_addendum(True)
-    assert "## Tests (required for this repository)" in text
-    assert "e2e/src/specs" in text and "`.abca/`" in text
+    assert "## Tests (required for this repository)" in TESTS_REQUIRED_ADDENDUM
+    assert "Unit tests" in TESTS_REQUIRED_ADDENDUM and "end-to-end" in TESTS_REQUIRED_ADDENDUM
+    for unsupported_claim in ("rejects", "do not count", "e2e/src/specs"):
+        assert unsupported_claim not in TESTS_REQUIRED_ADDENDUM

@@ -183,6 +183,12 @@ def _clean_env(monkeypatch):
     """
     for var in _AGENT_ENV_VARS:
         monkeypatch.delenv(var, raising=False)
+    # A git hook (e.g. the pre-commit agent-quality run, notably in a linked
+    # worktree) exports GIT_DIR / GIT_INDEX_FILE / GIT_WORK_TREE. Tests that build
+    # throwaway repos under tmp_path would otherwise operate on (and commit into)
+    # the real repository. Strip every GIT_* variable (see upstream #855).
+    for var in [v for v in os.environ if v.startswith("GIT_")]:
+        monkeypatch.delenv(var, raising=False)
 
     from aws_session import reset_session_cache
 

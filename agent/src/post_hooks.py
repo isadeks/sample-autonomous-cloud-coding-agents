@@ -9,7 +9,7 @@ import subprocess
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
-from shell import log, run_cmd
+from shell import log, redact_secrets, run_cmd
 
 if TYPE_CHECKING:
     from models import AgentResult, RepoSetup, TaskConfig
@@ -72,16 +72,36 @@ class VerifyOutcome:
     output_tail: str = ""
 
 
-# How much of a failing verify command's output the fix-up turn sees.
-VERIFY_OUTPUT_TAIL_LINES = int(os.environ.get("VERIFY_OUTPUT_TAIL_LINES") or 150)
+_DEFAULT_TAIL_LINES = 150
+
+
+def _verify_output_tail_lines() -> int:
+    """``VERIFY_OUTPUT_TAIL_LINES``: lines of a failing verify command's output a fix-up sees."""
+    raw = os.environ.get("VERIFY_OUTPUT_TAIL_LINES", "")
+    if not raw:
+        return _DEFAULT_TAIL_LINES
+    try:
+        return max(1, int(raw))
+    except ValueError:
+        log(
+            "WARN",
+            f"VERIFY_OUTPUT_TAIL_LINES={raw!r} is not an integer; using {_DEFAULT_TAIL_LINES}",
+        )
+        return _DEFAULT_TAIL_LINES
+
+
+VERIFY_OUTPUT_TAIL_LINES = _verify_output_tail_lines()
 
 
 def _output_tail(
     result: subprocess.CompletedProcess, max_lines: int = VERIFY_OUTPUT_TAIL_LINES
 ) -> str:
-    """Last ``max_lines`` lines of a command's combined output."""
-    text = (getattr(result, "stdout", "") or "") + (getattr(result, "stderr", "") or "")
-    return "\n".join(text.rstrip().splitlines()[-max_lines:])
+    """Last ``max_lines`` lines of a command's output (stdout, then stderr), redacted.
+
+    The text goes into the agent's prompt and trajectory, so tokens are masked.
+    """
+    text = (result.stdout or "") + (result.stderr or "")
+    return redact_secrets("\n".join(text.rstrip().splitlines()[-max_lines:]))
 
 
 # POSIX shell exit code for "command not found" — an inert build signal (the
@@ -722,16 +742,6 @@ def ensure_pr(
     elif config.task_description:
         task_source = f"**Task:** {config.task_description}\n\n"
 
-    build_status = "PASS" if build_passed else "FAIL"
-    lint_status = "PASS" if lint_passed else "FAIL"
-    # Show the actual commands run (default mise), not a hardcoded label.
-    build_label = (config.build_command or DEFAULT_BUILD_COMMAND).strip()
-    lint_label = (config.lint_command or DEFAULT_LINT_COMMAND).strip()
-
-    cost_line = ""
-    if agent_result and agent_result.cost_usd is not None:
-        cost_line = f"- Agent cost: **${agent_result.cost_usd:.4f}**\n"
-
     # When build-regression gating is inert (no runnable build command, none
     # configured), say so plainly — otherwise a green "build: PASS" misleads:
     # nothing was actually verified.
@@ -744,6 +754,9 @@ def ensure_pr(
             "`pipeline.buildCommand` in this repo's ABCA blueprint (e.g. `npm run build`).\n\n"
         )
 
+    verification = render_verification_section(
+        config, build_passed, lint_passed, agent_result=agent_result
+    )
     pr_body = (
         f"## Summary\n\n"
         f"{task_source}"
@@ -751,10 +764,7 @@ def ensure_pr(
         f"```\n{commits}\n```\n\n"
         f"## Verification\n\n"
         f"{gate_warning}"
-        f"- `{build_label}` (post-agent): **{build_status}**\n"
-        f"- `{lint_label}` (post-agent): **{lint_status}**\n"
-        f"{cost_line}\n"
-        f"---\n\n"
+        f"{verification}\n\n---\n\n"
         f"By submitting this pull request, I confirm that you can use, modify, copy, "
         f"and redistribute this contribution, under the terms of the [project license](https://github.com/aws-samples/sample-autonomous-cloud-coding-agents/blob/main/LICENSE)."
     )
@@ -857,9 +867,10 @@ def render_verification_section(
 ) -> str:
     """The platform's verdict between stable markers: ONE summary line, details collapsed.
 
-    Upserted into whatever PR exists, so the platform's verdict is visible even
-    when the agent opened the PR itself. ``ci_summary`` / ``extra_lines`` come
-    from the CI convergence loop (``ci_wait.render_ci_summary``).
+    ``ensure_pr`` writes it into the bodies it creates, and
+    ``upsert_verification_section`` replaces it (or appends it to an agent-written
+    body) once the post-agent rounds are done. ``ci_summary`` / ``extra_lines``
+    come from ``ci_wait.render_ci_summary``.
     """
     build_label = (config.build_command or DEFAULT_BUILD_COMMAND).strip()
     lint_label = (config.lint_command or DEFAULT_LINT_COMMAND).strip()
@@ -918,9 +929,6 @@ def upsert_verification_section(
             )
             return False
         body = view.stdout.rstrip("\n")
-        if VERIFICATION_START not in body and "(post-agent): **" in body:
-            # ensure_pr wrote this body on create; it already carries the verdict.
-            return True
         pattern = re.compile(
             re.escape(VERIFICATION_START) + r".*?" + re.escape(VERIFICATION_END), re.DOTALL
         )

@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import subprocess
-from types import SimpleNamespace
 
 import post_hooks
 from post_hooks import (
@@ -14,6 +13,11 @@ from post_hooks import (
     verify_build,
     verify_lint,
 )
+
+
+def _done(returncode: int, stderr: str = "") -> subprocess.CompletedProcess:
+    """A finished verify command as ``run_cmd`` returns it."""
+    return subprocess.CompletedProcess([], returncode, stdout="", stderr=stderr)
 
 
 class TestResolveVerifyArgv:
@@ -89,7 +93,7 @@ class TestVerifyBuildHonorsCommand:
         def fake_run_cmd(argv, **kw):
             seen["argv"] = argv
             seen["kw"] = kw
-            return SimpleNamespace(returncode=0)
+            return _done(0)
 
         monkeypatch.setattr(post_hooks, "run_cmd", fake_run_cmd)
         return seen
@@ -119,7 +123,7 @@ class TestVerifyBuildHonorsCommand:
         assert seen["argv"] == ["ruff", "check", "."]
 
     def test_nonzero_returncode_is_failure_not_timeout(self, monkeypatch):
-        monkeypatch.setattr(post_hooks, "run_cmd", lambda argv, **kw: SimpleNamespace(returncode=1))
+        monkeypatch.setattr(post_hooks, "run_cmd", lambda argv, **kw: _done(1))
         outcome = verify_build("/repo", "npm run build")
         assert outcome.passed is False
         assert outcome.timed_out is False  # ran-and-failed, not a timeout
@@ -143,7 +147,7 @@ class TestVerifyBuildHonorsCommand:
         monkeypatch.setattr(
             post_hooks,
             "run_cmd",
-            lambda argv, **kw: SimpleNamespace(returncode=127, stderr="yarn: command not found"),
+            lambda argv, **kw: _done(127, "yarn: command not found"),
         )
         outcome = verify_build("/repo", "yarn install && yarn build")
         assert outcome.passed is False
@@ -155,7 +159,7 @@ class TestVerifyBuildHonorsCommand:
         monkeypatch.setattr(
             post_hooks,
             "run_cmd",
-            lambda argv, **kw: SimpleNamespace(returncode=1, stderr=no_task),
+            lambda argv, **kw: _done(1, no_task),
         )
         assert verify_build("/repo", "mise run build").inert is True
 
@@ -165,7 +169,7 @@ class TestVerifyBuildHonorsCommand:
         monkeypatch.setattr(
             post_hooks,
             "run_cmd",
-            lambda argv, **kw: SimpleNamespace(returncode=2, stderr="tsc: 3 type errors"),
+            lambda argv, **kw: _done(2, "tsc: 3 type errors"),
         )
         outcome = verify_build("/repo", "mise //cdk:compile")
         assert outcome.passed is False
@@ -180,7 +184,7 @@ class TestVerifyBuildHonorsCommand:
         monkeypatch.setattr(
             post_hooks,
             "run_cmd",
-            lambda argv, **kw: SimpleNamespace(returncode=1, stderr=enospc),
+            lambda argv, **kw: _done(1, enospc),
         )
         outcome = verify_build("/repo", "mise run build")
         assert outcome.passed is False
@@ -191,7 +195,7 @@ class TestVerifyBuildHonorsCommand:
         monkeypatch.setattr(
             post_hooks,
             "run_cmd",
-            lambda argv, **kw: SimpleNamespace(returncode=137, stderr="Killed"),
+            lambda argv, **kw: _done(137, "Killed"),
         )
         outcome = verify_build("/repo", "mise run build")
         assert outcome.passed is False
@@ -213,7 +217,7 @@ class TestVerifyBuildHonorsCommand:
         monkeypatch.setattr(
             post_hooks,
             "run_cmd",
-            lambda argv, **kw: SimpleNamespace(returncode=137, stderr=mise_and_notfound),
+            lambda argv, **kw: _done(137, mise_and_notfound),
         )
         outcome = verify_build("/repo", "mise run build")
         assert outcome.passed is False
@@ -229,7 +233,7 @@ class TestVerifyBuildHonorsCommand:
         monkeypatch.setattr(
             post_hooks,
             "run_cmd",
-            lambda argv, **kw: SimpleNamespace(returncode=137, stderr="compiling...\naborting"),
+            lambda argv, **kw: _done(137, "compiling...\naborting"),
         )
         outcome = verify_build("/repo", "mise run build")
         assert outcome.passed is False

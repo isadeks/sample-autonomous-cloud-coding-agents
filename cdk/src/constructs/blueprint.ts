@@ -159,6 +159,35 @@ export interface BlueprintProps {
      * ``mise run lint`` when unset. Same semantics as ``buildCommand``.
      */
     readonly lintCommand?: string;
+
+    /**
+     * Seconds the agent waits, in its session, for the PR's CI/CD checks after
+     * opening the PR; red results go back to the agent as fix-up rounds
+     * (``convergence.max_fixup_rounds``). 0 or unset = do not wait for CI.
+     */
+    readonly ciWaitTimeoutSeconds?: number;
+
+    /**
+     * Check names (commit status contexts, check-run names, or
+     * ``deployment:<environment>``) that must all report green before the PR
+     * counts as converged.
+     */
+    readonly ciRequiredChecks?: string[];
+
+    /**
+     * Before stopping on an agent's "this CI failure is unrelated to my change",
+     * run CI on the base branch (pushes ``abca-baseline/<task_id>``) to verify it.
+     */
+    readonly ciBaselineProbe?: boolean;
+
+    /**
+     * Repo-relative directory where the agent commits a UI check of its change,
+     * which the repository's CD runs against the PR preview.
+     */
+    readonly uiChecksDir?: string;
+
+    /** Ask the agent to add tests to the project's own suites for every behaviour change. */
+    readonly requireTests?: boolean;
   };
 
   /**
@@ -267,6 +296,13 @@ export class Blueprint extends Construct {
   /** Registry ``registry://`` refs for skills (#246). */
   public readonly skillRefs: readonly string[];
 
+  /**
+   * RepoTable attributes for in-session CI/CD convergence and agent
+   * requirements (``pipeline.ciWaitTimeoutSeconds`` … ``requireTests``), keyed by
+   * attribute name; only the configured ones are present.
+   */
+  private readonly convergenceAttributes: RepoTableAttributes;
+
   constructor(scope: Construct, id: string, props: BlueprintProps) {
     super(scope, id);
 
@@ -274,6 +310,7 @@ export class Blueprint extends Construct {
     this.cedarPolicies = [...(props.security?.cedarPolicies ?? [])];
     this.approvalGateCap = props.security?.approvalGateCap;
     this.maxBudgetUsd = props.agent?.maxBudgetUsd;
+    this.convergenceAttributes = convergenceAttributes(props.pipeline);
     this.mcpServerRefs = [...(props.assets?.mcpServers ?? [])];
     this.cedarPolicyModuleRefs = [...(props.assets?.cedarPolicyModules ?? [])];
     this.skillRefs = [...(props.assets?.skills ?? [])];
@@ -296,6 +333,7 @@ export class Blueprint extends Construct {
     this.node.addValidation(new DomainFormatValidation(this.egressAllowlist));
     this.node.addValidation(new ApprovalGateCapValidation(this.approvalGateCap));
     this.node.addValidation(new MaxBudgetUsdValidation(this.maxBudgetUsd));
+    this.node.addValidation(new ConvergenceValidation(props.pipeline));
     this.node.addValidation(new RegistryRefValidation('assets.mcpServers', this.mcpServerRefs, 'mcp_server'));
     this.node.addValidation(new RegistryRefValidation('assets.cedarPolicyModules', this.cedarPolicyModuleRefs, 'cedar_policy_module'));
     this.node.addValidation(new RegistryRefValidation('assets.skills', this.skillRefs, 'skill'));
@@ -340,6 +378,7 @@ export class Blueprint extends Construct {
     if (props.pipeline?.lintCommand) {
       item.lint_command = { S: props.pipeline.lintCommand };
     }
+    Object.assign(item, this.convergenceAttributes);
     if (this.egressAllowlist.length > 0) {
       item.egress_allowlist = { L: this.egressAllowlist.map(d => ({ S: d })) };
     }
@@ -431,6 +470,7 @@ export class Blueprint extends Construct {
     if (props.pipeline?.pollIntervalMs !== undefined) fields.push(', #poll_interval_ms = :poll_interval_ms');
     if (props.pipeline?.buildCommand) fields.push(', #build_command = :build_command');
     if (props.pipeline?.lintCommand) fields.push(', #lint_command = :lint_command');
+    for (const attr of Object.keys(this.convergenceAttributes)) fields.push(`, #${attr} = :${attr}`);
     if (this.egressAllowlist.length > 0) fields.push(', #egress_allowlist = :egress_allowlist');
     if (this.cedarPolicies.length > 0) fields.push(', #cedar_policies = :cedar_policies');
     if (this.approvalGateCap !== undefined) fields.push(', #approval_gate_cap = :approval_gate_cap');
@@ -454,6 +494,7 @@ export class Blueprint extends Construct {
     if (props.pipeline?.pollIntervalMs !== undefined) names['#poll_interval_ms'] = 'poll_interval_ms';
     if (props.pipeline?.buildCommand) names['#build_command'] = 'build_command';
     if (props.pipeline?.lintCommand) names['#lint_command'] = 'lint_command';
+    for (const attr of Object.keys(this.convergenceAttributes)) names[`#${attr}`] = attr;
     if (this.egressAllowlist.length > 0) names['#egress_allowlist'] = 'egress_allowlist';
     if (this.cedarPolicies.length > 0) names['#cedar_policies'] = 'cedar_policies';
     if (this.approvalGateCap !== undefined) names['#approval_gate_cap'] = 'approval_gate_cap';
@@ -475,6 +516,7 @@ export class Blueprint extends Construct {
     if (props.pipeline?.pollIntervalMs !== undefined) values[':poll_interval_ms'] = { N: String(props.pipeline.pollIntervalMs) };
     if (props.pipeline?.buildCommand) values[':build_command'] = { S: props.pipeline.buildCommand };
     if (props.pipeline?.lintCommand) values[':lint_command'] = { S: props.pipeline.lintCommand };
+    for (const [attr, value] of Object.entries(this.convergenceAttributes)) values[`:${attr}`] = value;
     if (this.egressAllowlist.length > 0) values[':egress_allowlist'] = { L: this.egressAllowlist.map(d => ({ S: d })) };
     if (this.cedarPolicies.length > 0) values[':cedar_policies'] = { L: this.cedarPolicies.map(p => ({ S: p })) };
     if (this.approvalGateCap !== undefined) values[':approval_gate_cap'] = { N: String(this.approvalGateCap) };
@@ -633,6 +675,43 @@ class RegistryRefValidation implements IValidation {
           + `but got '${result.ref.kind}'.`,
         );
       }
+    }
+    return errors;
+  }
+}
+
+/** Upper bound for ``pipeline.ciWaitTimeoutSeconds`` (matches the agent's TaskConfig bound). */
+const MAX_CI_WAIT_TIMEOUT_SECONDS = 21_600;
+
+/** DynamoDB-JSON RepoTable attributes, keyed by attribute name. */
+type RepoTableAttributes = Record<string, { S: string } | { N: string } | { BOOL: boolean } | { L: { S: string }[] }>;
+
+function convergenceAttributes(pipeline: BlueprintProps['pipeline']): RepoTableAttributes {
+  const attrs: RepoTableAttributes = {};
+  if (pipeline?.ciWaitTimeoutSeconds) attrs.ci_wait_timeout_s = { N: String(pipeline.ciWaitTimeoutSeconds) };
+  if (pipeline?.ciRequiredChecks?.length) attrs.ci_required_checks = { L: pipeline.ciRequiredChecks.map(c => ({ S: c })) };
+  if (pipeline?.ciBaselineProbe) attrs.ci_baseline_probe = { BOOL: true };
+  const uiDir = pipeline?.uiChecksDir?.trim().replace(/^\/+|\/+$/g, '');
+  if (uiDir) attrs.ui_checks_dir = { S: uiDir };
+  if (pipeline?.requireTests) attrs.require_tests = { BOOL: true };
+  return attrs;
+}
+
+/** Validates the CI/CD convergence settings at synth (same bounds as ``bgagent repo onboard``). */
+class ConvergenceValidation implements IValidation {
+  constructor(private readonly pipeline: BlueprintProps['pipeline']) {}
+
+  public validate(): string[] {
+    const errors: string[] = [];
+    const wait = this.pipeline?.ciWaitTimeoutSeconds;
+    if (wait !== undefined && (!Number.isInteger(wait) || wait < 0 || wait > MAX_CI_WAIT_TIMEOUT_SECONDS)) {
+      errors.push(`Invalid pipeline.ciWaitTimeoutSeconds: ${wait}. Must be an integer between 0 and ${MAX_CI_WAIT_TIMEOUT_SECONDS}.`);
+    }
+    if (this.pipeline?.ciRequiredChecks?.some(c => !c.trim())) {
+      errors.push('Invalid pipeline.ciRequiredChecks: check names must be non-empty.');
+    }
+    if (this.pipeline?.uiChecksDir?.split('/').includes('..')) {
+      errors.push(`Invalid pipeline.uiChecksDir: ${this.pipeline.uiChecksDir}. Must stay inside the repository.`);
     }
     return errors;
   }

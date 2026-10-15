@@ -821,15 +821,6 @@ export function enforceTokenBudget(
 // ---------------------------------------------------------------------------
 
 /**
- * Assemble the user prompt from issue context and task description.
- * Mirrors agent/src/context.py:assemble_prompt.
- * @param taskId - the task ID.
- * @param repo - the "owner/repo" string.
- * @param issue - the GitHub issue context (optional).
- * @param taskDescription - the user's task description (optional).
- * @returns the assembled user prompt.
- */
-/**
  * The attacker-controlled parts of an issue (title, body, comments) as screened by the
  * input guardrail — without the platform-authored framing around them.
  * @param issue - the hydrated GitHub issue.
@@ -843,6 +834,15 @@ export function issueContentForScreening(issue: GitHubIssueContext): string {
   return parts.filter(Boolean).join('\n\n');
 }
 
+/**
+ * Assemble the user prompt from issue context and task description.
+ * Mirrors agent/src/context.py:assemble_prompt.
+ * @param taskId - the task ID.
+ * @param repo - the "owner/repo" string.
+ * @param issue - the GitHub issue context (optional).
+ * @param taskDescription - the user's task description (optional).
+ * @returns the assembled user prompt.
+ */
 export function assembleUserPrompt(
   taskId: string,
   repo: string | undefined,
@@ -1292,9 +1292,9 @@ export async function hydrateContext(task: TaskRecord, options?: HydrateContextO
     // Skipped when no issue is present — task_description is already screened at submission time.
     // Screen ONLY the external content, not the assembled prompt: the platform's own wrapper
     // ("Resolve the GitHub issue described above. Follow the workflow in your system
-    // instructions.") placed right after user text reads as an injected instruction and made the
-    // PROMPT_ATTACK filter block a plain upstream bug report (immich #16151 without its
-    // maintainer note: MEDIUM, 3/3 runs; the same text without the wrapper: NONE, 3/3).
+    // instructions.") placed right after user text reads as an injected instruction: the
+    // PROMPT_ATTACK filter blocked an ordinary bug report at MEDIUM in 3/3 ApplyGuardrail runs,
+    // while the same issue text without the wrapper returned NONE in 3/3.
     const screenResult = issue
       ? await screenWithGuardrail(issueContentForScreening(issue), task.task_id)
       : undefined;

@@ -825,31 +825,23 @@ class TestCloneWorkspaceGuards:
             repo._assert_clone_root(str(repo_dir))
 
 
+def _git(repo, *args) -> str:
+    return subprocess.run(
+        ["git", "-C", str(repo), "-c", "user.name=t", "-c", "user.email=t@x", *args],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout
+
+
 class TestRestoreSetupChurn:
-    """Setup must not leave tracked-file changes for the safety net to commit (mise.lock churn)."""
+    """Setup must not leave tracked-file changes for the safety net to commit (lockfile churn)."""
 
     def _repo(self, tmp_path):
-        import subprocess as sp
-
-        sp.run(["git", "init", "-q", str(tmp_path)], check=True)
-        (tmp_path / "mise.lock").write_text("a\n")
-        (tmp_path / "keep.txt").write_text("k\n")
-        sp.run(["git", "-C", str(tmp_path), "add", "-A"], check=True)
-        sp.run(
-            [
-                "git",
-                "-C",
-                str(tmp_path),
-                "-c",
-                "user.name=t",
-                "-c",
-                "user.email=t@x",
-                "commit",
-                "-qm",
-                "i",
-            ],
-            check=True,
-        )
+        subprocess.run(["git", "init", "-q", str(tmp_path)], check=True)
+        (tmp_path / "tool.lock").write_text("a\n")
+        _git(tmp_path, "add", "-A")
+        _git(tmp_path, "commit", "-qm", "i")
         return tmp_path
 
     def test_clean_tree_is_noop(self, tmp_path):
@@ -861,87 +853,64 @@ class TestRestoreSetupChurn:
         from repo import restore_setup_churn
 
         repo = self._repo(tmp_path)
-        (repo / "mise.lock").write_text("re-sorted by mise install\n")
-        (repo / "node_modules.txt").write_text("untracked build output\n")
+        (repo / "tool.lock").write_text("re-sorted by the tool installer\n")
+        (repo / "build-output.txt").write_text("untracked\n")
         notes = restore_setup_churn(str(repo))
-        assert (repo / "mise.lock").read_text() == "a\n"
-        assert (repo / "node_modules.txt").exists()
-        assert notes == ["setup changes to tracked files reverted: mise.lock"]
+        assert (repo / "tool.lock").read_text() == "a\n"
+        assert (repo / "build-output.txt").exists()
+        assert len(notes) == 1 and "tool.lock" in notes[0]
 
 
 class TestCheckBaseConflicts:
-    """PR iteration notes whether the PR branch is behind its base and what conflicts."""
-
-    def _git(self, repo, *args):
-        import subprocess as sp
-
-        sp.run(
-            ["git", "-C", str(repo), "-c", "user.name=t", "-c", "user.email=t@x", *args],
-            check=True,
-            capture_output=True,
-        )
+    """PR iteration notes conflicts with its base (only those); the tree stays as checked out."""
 
     def _setup(self, tmp_path, conflict: bool):
-        import subprocess as sp
-
         origin, work = tmp_path / "origin", tmp_path / "work"
-        sp.run(["git", "init", "-q", "-b", "main", str(origin)], check=True)
-        (origin / "panel.svelte").write_text("<p>path</p>\n")
-        self._git(origin, "add", "-A")
-        self._git(origin, "commit", "-qm", "base")
-        sp.run(["git", "clone", "-q", str(origin), str(work)], check=True)
-        self._git(work, "checkout", "-qb", "bgagent/t/b")
-        (work / "panel.svelte").write_text("<p>path</p>\n<p>stack</p>\n")
-        self._git(work, "commit", "-qam", "pr B")
-        # PR A lands on main
-        (origin / ("panel.svelte" if conflict else "other.txt")).write_text(
-            "<p>path</p>\n<p>library</p>\n"
-        )
-        self._git(origin, "add", "-A")
-        self._git(origin, "commit", "-qm", "pr A merged")
+        subprocess.run(["git", "init", "-q", "-b", "main", str(origin)], check=True)
+        (origin / "panel.txt").write_text("path\n")
+        _git(origin, "add", "-A")
+        _git(origin, "commit", "-qm", "base")
+        subprocess.run(["git", "clone", "-q", str(origin), str(work)], check=True)
+        _git(work, "checkout", "-qb", "bgagent/t/b")
+        (work / "panel.txt").write_text("path\nstack\n")
+        _git(work, "commit", "-qam", "pr B")
+        # PR A lands on main first
+        (origin / ("panel.txt" if conflict else "other.txt")).write_text("path\nlibrary\n")
+        _git(origin, "add", "-A")
+        _git(origin, "commit", "-qm", "pr A merged")
         return work
 
-    def test_reports_conflicting_files_and_leaves_tree_clean(self, tmp_path):
-        import subprocess as sp
-
+    def test_reports_conflicting_files_and_the_base_and_leaves_the_tree_clean(self, tmp_path):
         from repo import check_base_conflicts
 
         work = self._setup(tmp_path, conflict=True)
-        head = sp.run(
-            ["git", "-C", str(work), "rev-parse", "HEAD"], capture_output=True, text=True
-        ).stdout
+        head = _git(work, "rev-parse", "HEAD")
         notes = check_base_conflicts(str(work), "main")
-        assert (
-            len(notes) == 1
-            and notes[0].startswith("MERGE CONFLICTS")
-            and "panel.svelte" in notes[0]
-        )
-        assert (
-            sp.run(
-                ["git", "-C", str(work), "status", "--porcelain"], capture_output=True, text=True
-            ).stdout
-            == ""
-        )
-        assert (
-            sp.run(
-                ["git", "-C", str(work), "rev-parse", "HEAD"], capture_output=True, text=True
-            ).stdout
-            == head
-        )
+        assert len(notes) == 1 and "panel.txt" in notes[0] and "`origin/main`" in notes[0]
+        assert _git(work, "status", "--porcelain") == ""
+        assert _git(work, "rev-parse", "HEAD") == head
 
-    def test_behind_but_clean(self, tmp_path):
-        from repo import check_base_conflicts
-
-        notes = check_base_conflicts(str(self._setup(tmp_path, conflict=False)), "main")
-        assert notes == ["This PR branch is 1 commit(s) behind `origin/main` and merges cleanly."]
-
-    def test_up_to_date_is_silent(self, tmp_path):
-        import subprocess as sp
-
+    def test_behind_but_clean_needs_no_note(self, tmp_path):
         from repo import check_base_conflicts
 
         work = self._setup(tmp_path, conflict=False)
-        self._git(work, "fetch", "-q", "origin", "main")
-        self._git(work, "merge", "-q", "--no-edit", "origin/main")
-        sp.run(["git", "-C", str(work), "log", "-1"], check=True, capture_output=True)
         assert check_base_conflicts(str(work), "main") == []
+        assert _git(work, "status", "--porcelain") == ""
+
+    def test_up_to_date_is_silent(self, tmp_path):
+        from repo import check_base_conflicts
+
+        work = self._setup(tmp_path, conflict=False)
+        _git(work, "fetch", "-q", "origin", "main")
+        _git(work, "merge", "-q", "--no-edit", "origin/main")
+        assert check_base_conflicts(str(work), "main") == []
+
+    def test_a_failing_merge_without_conflicts_is_not_called_clean_or_left_half_done(
+        self, tmp_path
+    ):
+        from repo import check_base_conflicts
+
+        work = self._setup(tmp_path, conflict=True)
+        (work / "panel.txt").write_text("uncommitted local edit\n")  # merge refuses to run
+        assert check_base_conflicts(str(work), "main") == []
+        assert not (work / ".git" / "MERGE_HEAD").exists()

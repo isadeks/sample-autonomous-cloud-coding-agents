@@ -256,6 +256,51 @@ describe('Blueprint construct', () => {
     expect(serialized).toContain('"poll_interval_ms":{"N":"15000"}');
   });
 
+  test('maps CI/CD convergence and agent requirement props on create and update', () => {
+    const { template } = createStack({
+      pipeline: {
+        ciWaitTimeoutSeconds: 1800,
+        ciRequiredChecks: ['ci/build', 'deployment:Preview'],
+        ciBaselineProbe: true,
+        uiChecksDir: '/checks/ui/',
+        requireTests: true,
+      },
+    });
+    const created = getCreateJoinParts(template).join('');
+    expect(created).toContain('"ci_wait_timeout_s":{"N":"1800"}');
+    expect(created).toContain('"ci_required_checks":{"L":[{"S":"ci/build"},{"S":"deployment:Preview"}]}');
+    expect(created).toContain('"ci_baseline_probe":{"BOOL":true}');
+    expect(created).toContain('"ui_checks_dir":{"S":"checks/ui"}');
+    expect(created).toContain('"require_tests":{"BOOL":true}');
+    const updated = getUpdateJoinParts(template).join('');
+    for (const attr of ['ci_wait_timeout_s', 'ci_required_checks', 'ci_baseline_probe', 'ui_checks_dir', 'require_tests']) {
+      expect(updated).toContain(`#${attr} = :${attr}`);
+    }
+  });
+
+  test('omits convergence attributes that are unset, zero or false', () => {
+    const { template } = createStack({ pipeline: { ciWaitTimeoutSeconds: 0, ciBaselineProbe: false, requireTests: false } });
+    const created = getCreateJoinParts(template).join('');
+    for (const attr of ['ci_wait_timeout_s', 'ci_required_checks', 'ci_baseline_probe', 'ui_checks_dir', 'require_tests']) {
+      expect(created).not.toContain(attr);
+    }
+  });
+
+  test.each([
+    [{ ciWaitTimeoutSeconds: 1.5 }, /ciWaitTimeoutSeconds/],
+    [{ ciWaitTimeoutSeconds: 99999 }, /ciWaitTimeoutSeconds/],
+    [{ ciRequiredChecks: [' '] }, /ciRequiredChecks/],
+    [{ uiChecksDir: '../outside' }, /uiChecksDir/],
+  ])('rejects invalid convergence settings at synth: %o', (pipeline, message) => {
+    const app = new App();
+    const stack = new Stack(app, 'TestStack');
+    const repoTable = new dynamodb.Table(stack, 'RepoTable', {
+      partitionKey: { name: 'repo', type: dynamodb.AttributeType.STRING },
+    });
+    new Blueprint(stack, 'Blueprint', { repo: 'org/my-repo', repoTable, pipeline });
+    expect(() => Template.fromStack(stack)).toThrow(message);
+  });
+
   test('maps networking egress allowlist to DynamoDB list', () => {
     const { template } = createStack({
       networking: { egressAllowlist: ['npm.internal.example.com', '*.private-registry.io'] },

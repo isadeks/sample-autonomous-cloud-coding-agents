@@ -507,6 +507,20 @@ forbid (principal, action == Agent::Action::"write_file", resource)
   when { context.file_path like "*credentials*" };
 ```
 
+**Gate changes to tests that already existed** (soft-deny — part of the built-in starter set). The engine sets `context.existing_file` on `write_file` evaluations when the path exists on the PR's base commit (the merge-base of the task branch and `origin/HEAD`, snapshotted when the session starts). Tests the agent adds in the same PR are not gated. Only Write/Edit tool calls carry a file path, so shell edits are not seen here; a CI check on the final diff is the intended backstop.
+```cedar
+@tier("soft")
+@rule_id("modify_existing_test")
+@approval_timeout_s("600")
+@severity("medium")
+@category("tests")
+forbid (principal, action == Agent::Action::"write_file", resource)
+  when { context has existing_file && context.existing_file
+      && (context.file_path like "*.spec.*" || context.file_path like "*.test.*"
+       || context.file_path like "*/tests/*" || context.file_path like "*vitest.config*" /* … */) };
+```
+The `has` guard keeps the rule inert (no error, no match) on an engine that does not set the attribute. The full pattern list is in `agent/policies/soft_deny.cedar`.
+
 **Optional patterns (not shipped by default — copy into your blueprint if your repo needs them):**
 ```cedar
 // Gate writes under a conventional infrastructure/ directory. Not in the
@@ -2228,12 +2242,13 @@ Built-in policies shipped with the agent:
 - `force_push_main` — force-push specifically to `main`/`prod` — high, 600s
 - `write_env_files` — `like "*.env"` — high, 600s
 - `write_credentials` — `like "*credentials*"` — high, 300s
+- `modify_existing_test` — Write/Edit of a test file or test config that exists on the PR's base (`context.existing_file`) — medium, 600s
 
 Users who want fully autonomous execution (no approval gates) pass `--pre-approve all_session --yes` at submit. Repos that want additional gates add them via `Blueprint.security.cedarPolicies.soft`. Repos that want a different policy set can override specific built-in **soft-deny** rules by `@rule_id` via the blueprint's `security.cedarPolicies.disable` list. The `disable:` mechanism is restricted: it may NOT include any built-in hard-deny rule_id, and the blueprint loader rejects such configurations at task start.
 
 Rollout steps:
 
-1. **Implement + merge to main.** Built-in soft-deny ships with the 5-rule starter set above. No flag, no global kill switch. Any task on any repo instantly has the gate behavior for rules in the starter set; any task with `--pre-approve all_session` bypasses soft-deny as it always has.
+1. **Implement + merge to main.** Built-in soft-deny ships with the starter set above. No flag, no global kill switch. Any task on any repo instantly has the gate behavior for rules in the starter set; any task with `--pre-approve all_session` bypasses soft-deny as it always has.
 2. **`backgroundagent-dev` validation.** Deploy merged code. Run E2E scenarios A–E:
    - A: force-push gated + approved via CLI
    - B: hard-deny path (DROP TABLE blocked, not gated)

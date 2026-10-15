@@ -101,7 +101,7 @@ A workflow file has the following top-level fields. (Full machine-readable schem
 | `steps` | Step[] | ✓ | Ordered pipeline phases (see [Step kinds](#step-kinds)). |
 | `required_inputs` | object | – | Validation contract, e.g. `{ one_of: [issue_number, task_description] }` or `{ all_of: [pr_number] }`. Replaces the scattered required-input checks. |
 | `terminal_outcomes` | object | ✓ | What "done" *produces* — `pr_url` \| `review_posted` \| `artifact` \| `comment`. Records the expected artifact; it does **not** override success inference (see [Success inference](#success-inference-terminal-outcomes-and-convergence)). |
-| `convergence` | object | – | How a harness decides the task is done: `{ mode, required_sensors?, terminal_outcomes, early_exit? }`. Optional for backward compatibility; validated at workflow load. In v1 this is declarative metadata and does not change runtime finalization. |
+| `convergence` | object | – | How a harness decides the task is done: `{ mode, required_sensors?, terminal_outcomes, early_exit?, max_fixup_rounds? }`. Optional for backward compatibility; validated at workflow load. `max_fixup_rounds` (test_gated only) turns the declaration into runtime behaviour — see [Convergence contract](#convergence-contract). |
 | `limits` | object | – | `{ max_turns, max_budget_usd }` defaults (per-task / per-repo still override, per [override precedence](./REPO_ONBOARDING.md#override-precedence)). |
 | `promotion_gate` | object | – | The check contract a version must pass to reach `production` (see [Promotion is earned, not set](#promotion-is-earned-not-set)). `{ requires: [<check ids>] }` — pre-#236 a concrete test target (`tests:agent/new_task`); post-#236 an eval id (`eval:web-research-quality`). Optional until #236; absent ⇒ test-tier fallback. |
 | `status` | enum | ✓ | `draft` \| `validated` \| `production` \| `deprecated`. Only `production` resolves for normal tasks. |
@@ -129,7 +129,7 @@ Each step declares `on_failure: fail | continue | skip_remaining` (default `fail
 
 ### Convergence contract
 
-`convergence` makes the workflow's stopping contract explicit for conformance tests and future harnesses. The loader validates the block before the step runner receives the workflow:
+`convergence` makes the workflow's stopping contract explicit. The loader validates the block before the step runner receives the workflow:
 
 | Field | Required | Meaning |
 |---|---|---|
@@ -137,10 +137,17 @@ Each step declares `on_failure: fail | continue | skip_remaining` (default `fail
 | `required_sensors` | For `test_gated` | Verification results a conforming harness would evaluate using their step's existing `gate` semantics. Current sensors are `verify_build` and `verify_lint`; each must have a matching step, enforced at load. |
 | `terminal_outcomes` | ✓ | Observable convergence signals: `pr_opened` \| `review_published` \| `artifact_delivered` \| `human_approved`. At least one is required. |
 | `early_exit.allow_on_policy_deny` | – | Declares that a policy denial may terminate without the normal terminal outcome. Defaults to `false`. |
+| `max_fixup_rounds` | – | `0`–`5`, default `0`. For `test_gated` only (any other mode must leave it at `0`, enforced at load): how many times a failing verification is handed back to the agent before the task is finalized. `coding/new-task-v1` and `coding/pr-iteration-v1` set `2`. |
 
 This field is distinct from the required top-level `terminal_outcomes` object. The top-level object identifies the result artifact consumed by existing finalization (`pr_url`, `review_posted`, `artifact`, or `comment`). `convergence.terminal_outcomes` names the external signal a harness should observe before considering the workflow complete. For example, a coding workflow can produce a `pr_url` and declare `pr_opened` as its convergence signal.
 
-The v1 implementation is intentionally descriptive: it parses and exposes the contract but does not branch on it in `runner.py`, emit a new event, or replace `_resolve_overall_task_status`. Existing workflows without the optional block retain their current behavior.
+`mode`, `required_sensors` and `terminal_outcomes` remain declarative. `max_fixup_rounds > 0` is enforced by the coding post-hooks (`agent/src/fixup.py`, `agent/src/ci_wait.py`), in the agent's own session, so a fix-up resumes the same SDK session with full context instead of starting a new task:
+
+1. **Local build gate.** A genuinely failing post-agent `verify_build` (not inert, not timed out, not an infrastructure kill, and passing before the agent ran) is handed back with the command and the tail of its output. The agent fixes, commits, pushes; the gate re-runs. Milestones: `fixup_round_started`, `fixup_round_result`.
+2. **PR CI/CD (per repo, opt-in).** When the repo sets `ci_wait_timeout_s`, the session stays open after the PR opens and waits for the PR head's commit statuses, check runs and deployments (`deployment:<environment>`). Every name in `ci_required_checks` must report before the PR counts as green. A red result is handed back with the failing checks and the CI's PR comments that cite the head SHA; the agent pushes and the wait repeats. A PR still red after the rounds fails the task (`ci_ok=False`); required checks that never report do not count as green. Milestones: `ci_wait_started`, `ci_wait_progress`, `ci_result`, `ci_fixup_round_started`.
+3. **"Unrelated failure" claims (per repo, opt-in).** The agent may push nothing and say a CI failure is not caused by its change. With `ci_baseline_probe` set, the platform checks the claim against the same checks on the base commit — reusing results already reported there, otherwise pushing `abca-baseline/<task_id>` at the base SHA (no new commit; deleted afterwards) under its own bounded wait. *Refuted* (they pass on base): the evidence goes back to the agent. *Confirmed* (they fail on base too): the task ends as a pre-existing failure (`ci_ok=preexisting`). Otherwise the claim is reported as unverified. Milestones: `ci_baseline_probe_started`, `ci_baseline_probe_result`.
+
+The platform's verdict is written into the PR body between `<!-- abca-verification:start -->` markers as one summary line with collapsed details. Existing workflows without `max_fixup_rounds` retain their report-only gate.
 
 ### Example: shipped coding workflow (`new_task`)
 
@@ -476,13 +483,13 @@ Where a migration deliberately changes behavior, the gate's expected output is u
 
 ## Success inference, terminal outcomes, and convergence
 
-Top-level `terminal_outcomes` declares what a workflow is *expected to produce*. `convergence` separately declares which sensor and external signals define completion for conformance tooling. Neither replaces the agent's deliberately-defensive success model in v1. Today `_resolve_overall_task_status` (`pipeline.py`) keys success off the agent SDK result status plus the build gate, and explicitly refuses to infer success from PR/build presence when the SDK never emitted a `ResultMessage` (so a crashed agent that happens to have left a branch is not reported `COMPLETED`). That refusal stays. `terminal_outcomes` layers on top as the *artifact* check, not a replacement:
+Top-level `terminal_outcomes` declares what a workflow is *expected to produce*. `convergence` separately declares which sensor and external signals define completion; with `max_fixup_rounds` it also drives the fix-up rounds above. Neither replaces the agent's deliberately-defensive success model. Today `_resolve_overall_task_status` (`pipeline.py`) keys success off the agent SDK result status plus the build gate, and explicitly refuses to infer success from PR/build presence when the SDK never emitted a `ResultMessage` (so a crashed agent that happens to have left a branch is not reported `COMPLETED`). That refusal stays. `terminal_outcomes` layers on top as the *artifact* check, not a replacement:
 
 - **`pr_url` / `review_posted`** — agent status is authoritative; the terminal outcome is the artifact the orchestrator's existing finalization decision matrix (ORCHESTRATOR.md) already inspects (PR exists? commits?). No change to that matrix.
 - **`artifact` (repo-less)** — there is no PR/branch to fall back on, so success = agent status `success`/`end_turn` **and** the `deliver_artifact` step recorded a delivered artifact (S3 key present). If the agent reports success but no artifact was delivered, the task is `FAILED` (nothing produced) — the repo-less analog of "success, no commits, no PR ⇒ FAILED."
 - **`comment`** — success = agent status success **and** the comment post succeeded.
 
-The point: `convergence` now documents "what counts as done" per workflow without weakening or silently changing the existing guard against false-positive completion. A later runtime adoption can consume the same declaration explicitly rather than infer policy from workflow IDs.
+The point: `convergence` documents "what counts as done" per workflow, and the fix-up rounds act on it, without weakening the existing guard against false-positive completion: a CI result can only turn a success into a failure, never the reverse.
 
 ## Observability & metadata
 

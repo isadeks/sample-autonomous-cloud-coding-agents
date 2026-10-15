@@ -298,6 +298,15 @@
         {
           "if": {
             "required": ["mode"],
+            "properties": { "mode": { "not": { "const": "test_gated" } } }
+          },
+          "then": {
+            "properties": { "max_fixup_rounds": { "const": 0 } }
+          }
+        },
+        {
+          "if": {
+            "required": ["mode"],
             "properties": { "mode": { "const": "artifact_delivered" } }
           },
           "then": {

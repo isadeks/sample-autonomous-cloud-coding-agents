@@ -6,7 +6,7 @@ from typing import Any
 
 from config import AGENT_WORKSPACE
 from models import RepoSetup, TaskConfig
-from shell import log, run_cmd, run_cmd_with_backoff, slugify
+from shell import log, run_cmd, run_cmd_with_backoff, slugify, try_cmd
 
 # Directories never worth scanning for nested mise configs (huge, and any
 # ``mise.toml`` inside a dependency tree is not ours to trust). Bounds the walk
@@ -186,55 +186,61 @@ def _assert_clone_root(repo_dir: str) -> None:
 
 
 def check_base_conflicts(repo_dir: str, base: str) -> list[str]:
-    """Trial-merge ``origin/<base>`` into the checked-out PR branch, then abort.
+    """Trial-merge ``origin/<base>`` into the checked-out PR branch, then undo it.
 
-    Leaves the tree exactly as checked out. Returns a setup note: nothing when the
-    branch already contains the base, "merges cleanly" when it is behind but
-    conflict-free, or the conflicting files. Best-effort (a git failure → no note).
+    Returns a setup note only when the merge conflicts (naming the files and the
+    base ref); a branch that is up to date or merges cleanly needs no note.
+    Leaves the tree exactly as checked out.
     """
     if not os.path.isdir(os.path.join(repo_dir, ".git")):
         return []
-    fetch = subprocess.run(
-        ["git", "fetch", "origin", base], cwd=repo_dir, capture_output=True, text=True, check=False
-    )
-    if fetch.returncode != 0:
+    if try_cmd(["git", "fetch", "origin", base], label="fetch-base", cwd=repo_dir).returncode != 0:
         return []
-    behind = subprocess.run(
-        ["git", "rev-list", "--count", f"HEAD..origin/{base}"],
-        cwd=repo_dir,
-        capture_output=True,
-        text=True,
-        check=False,
+    behind = try_cmd(
+        ["git", "rev-list", "--count", f"HEAD..origin/{base}"], label="behind-base", cwd=repo_dir
     )
     if behind.returncode != 0 or behind.stdout.strip() in ("", "0"):
         return []
-    n = behind.stdout.strip()
-    trial = subprocess.run(
+    head = try_cmd(
+        ["git", "rev-parse", "HEAD"], label="head-before-trial", cwd=repo_dir
+    ).stdout.strip()
+    trial = try_cmd(
         ["git", "merge", "--no-commit", "--no-ff", f"origin/{base}"],
+        label="trial-merge-base",
         cwd=repo_dir,
-        capture_output=True,
-        text=True,
-        check=False,
     )
     conflicted: list[str] = []
     if trial.returncode != 0:
-        unmerged = subprocess.run(
-            ["git", "diff", "--name-only", "--diff-filter=U"],
-            cwd=repo_dir,
-            capture_output=True,
-            text=True,
-            check=False,
+        unmerged = try_cmd(
+            ["git", "diff", "--name-only", "--diff-filter=U"], label="unmerged-files", cwd=repo_dir
         )
         conflicted = [f for f in unmerged.stdout.splitlines() if f.strip()]
-    subprocess.run(["git", "merge", "--abort"], cwd=repo_dir, capture_output=True, check=False)
+    _undo_trial_merge(repo_dir, head)
+    if trial.returncode == 0:
+        return []
     if not conflicted:
-        log("SETUP", f"PR branch is {n} commit(s) behind origin/{base}; merges cleanly")
-        return [f"This PR branch is {n} commit(s) behind `origin/{base}` and merges cleanly."]
+        log(
+            "WARN",
+            f"trial merge of origin/{base} failed without conflicts: {trial.stderr.strip()[:200]}",
+        )
+        return []
     log("SETUP", f"PR branch conflicts with origin/{base}: {', '.join(conflicted)}")
     return [
-        f"MERGE CONFLICTS: this PR branch is {n} commit(s) behind `origin/{base}` and merging "
-        f"it conflicts in: {', '.join(conflicted)}. Resolve them as described in the workflow."
+        f"MERGE CONFLICTS: this PR branch is {behind.stdout.strip()} commit(s) behind "
+        f"`origin/{base}` and merging it conflicts in: {', '.join(conflicted)}. Merge "
+        f"`origin/{base}` and resolve them as described in the workflow."
     ]
+
+
+def _undo_trial_merge(repo_dir: str, head: str) -> None:
+    """Abort the trial merge; if that fails, hard-reset to the pre-trial HEAD."""
+    if (
+        try_cmd(["git", "merge", "--abort"], label="trial-merge-abort", cwd=repo_dir).returncode
+        == 0
+    ):
+        return
+    if head:
+        try_cmd(["git", "reset", "--hard", head], label="trial-merge-reset", cwd=repo_dir)
 
 
 # file names listed in the setup note when setup churned tracked files
@@ -246,26 +252,18 @@ def restore_setup_churn(repo_dir: str) -> list[str]:
 
     Runs right after clone + ``mise install`` + baseline build, before the agent
     starts, so anything modified here was changed by setup, not by the agent.
-    Returns setup notes (empty when the tree was already clean). Best-effort.
+    Returns setup notes (empty when the tree was already clean).
     """
     if not os.path.isdir(os.path.join(repo_dir, ".git")):
         return []
-    diff = subprocess.run(
-        ["git", "diff", "--name-only"], cwd=repo_dir, capture_output=True, text=True, check=False
-    )
+    diff = try_cmd(["git", "diff", "--name-only"], label="setup-churn", cwd=repo_dir)
     changed = [f for f in diff.stdout.splitlines() if f.strip()] if diff.returncode == 0 else []
     if not changed:
         return []
-    restore = subprocess.run(
-        ["git", "checkout", "--", *changed],
-        cwd=repo_dir,
-        capture_output=True,
-        text=True,
-        check=False,
+    restore = try_cmd(
+        ["git", "checkout", "--", *changed], label="restore-setup-churn", cwd=repo_dir
     )
     if restore.returncode != 0:
-        err = restore.stderr.strip()[:200]
-        log("WARN", f"setup changed tracked files but restoring them failed: {err}")
         return [f"setup modified tracked files (not restored): {', '.join(changed[:_CHURN_SHOWN])}"]
     head, rest = changed[:_CHURN_SHOWN], len(changed) - _CHURN_SHOWN
     shown = ", ".join(head) + (f" (+{rest} more)" if rest > 0 else "")

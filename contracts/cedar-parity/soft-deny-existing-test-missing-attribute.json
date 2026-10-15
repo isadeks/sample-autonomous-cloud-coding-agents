@@ -1,0 +1,28 @@
+{
+  "name": "soft-deny-existing-test-missing-attribute",
+  "description": "Without the existing_file attribute (older engine) the `has` guard keeps the rule from erroring or matching.",
+  "policies": "@rule_id(\"base_permit\")\npermit (principal, action, resource);\n@tier(\"soft\")\n@rule_id(\"modify_existing_test\")\n@approval_timeout_s(\"600\")\n@severity(\"medium\")\n@category(\"tests\")\nforbid (principal, action == Agent::Action::\"write_file\", resource)\nwhen { context has existing_file && context.existing_file\n    && (context.file_path like \"*.spec.*\"\n     || context.file_path like \"*.test.*\"\n     || context.file_path like \"*_test.*\"\n     || context.file_path like \"*/test_*.py\"\n     || context.file_path like \"*/test/*\"\n     || context.file_path like \"*/tests/*\"\n     || context.file_path like \"*/__tests__/*\"\n     || context.file_path like \"*e2e-spec*\"\n     || context.file_path like \"*/e2e/*\"\n     || context.file_path like \"e2e/*\"\n     || context.file_path like \"test/*\"\n     || context.file_path like \"tests/*\"\n     || context.file_path like \"*vitest.config*\"\n     || context.file_path like \"*playwright.config*\"\n     || context.file_path like \"*jest.config*\") };",
+  "input": {
+    "principal": {
+      "type": "Agent::TaskAgent",
+      "id": "new_task"
+    },
+    "action": {
+      "type": "Agent::Action",
+      "id": "write_file"
+    },
+    "resource": {
+      "type": "Agent::File",
+      "id": "file"
+    },
+    "context": {
+      "file_path": "/workspace/t/src/lib/a.spec.ts"
+    }
+  },
+  "expected": {
+    "decision": "allow",
+    "matching_rule_ids": [
+      "base_permit"
+    ]
+  }
+}

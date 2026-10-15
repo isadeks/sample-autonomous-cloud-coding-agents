@@ -22,30 +22,44 @@
  * requests starts a `coding/pr-iteration-v1` task on that PR.
  *
  * Invoked asynchronously by the GitHub webhook receiver (`github-webhook.ts`),
- * which has already verified the HMAC signature and deduplicated the delivery.
+ * which has verified the HMAC signature, applied the payload gate
+ * (`decideTrigger`) and deduplicated the comment.
  *
- * Guardrails on who and what:
- * - only `issue_comment` `created` events on a pull request whose body mentions
- *   `@bgagent`, from a non-bot author with write-level association
- *   (OWNER / MEMBER / COLLABORATOR);
- * - only PRs whose head branch is an ABCA branch `bgagent/<task_id>/...` of a
- *   task on the same repo — the iteration runs as THAT task's user, so the
- *   comment cannot spend some other user's budget;
- * - the instruction is screened by createTaskCore's input guardrail like any
- *   submitted task description.
+ * Who may trigger, checked here against the GitHub API:
+ * - the commenter must have write, maintain or admin permission on the
+ *   repository (the receiver's author_association check is only a pre-filter);
+ * - comments posted with the platform's own token are ignored, so the agent's
+ *   replies can never start another task;
+ * - only open PRs whose head is an ABCA branch `bgagent/<task_id>/...` in the
+ *   same repository (not a fork), for a task on that repository.
+ *
+ * Identity: the iteration runs as the ABCA user who owns the original task —
+ * GitHub logins are not mapped to ABCA users, so the commenter's write access
+ * is what authorises spending that user's budget. A login-to-user mapping (as
+ * the Jira and Linear channels have) would let the commenter's own identity be
+ * used instead. The instruction is screened by createTaskCore's input guardrail
+ * like any submitted task description.
  */
 
 import { GetCommand } from '@aws-sdk/lib-dynamodb';
 import { ulid } from 'ulid';
 import { resolveGitHubToken } from './shared/context-hydration';
 import { createTaskCore } from './shared/create-task-core';
-import { ABCA_BRANCH, decideTrigger, type GitHubCommentEvent, type IssueCommentPayload } from './shared/github-comment-trigger';
+import { ABCA_BRANCH, type GitHubCommentTrigger } from './shared/github-comment-trigger';
 import { logger } from './shared/logger';
+import { loadRepoConfig } from './shared/repo-config';
 import { makeDocClient } from './shared/ua';
 
 const ddb = makeDocClient();
 const TASK_TABLE_NAME = process.env.TASK_TABLE_NAME!;
-const GITHUB_TOKEN_SECRET_ARN = process.env.GITHUB_TOKEN_SECRET_ARN ?? '';
+const GITHUB_API_TIMEOUT_MS = 10_000;
+/** Repository permissions that may start work on the repo's PRs. */
+const WRITE_PERMISSIONS = new Set(['admin', 'maintain', 'write']);
+
+export type CommentTriggerResult = { readonly status: string; readonly task_id?: string };
+
+/** Login behind each token, cached for the Lambda's lifetime (a rotated token is looked up again). */
+const tokenLogins = new Map<string, string>();
 
 async function github(token: string, method: string, path: string, body?: unknown): Promise<Response> {
   return fetch(`https://api.github.com${path}`, {
@@ -58,34 +72,65 @@ async function github(token: string, method: string, path: string, body?: unknow
       ...(body !== undefined && { 'Content-Type': 'application/json' }),
     },
     ...(body !== undefined && { body: JSON.stringify(body) }),
+    signal: AbortSignal.timeout(GITHUB_API_TIMEOUT_MS),
   });
 }
 
-/** Lambda entry point (async invoke from the GitHub webhook receiver). */
-export async function handler(event: GitHubCommentEvent): Promise<{ status: string; task_id?: string }> {
-  let payload: IssueCommentPayload;
-  try {
-    payload = JSON.parse(event.raw_body) as IssueCommentPayload;
-  } catch {
-    return { status: 'invalid_json' };
+async function reply(token: string, repo: string, prNumber: number, text: string): Promise<void> {
+  const res = await github(token, 'POST', `/repos/${repo}/issues/${prNumber}/comments`, { body: text });
+  if (!res.ok) {
+    logger.warn('PR comment trigger: reply failed', { repo, pr_number: prNumber, status: res.status });
   }
-  const decision = decideTrigger(payload);
-  if (!decision.ok) {
-    logger.info('PR comment not a trigger', { reason: decision.reason });
-    return { status: `skipped:${decision.reason}` };
+}
+
+async function tokenLogin(token: string): Promise<string> {
+  const cached = tokenLogins.get(token);
+  if (cached) return cached;
+  const res = await github(token, 'GET', '/user');
+  if (!res.ok) throw new Error(`GitHub GET /user failed (HTTP ${res.status})`);
+  const login = ((await res.json()) as { login?: string }).login ?? '';
+  if (!login) throw new Error('GitHub GET /user returned no login');
+  tokenLogins.set(token, login);
+  return login;
+}
+
+async function hasWriteAccess(token: string, repo: string, login: string): Promise<boolean> {
+  const res = await github(token, 'GET', `/repos/${repo}/collaborators/${encodeURIComponent(login)}/permission`);
+  if (res.status === 404) return false;
+  if (!res.ok) throw new Error(`GitHub permission lookup failed (HTTP ${res.status})`);
+  const json = (await res.json()) as { permission?: string; role_name?: string };
+  return WRITE_PERMISSIONS.has(json.role_name ?? '') || WRITE_PERMISSIONS.has(json.permission ?? '');
+}
+
+/** Handler entry point (served by the webhook task Lambda; see webhook-create-task.ts). */
+export async function handler(event: GitHubCommentTrigger): Promise<CommentTriggerResult> {
+  const platformSecretArn = process.env.GITHUB_TOKEN_SECRET_ARN;
+  if (!platformSecretArn) {
+    throw new Error('GITHUB_TOKEN_SECRET_ARN is not configured for the PR-comment trigger');
   }
-  const { repo, prNumber, instruction, commentId, commentUrl, author } = decision;
-  const token = await resolveGitHubToken(GITHUB_TOKEN_SECRET_ARN);
+  const { repo, prNumber, instruction, commentId, commentUrl, author } = event;
+  const repoConfig = await loadRepoConfig(repo);
+  const secretArn = repoConfig?.github_token_secret_arn ?? platformSecretArn;
+  const token = await resolveGitHubToken(secretArn);
+
+  if (author.toLowerCase() === (await tokenLogin(token)).toLowerCase()) {
+    return { status: 'skipped:self_comment' };
+  }
+  if (!await hasWriteAccess(token, repo, author)) {
+    logger.info('PR comment trigger: commenter lacks write access', { repo, pr_number: prNumber, author });
+    return { status: 'skipped:insufficient_permission' };
+  }
 
   const pr = await github(token, 'GET', `/repos/${repo}/pulls/${prNumber}`);
   if (!pr.ok) {
     logger.warn('PR comment trigger: PR lookup failed', { repo, pr_number: prNumber, status: pr.status });
     return { status: 'pr_lookup_failed' };
   }
-  const prJson = await pr.json() as { head?: { ref?: string }; state?: string };
+  const prJson = await pr.json() as { head?: { ref?: string; repo?: { full_name?: string } | null }; state?: string };
   const branchMatch = ABCA_BRANCH.exec(prJson.head?.ref ?? '');
-  if (!branchMatch || prJson.state !== 'open') {
-    logger.info('PR comment trigger: not an open ABCA PR', { repo, pr_number: prNumber });
+  const sameRepo = prJson.head?.repo?.full_name?.toLowerCase() === repo.toLowerCase();
+  if (!branchMatch || !sameRepo || prJson.state !== 'open') {
+    logger.info('PR comment trigger: not an open ABCA PR in this repository', { repo, pr_number: prNumber });
     return { status: 'skipped:not_abca_pr' };
   }
   const origin = await ddb.send(new GetCommand({ TableName: TASK_TABLE_NAME, Key: { task_id: branchMatch[1] } }));
@@ -96,6 +141,7 @@ export async function handler(event: GitHubCommentEvent): Promise<{ status: stri
   }
 
   const taskId = ulid();
+  const idempotencyKey = `gh-pr-comment-${commentId}`;
   const result = await createTaskCore(
     {
       repo,
@@ -113,22 +159,30 @@ export async function handler(event: GitHubCommentEvent): Promise<{ status: stri
         github_comment_author: author,
       },
       taskId,
-      // a webhook redelivery of the same comment must not start a second task
-      idempotencyKey: `gh-pr-comment-${commentId}`,
+      // a redelivery of the same comment must not start a second task
+      idempotencyKey,
     },
-    `gh-pr-comment-${commentId}`,
+    idempotencyKey,
   );
+  if (result.statusCode === 200 && result.headers?.['Idempotent-Replay'] === 'true') {
+    // An async-invoke retry of a comment that already created its task (and its ack).
+    return { status: 'replayed' };
+  }
   if (result.statusCode !== 201) {
     logger.warn('PR comment trigger: task not created', { repo, pr_number: prNumber, status: result.statusCode });
-    await github(token, 'POST', `/repos/${repo}/issues/${prNumber}/comments`, {
-      body: `ABCA could not start a task for [this comment](${commentUrl}) (HTTP ${result.statusCode}).`,
-    });
+    await reply(token, repo, prNumber, `ABCA could not start a task for [this comment](${commentUrl}) (HTTP ${result.statusCode}).`);
     return { status: `create_failed:${result.statusCode}` };
   }
-  await github(token, 'POST', `/repos/${repo}/issues/${prNumber}/comments`, {
-    body: `🤖 ABCA picked up [this request](${commentUrl}) as task \`${taskId}\` (PR iteration). `
-      + 'It will push to this PR and wait for CI/CD before finishing.',
-  });
+  const waits = repoConfig?.ci_wait_timeout_s
+    ? ' It will push to this PR and wait for its CI/CD checks before finishing.'
+    : ' It will push to this PR.';
+  await reply(
+    token,
+    repo,
+    prNumber,
+    `🤖 ABCA picked up [this request](${commentUrl}) as task \`${taskId}\` (PR iteration), `
+      + `running as the ABCA user who owns this pull request's original task.${waits}`,
+  );
   logger.info('PR comment trigger: pr-iteration task created', { repo, pr_number: prNumber, task_id: taskId });
   return { status: 'created', task_id: taskId };
 }

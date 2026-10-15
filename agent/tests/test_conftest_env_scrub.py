@@ -34,6 +34,7 @@ from aws_session import SESSION_ROLE_ARN_ENV, is_scoped
 # Poison the process env at import time — BEFORE any fixture runs. The conftest
 # `_clean_env` autouse must scrub this for the assertions below to hold.
 os.environ[SESSION_ROLE_ARN_ENV] = "arn:aws:iam::123456789012:role/leaked-from-parent-env"
+os.environ["GIT_INDEX_FILE"] = "/nonexistent/leaked-hook-index"
 
 
 def test_conftest_scrubs_session_role_arn():
@@ -48,3 +49,20 @@ def test_session_resolves_unscoped_when_scrubbed():
     # bare get_session() must be unscoped — the path where boto3.client mocks
     # intercept, so no real S3 call is made and nothing hangs.
     assert is_scoped() is False
+
+
+def test_conftest_scrubs_git_hook_env(tmp_path):
+    # A pre-commit hook exports GIT_INDEX_FILE / GIT_DIR; with them set, `git init`
+    # + commit in tmp_path would write into the hook's repository instead.
+    import subprocess
+
+    for var in ("GIT_DIR", "GIT_INDEX_FILE", "GIT_WORK_TREE"):
+        assert var not in os.environ
+    subprocess.run(["git", "init", "-q", str(tmp_path)], check=True)
+    top = subprocess.run(
+        ["git", "-C", str(tmp_path), "rev-parse", "--show-toplevel"],
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout.strip()
+    assert os.path.realpath(top) == os.path.realpath(tmp_path)

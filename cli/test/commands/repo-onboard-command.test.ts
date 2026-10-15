@@ -17,6 +17,9 @@
  *  SOFTWARE.
  */
 
+import * as fs from 'fs';
+import * as os from 'os';
+import * as path from 'path';
 import { makeRepoCommand } from '../../src/commands/repo';
 import { onboardRepo, offboardRepo } from '../../src/repo-onboard';
 import { getStackOutput } from '../../src/stack-outputs';
@@ -65,6 +68,43 @@ describe('repo onboard/offboard commands', () => {
     expect(output).toContain('onboarded');
     expect(output).toContain('RepoTable only');
     expect(output).toContain('CDK Blueprint');
+  });
+
+  test('repo onboard reads --system-prompt-overrides-file and passes the convergence flags', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'onboard-'));
+    const file = path.join(dir, 'overrides.md');
+    fs.writeFileSync(file, 'Repo-specific UI-check contract');
+    const cmd = makeRepoCommand();
+    await cmd.parseAsync([
+      'node', 'test', 'onboard', 'acme/a', '--region', 'us-east-1',
+      '--system-prompt-overrides-file', file, '--ci-baseline-probe', '--require-tests', '--ui-checks-dir', 'checks/ui',
+    ]);
+
+    expect((onboardRepo as jest.Mock).mock.calls[0][3]).toMatchObject({
+      systemPromptOverrides: 'Repo-specific UI-check contract',
+      ciBaselineProbe: true,
+      requireTests: true,
+      uiChecksDir: 'checks/ui',
+    });
+  });
+
+  test('repo onboard leaves unset flags undefined so stored values are kept', async () => {
+    const cmd = makeRepoCommand();
+    await cmd.parseAsync(['node', 'test', 'onboard', 'acme/a', '--region', 'us-east-1']);
+
+    const opts = (onboardRepo as jest.Mock).mock.calls[0][3];
+    expect(opts.systemPromptOverrides).toBeUndefined();
+    expect(opts.ciBaselineProbe).toBeUndefined();
+    expect(opts.requireTests).toBeUndefined();
+  });
+
+  test('repo onboard --clear-system-prompt-overrides clears them; an unreadable file is an error', async () => {
+    await makeRepoCommand().parseAsync(['node', 'test', 'onboard', 'acme/a', '--region', 'us-east-1', '--clear-system-prompt-overrides']);
+    expect((onboardRepo as jest.Mock).mock.calls[0][3].systemPromptOverrides).toBe('');
+
+    await expect(makeRepoCommand().parseAsync([
+      'node', 'test', 'onboard', 'acme/a', '--region', 'us-east-1', '--system-prompt-overrides-file', '/nonexistent/x.md',
+    ])).rejects.toThrow(/cannot read/);
   });
 
   test('repo onboard warns when custom runtime is stored', async () => {

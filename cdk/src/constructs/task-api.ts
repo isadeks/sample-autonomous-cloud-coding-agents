@@ -27,6 +27,7 @@ import { Runtime, Architecture, type LayerVersion } from 'aws-cdk-lib/aws-lambda
 import * as lambda from 'aws-cdk-lib/aws-lambda-nodejs';
 import * as logs from 'aws-cdk-lib/aws-logs';
 import * as s3 from 'aws-cdk-lib/aws-s3';
+import type { ISecret } from 'aws-cdk-lib/aws-secretsmanager';
 import * as wafv2 from 'aws-cdk-lib/aws-wafv2';
 import { NagSuppressions } from 'cdk-nag';
 import { Construct } from 'constructs';
@@ -166,7 +167,7 @@ export interface TaskApiProps {
    * serves the `@bgagent` PR-comment trigger (github-comment-task.ts) that the
    * GitHub webhook receiver invokes for `issue_comment` events.
    */
-  readonly githubTokenSecret?: import('aws-cdk-lib/aws-secretsmanager').ISecret;
+  readonly githubTokenSecret?: ISecret;
 
   /**
    * Bedrock Guardrail version for screening task input.
@@ -1306,8 +1307,15 @@ export class TaskApi extends Construct {
         timeout: Duration.seconds(API_HANDLER_TIMEOUT_SECONDS),
       });
 
-      // `@bgagent` PR-comment trigger shares this Lambda (createTaskCore grants
-      // already here); it also needs the GitHub token for the PR lookup + reply.
+      // `@bgagent` PR-comment trigger (github-comment-task.ts) shares this Lambda.
+      // Trade-off, deliberately: a dedicated Lambda would add a function, role and
+      // policy, and the lambda-microvm deployment profile is at its 490-resource
+      // budget. Sharing reuses the createTaskCore env and grants but widens this
+      // internet-facing ingest Lambda's role by the platform GitHub token, used for
+      // the permission/PR lookups and the reply. The async trigger event is only
+      // reachable through lambda:InvokeFunction, granted to the GitHub receiver;
+      // API Gateway requests never take that path (isCommentTrigger). Repos with a
+      // per-repo token need that secret granted here too, as for the orchestrator.
       if (props.githubTokenSecret) {
         webhookCreateTaskFn.addEnvironment('GITHUB_TOKEN_SECRET_ARN', props.githubTokenSecret.secretArn);
         props.githubTokenSecret.grantRead(webhookCreateTaskFn);

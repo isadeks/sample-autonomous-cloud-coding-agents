@@ -608,6 +608,7 @@ export async function loadBlueprintConfig(task: TaskRecord): Promise<BlueprintCo
     ci_required_checks: repoConfig?.ci_required_checks,
     ui_checks_dir: repoConfig?.ui_checks_dir,
     require_tests: repoConfig?.require_tests,
+    ci_baseline_probe: repoConfig?.ci_baseline_probe,
     cedar_policies: repoConfig?.cedar_policies,
     approval_gate_cap: repoConfig?.approval_gate_cap,
     mcp_servers: repoConfig?.mcp_servers,
@@ -1003,6 +1004,7 @@ export async function hydrateAndTransition(task: TaskRecord, blueprintConfig?: B
     ...(blueprintConfig?.ci_required_checks?.length && { ci_required_checks: blueprintConfig.ci_required_checks }),
     ...(blueprintConfig?.ui_checks_dir && { ui_checks_dir: blueprintConfig.ui_checks_dir }),
     ...(blueprintConfig?.require_tests && { require_tests: true }),
+    ...(blueprintConfig?.ci_baseline_probe && { ci_baseline_probe: true }),
     // cedarText is inline blueprint policies ++ resolved registry
     // cedar_policy_module text (#246), so it supersedes the raw
     // blueprintConfig.cedar_policies — byte-identical to inline when no

@@ -36,7 +36,30 @@ For operators with IAM access to the deployed stack, `bgagent repo onboard` and 
 
 Use the CLI path for quick day-2 registration with platform defaults (runtime ARN, GitHub token secret). Use CDK when the repo needs durable infrastructure, custom IAM, Cedar policies, egress rules, or pipeline customization. The onboard command prints notes explaining which platform defaults apply and when a redeploy is still required.
 
+`bgagent repo onboard` carries every attribute of an existing row forward and only changes what its flags set. Flags for the convergence and agent-requirement settings:
+
+| Flag | RepoConfig field |
+|---|---|
+| `--build-command <cmd>` / `--lint-command <cmd>` | `build_command` / `lint_command` |
+| `--ci-wait-timeout <seconds>` (0 clears) | `ci_wait_timeout_s` |
+| `--ci-required-check <name>` (repeatable) / `--clear-ci-required-checks` | `ci_required_checks` |
+| `--ci-baseline-probe` / `--no-ci-baseline-probe` | `ci_baseline_probe` |
+| `--ui-checks-dir <dir>` (`''` clears) | `ui_checks_dir` |
+| `--require-tests` / `--no-require-tests` | `require_tests` |
+| `--system-prompt-overrides-file <path>` / `--clear-system-prompt-overrides` | `system_prompt_overrides` |
+
 See also: [Using the CLI — operator commands](../guides/USER_GUIDE.md#operator-commands-stack-admin) and [ADR-017](../decisions/ADR-017-operator-cli-repo-onboarding.md).
+
+### GitHub PR-comment trigger
+
+A comment containing `@bgagent <instruction>` on an open ABCA pull request (head branch `bgagent/<task_id>/…` in the same repository) starts a `coding/pr-iteration-v1` task with the instruction as its description. The repository's GitHub webhook (the one `bgagent github webhook-info` prints) must subscribe to **Issue comments** in addition to its screenshot events.
+
+- **Who can trigger:** only commenters with write, maintain or admin permission on the repository. Bot accounts, the platform's own token user and quoted text are ignored. Pull requests from forks are rejected.
+- **Whose task it is:** the iteration runs as the user who owns the PR's original task, against that user's budget. There is no GitHub-to-ABCA user mapping yet.
+- **What it does:** the receiver verifies the HMAC and dedups per comment; the instruction is screened by the input guardrail like any task description; ABCA replies on the PR with the task id.
+- PR iteration checks whether the PR is behind its base; if merging the base conflicts, resolving the conflicts becomes part of the task.
+
+With `ci_baseline_probe` set, the convergence loop may push a short-lived `abca-baseline/<task_id>` branch at the base commit (no new commit) so the repository's CI runs there; the branch is deleted afterwards. Exclude that prefix from branch protection and deploy workflows if they would otherwise act on it.
 
 ### Blueprint construct
 
@@ -73,11 +96,20 @@ interface BlueprintProps {
   };
   pipeline?: {
     pollIntervalMs?: number;
+    buildCommand?: string;             // post-agent build gate, default `mise run build`
+    lintCommand?: string;              // post-agent lint gate, default `mise run lint`
+    ciWaitTimeoutSeconds?: number;     // 0-21600; wait in-session for the PR's CI/CD (0 = off)
+    ciRequiredChecks?: string[];       // status contexts, check names or `deployment:<env>`
+    ciBaselineProbe?: boolean;         // verify "unrelated failure" claims on the base branch
+    uiChecksDir?: string;              // repo-relative dir for an agent-written UI check
+    requireTests?: boolean;            // ask for tests in the project's own suites
     customSteps?: CustomStepConfig[];
     stepSequence?: StepRef[];
   };
 }
 ```
+
+The `ci*`, `uiChecksDir` and `requireTests` settings drive the in-session convergence loop described in [Workflows — Convergence contract](./WORKFLOWS.md#convergence-contract). Repo-specific details the agent needs for them (the CD's UI-check format, preview environment variables) belong in `agent.systemPromptOverrides`.
 
 At deploy time, the construct creates a CDK custom resource that writes (PutItem) the `RepoConfig` record with `status: 'active'`. When removed from the stack, it soft-deletes (`status: 'removed'`). Redeploying with updated props overwrites the record.
 
@@ -101,6 +133,13 @@ interface RepoConfig {
   github_token_secret_arn?: string;
   egress_allowlist?: string[];
   poll_interval_ms?: number;
+  build_command?: string;
+  lint_command?: string;
+  ci_wait_timeout_s?: number;
+  ci_required_checks?: string[];
+  ci_baseline_probe?: boolean;
+  ui_checks_dir?: string;
+  require_tests?: boolean;
   custom_steps?: CustomStepConfig[];
   step_sequence?: StepRef[];
 }

@@ -396,6 +396,21 @@ def run_cmd(
     return result
 
 
+def try_cmd(
+    cmd: list[str], label: str, cwd: str | None = None, timeout: int = 60
+) -> subprocess.CompletedProcess:
+    """``run_cmd(check=False)`` that reports a timeout as exit 124 instead of raising.
+
+    For best-effort git/gh calls whose failure the caller handles (it checks
+    ``returncode``), so a hung remote cannot stall the task.
+    """
+    try:
+        return run_cmd(cmd, label=label, cwd=cwd, timeout=timeout, check=False)
+    except subprocess.TimeoutExpired:
+        log("WARN", f"{label}: timed out after {timeout}s")
+        return subprocess.CompletedProcess(cmd, 124, "", f"timed out after {timeout}s")
+
+
 # Signatures a transient (retryable) dependency/registry failure leaves in a
 # command's stderr — network blips, DNS hiccups, registry 5xx / rate limits.
 # NOT a permanent auth/not-found error: those are re-run-won't-help and would

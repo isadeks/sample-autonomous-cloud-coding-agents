@@ -322,20 +322,26 @@ class TestBuildSystemPrompt:
     _setup = RepoSetup(repo_dir="/workspace/t123", branch="b", default_branch="main")
 
     def test_ui_check_section_when_repo_sets_ui_checks_dir(self):
-        result = _build_system_prompt(
-            self._cfg(ui_checks_dir=".abca/ui-checks"), self._setup, None, ""
-        )
+        result = _build_system_prompt(self._cfg(ui_checks_dir="checks/ui"), self._setup, None, "")
         assert "## UI check for your change" in result
-        assert ".abca/ui-checks/<short-slug>.spec.ts" in result
+        assert "`checks/ui/`" in result
 
     def test_tests_required_section(self):
         on = _build_system_prompt(self._cfg(require_tests=True), self._setup, None, "")
         assert "## Tests (required for this repository)" in on
         assert "## Tests (required" not in _build_system_prompt(self._cfg(), self._setup, None, "")
 
+    def test_repo_overrides_carry_the_repo_specific_ui_check_contract(self):
+        # e.g. the preview's env vars live in the repo's system_prompt_overrides
+        overrides = "UI checks are Playwright specs; the preview URL is in PREVIEW_URL."
+        result = _build_system_prompt(
+            self._cfg(ui_checks_dir="checks/ui"), self._setup, None, overrides
+        )
+        assert result.index(overrides) < result.index("## UI check for your change")
+
     def test_no_ui_check_section_by_default_or_read_only(self):
         assert "## UI check" not in _build_system_prompt(self._cfg(), self._setup, None, "")
-        ro = self._cfg(ui_checks_dir=".abca/ui-checks", read_only=True)
+        ro = self._cfg(ui_checks_dir="checks/ui", read_only=True)
         assert "## UI check" not in _build_system_prompt(ro, self._setup, None, "")
 
     def test_placeholder_substitution(self):
