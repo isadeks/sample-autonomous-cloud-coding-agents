@@ -1158,6 +1158,11 @@ class PolicyEngine:
 
     # ---- Three-outcome pipeline -------------------------------------------
 
+    @property
+    def repo_root(self) -> str:
+        """The checkout the agent works in ("" when unknown)."""
+        return self._repo_root
+
     def _existed_at_base(self, file_path: str) -> bool:
         rel = _relative_to(self._repo_root, file_path) if self._repo_root else ""
         return bool(rel) and rel in self._files_at_base

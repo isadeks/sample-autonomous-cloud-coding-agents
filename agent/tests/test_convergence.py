@@ -137,6 +137,12 @@ def _ci_rounds(world: World, ctx: RoundContext | None = None, probe: BaselinePro
 
 
 class TestCiRounds:
+    @pytest.fixture(autouse=True)
+    def _no_handoff(self, monkeypatch):
+        # the handoff turn is covered by TestHandoff; keep these tests about the rounds
+        self.handoffs: list[tuple] = []
+        monkeypatch.setattr(convergence, "_post_handoff", lambda *a: self.handoffs.append(a))
+
     def test_off_without_a_wait_timeout(self):
         world = World()
         _agent_result, ci = _ci_rounds(world, _ctx(_config(ci_wait_timeout_s=0)))
@@ -446,3 +452,72 @@ def test_progress_is_reported_during_a_long_wait():
     ctx.progress.write_agent_milestone.assert_called_once_with(
         "ci_wait_progress", "sha=abcdef123 waited=300s pending=ci/build"
     )
+
+
+class TestHandoff:
+    """A PR still red after the rounds gets ONE tagged comment saying what ABCA needs."""
+
+    def _ctx(self, tmp_path):
+        config = TaskConfig(
+            repo_url="o/r", task_id="t1", max_turns=100, github_token="x", aws_region="us-east-1"
+        )
+        setup = RepoSetup(repo_dir=str(tmp_path), branch="bgagent/t1/x")
+        return convergence.RoundContext(config, setup, "sys", None, MagicMock(), 2)
+
+    def _red(self):
+        return CiResult(
+            "fail",
+            "abc1234567",
+            [{"name": "ci/integrity", "state": "failure", "url": "u", "detail": "1 finding"}],
+        )
+
+    def test_agent_writes_the_handoff_and_it_is_posted_tagged(self, tmp_path):
+        ci = CiConvergence(rounds=2, results=[self._red()])
+        agent = AgentResult(status="success", session_id="s", turns=10, num_turns=10, cost_usd=1.0)
+
+        async def _turn(*_a, **kw):
+            assert kw["resume_session_id"] == "s" and kw["max_turns"] <= 3
+            return AgentResult(
+                status="success", result_text="**Needs your decision:** approve X?", cost_usd=0.02
+            )
+
+        posted = []
+        with (
+            patch("runner.run_agent", side_effect=_turn),
+            patch("convergence.ci_comments_for", return_value=[]),
+            patch("convergence.try_cmd"),
+            patch("convergence.post_pr_handoff", side_effect=lambda *a: posted.append(a) or True),
+        ):
+            convergence._post_handoff(self._ctx(tmp_path), agent, ci, "7")
+        assert posted[0][:2] == ("o/r", "7") and "approve X?" in posted[0][2]
+        assert agent.cost_usd == pytest.approx(1.02)
+
+    def test_falls_back_to_the_failing_checks_when_the_agent_cannot_resume(self, tmp_path):
+        ci = CiConvergence(rounds=2, results=[self._red()])
+        agent = AgentResult(status="success", session_id="")  # nothing to resume
+        posted = []
+        with patch("convergence.post_pr_handoff", side_effect=lambda *a: posted.append(a) or True):
+            convergence._post_handoff(self._ctx(tmp_path), agent, ci, "7")
+        assert "`ci/integrity`: 1 finding" in posted[0][2] and "abc123456" in posted[0][2]
+
+
+def test_post_pr_handoff_tags_the_comment():
+    from handoff import ABCA_COMMENT_TAG, post_pr_handoff
+
+    with patch("handoff.try_cmd", return_value=subprocess.CompletedProcess([], 0, "", "")) as run:
+        assert post_pr_handoff("o/r", "7", "body", "/w")
+    body = run.call_args.args[0][run.call_args.args[0].index("--body") + 1]
+    assert body.startswith(ABCA_COMMENT_TAG) and "body" in body
+
+
+def test_approval_question_for_editing_an_existing_test():
+    from handoff import approval_question
+
+    q = approval_question(
+        "Edit",
+        {"file_path": "/w/e2e/a.e2e-spec.ts", "old_string": "a\nb", "new_string": "a\nb\nc"},
+        ["modify_existing_test"],
+        "/w",
+    )
+    assert q == "Allow changing the existing test `e2e/a.e2e-spec.ts`? (replaces 2 line(s) with 3)"
+    assert approval_question("Bash", {}, ["force_push_any"], "/w") == ""

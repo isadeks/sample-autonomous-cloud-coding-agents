@@ -49,6 +49,13 @@ from fixup import (
     remaining_budget,
     remaining_turns,
 )
+from handoff import (
+    HANDOFF_MAX_TURNS,
+    HANDOFF_MAX_WORDS,
+    fallback_handoff,
+    handoff_prompt,
+    post_pr_handoff,
+)
 from post_hooks import (
     DEFAULT_BUILD_COMMAND,
     ensure_committed,
@@ -394,7 +401,54 @@ def run_ci_rounds(
             else f"agent pushed no change; claim unverified ({ci.probe.reason or 'no verdict'})"
         )
         break
+    if ci.final is not None and ci.final.state == "fail" and not cancelled():
+        _post_handoff(ctx, agent_result, ci, pr_number)
     return ci
+
+
+def _post_handoff(
+    ctx: RoundContext, agent_result: AgentResult, ci: CiConvergence, pr_number: str
+) -> None:
+    """Checks are still red: tell the owner exactly what ABCA needs (one question).
+
+    The agent writes it in one constrained turn when it can still be resumed;
+    otherwise a deterministic summary of the failing checks is posted.
+    """
+    final = ci.final
+    if final is None or not pr_number:
+        return
+    config, repo_dir = ctx.config, ctx.setup.repo_dir
+    body = ""
+    if not _resume_blocker(ctx, agent_result):
+        report = failure_report(
+            final, ci_comments_for(config.repo_url, pr_number, final.sha, repo_dir)
+        )
+        try:
+            turn = asyncio.run(
+                runner.run_agent(
+                    handoff_prompt(report, ci.rounds),
+                    ctx.system_prompt,
+                    config,
+                    cwd=repo_dir,
+                    trajectory=ctx.trajectory,
+                    resume_session_id=agent_result.session_id,
+                    max_budget_usd=remaining_budget(config.max_budget_usd, agent_result.cost_usd),
+                    max_turns=min(
+                        HANDOFF_MAX_TURNS,
+                        remaining_turns(config.max_turns, _used_turns(agent_result)),
+                    ),
+                )
+            )
+            _accumulate(agent_result, turn)
+            body = (turn.result_text or "").strip()
+        except Exception as e:
+            log("WARN", f"handoff turn failed ({type(e).__name__}); posting the fallback")
+        # the handoff turn must not leave edits behind
+        try_cmd(["git", "checkout", "--", "."], label="handoff-discard-edits", cwd=repo_dir)
+    if not body or len(body.split()) > 2 * HANDOFF_MAX_WORDS:
+        body = fallback_handoff(final, ci.rounds)
+    if post_pr_handoff(config.repo_url, pr_number, body, repo_dir):
+        ctx.progress.write_agent_milestone("handoff_posted", f"sha={final.sha[:9]}")
 
 
 def _wait_and_record(

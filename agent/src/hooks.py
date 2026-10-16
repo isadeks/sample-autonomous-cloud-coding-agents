@@ -29,6 +29,7 @@ from typing import TYPE_CHECKING, Any
 
 import nudge_reader
 import task_state
+from handoff import approval_question
 from nudge_reader import _xml_escape
 from output_scanner import scan_tool_output
 from policy import APPROVAL_RATE_LIMIT, FLOOR_TIMEOUT_S, Outcome
@@ -618,7 +619,7 @@ async def _handle_require_approval(
         "tool_name": tool_name,
         "tool_input_preview": _tool_input_preview(tool_input),
         "tool_input_sha256": tool_input_sha256,
-        "reason": decision.reason,
+        "reason": _approval_reason(engine, tool_name, tool_input, decision),
         "severity": decision.severity or "medium",
         "matching_rule_ids": list(decision.matching_rule_ids),
         "status": "PENDING",
@@ -1716,6 +1717,17 @@ async def stop_hook(
 
     reason = "\n\n".join(chunks)
     return {"decision": "block", "reason": reason}
+
+
+def _approval_reason(engine: PolicyEngine, tool_name: str, tool_input: Any, decision: Any) -> str:
+    """The question a person reads for this approval, followed by the rule that fired."""
+    question = approval_question(
+        tool_name,
+        tool_input if isinstance(tool_input, dict) else {},
+        list(decision.matching_rule_ids),
+        engine.repo_root,
+    )
+    return f"{question} [{decision.reason}]" if question else decision.reason
 
 
 def _apply_test_guard(
