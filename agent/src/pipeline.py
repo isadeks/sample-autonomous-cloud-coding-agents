@@ -1534,6 +1534,11 @@ def run_task(
                         agent_result=agent_result,
                         strategy=ensure_pr_strategy,
                     )
+                    if pr_url:
+                        # Announce the PR now, not after the CI rounds below: a
+                        # channel (Linear) would otherwise show nothing for the
+                        # whole CI wait, often 20+ minutes.
+                        progress.write_agent_milestone("pr_created", pr_url)
                     if pr_url and not workflow_read_only and build_passed:
                         # Convergence on the PR's CI (per-repo ci_wait_timeout_s):
                         # keep this session, wait for the checks, feed failures back.
@@ -1562,7 +1567,6 @@ def run_task(
                     post_span.set_attribute("lint.passed", lint_passed)
                     post_span.set_attribute("pr.url", pr_url or "")
             if pr_url:
-                progress.write_agent_milestone("pr_created", pr_url)
                 # Move the Jira card In Progress → In Review now that a PR is
                 # open (issue #572) — but ONLY when the build passed. ensure_pr
                 # deliberately opens a PR even on a FAILED build (so the human
