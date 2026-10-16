@@ -991,6 +991,24 @@ export function renderLinearPrOpenedComment(prUrl: string, prNumber: number | nu
 }
 
 /**
+ * The PR a ``pr_created`` milestone announces. The agent emits the milestone as
+ * soon as the PR opens, before the in-session CI rounds, while the task record's
+ * ``pr_url`` is only written when the task ends — so fall back to the URL the
+ * milestone carries (``metadata.details``), accepted only for the task's own repo.
+ */
+export function prFromTaskOrMilestone(
+  task: { repo?: string; pr_url?: string; pr_number?: number },
+  event: FanOutEvent,
+): { url: string; number: number | null } | null {
+  if (task.pr_url) return { url: task.pr_url, number: task.pr_number ?? null };
+  const details = event.metadata?.details;
+  if (typeof details !== 'string' || !task.repo) return null;
+  const m = details.match(/^https:\/\/github\.com\/([^/]+\/[^/]+)\/pull\/(\d+)$/);
+  if (!m || m[1].toLowerCase() !== task.repo.toLowerCase()) return null;
+  return { url: details, number: Number(m[2]) };
+}
+
+/**
  * Render the Linear final-status comment body. Inputs are already
  * coerced to native types by the caller; this function only formats.
  *
@@ -1233,8 +1251,10 @@ async function dispatchToLinear(event: FanOutEvent): Promise<void> {
     }
     // First-run PR-opened comment. Skip if we've already posted it, or if
     // there's no PR URL yet (nothing to link).
-    if (task.linear_pr_comment_event_id || !task.pr_url) return;
-    const prBody = renderLinearPrOpenedComment(task.pr_url, task.pr_number ?? null);
+    if (task.linear_pr_comment_event_id) return;
+    const pr = prFromTaskOrMilestone(task, event);
+    if (!pr) return;
+    const prBody = renderLinearPrOpenedComment(pr.url, pr.number);
     const prResult = await postIssueComment(
       { linearWorkspaceId: workspaceId, registryTableName },
       issueId,

@@ -194,6 +194,7 @@ function adfText(body: unknown): string {
 import {
   CHANNEL_DEFAULTS,
   parseStreamRecord,
+  prFromTaskOrMilestone,
   renderJiraFinalStatusComment,
   renderLinearFinalStatusComment,
   resolveChannelFilter,
@@ -1599,6 +1600,39 @@ describe('fanout-task-events: Linear dispatcher', () => {
     expect(body).toContain('🔗');
     expect(body).toContain('PR #13');
     expect(body).toContain('https://github.com/owner/repo/pull/13');
+  });
+
+  test('pr_created before the record has pr_url links the PR the milestone carries', async () => {
+    // The agent announces the PR before its CI rounds; pr_url lands on the record at the end.
+    mockGet({ ...TASK_RECORD_LINEAR, pr_url: undefined });
+
+    const event: DynamoDBStreamEvent = {
+      Records: [mkRecord('INSERT', {
+        task_id: { S: 't-lin' },
+        event_id: { S: '01ABCpr' },
+        event_type: { S: 'agent_milestone' },
+        timestamp: { S: '2026-04-22T04:00:00Z' },
+        metadata: { M: { milestone: { S: 'pr_created' }, details: { S: 'https://github.com/owner/repo/pull/14' } } },
+      })],
+    };
+    await handler(event);
+
+    expect(mockPostIssueComment).toHaveBeenCalledTimes(1);
+    const [, , body] = mockPostIssueComment.mock.calls[0];
+    expect(body).toContain('PR #14');
+    expect(body).toContain('https://github.com/owner/repo/pull/14');
+  });
+
+  test('prFromTaskOrMilestone ignores a milestone URL for another repo', () => {
+    const ev = {
+      task_id: 't',
+      event_id: 'e',
+      event_type: 'agent_milestone',
+      timestamp: 'x',
+      metadata: { milestone: 'pr_created', details: 'https://github.com/other/repo/pull/1' },
+    };
+    expect(prFromTaskOrMilestone({ repo: 'owner/repo' }, ev)).toBeNull();
+    expect(prFromTaskOrMilestone({ repo: 'owner/repo', pr_url: 'u', pr_number: 2 }, ev)).toEqual({ url: 'u', number: 2 });
   });
 
   test('pr_created without a PR url yet posts nothing (nothing to link)', async () => {
