@@ -95,6 +95,25 @@ repos:
         files: ^(contracts/coverage-thresholds\.json$|cdk/package\.json$|cli/package\.json$|agent/(pyproject\.toml|mise\.toml)$|scripts/check-coverage-thresholds-sync\.ts$)
         stages: [pre-commit]
 
+      # Layer 3 of the git-fixture isolation (#855). Registered at BOTH stages on
+      # purpose: pre-commit catches a polluted config before a mis-attributed
+      # commit is created (a repo-local [user] always shadows ~/.gitconfig), and
+      # pre-push catches whatever the hook-run test suite just wrote — the leak
+      # happens DURING the pre-push test run itself. pass_filenames: false and no
+      # `files:` filter, because the trigger is the state of .git/config, not the
+      # content of the change.
+      - id: git-config-clean
+        name: shared .git/config is unpolluted (core.worktree / [user])
+        # NOT `--show-toplevel` like the hooks above: a polluted `core.worktree`
+        # changes what that returns, so this hook would `cd` to a path that may
+        # not exist and die with a confusing shell error instead of the report.
+        # `--git-common-dir`/.. answers from the gitdir alone.
+        entry: bash -lc 'cd "$(git rev-parse --path-format=absolute --git-common-dir)/.." && mise run check:git-config-clean'
+        language: system
+        pass_filenames: false
+        always_run: true
+        stages: [pre-commit, pre-push]
+
       - id: monorepo-security-pre-push
         name: security scans (pre-push)
         entry: bash -lc 'cd "$(git rev-parse --show-toplevel)" && mise run hooks:pre-push:security'

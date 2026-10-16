@@ -13,6 +13,7 @@ from registry.loader import (
     apply_resolved_assets,
     build_skill_prompt_fragment,
 )
+from tests.git_isolation import isolated_git_env
 
 
 def _read_mcp(repo_dir) -> dict:
@@ -295,17 +296,27 @@ class TestMcpJsonNotCommittable:
 
     @staticmethod
     def _git(repo, *args) -> subprocess.CompletedProcess:
+        # `-C <repo>` is NOT containment (#855): an inherited GIT_DIR overrides
+        # repository discovery outright, so it beats -C, --local, cwd, HOME and
+        # the GIT_CONFIG_* pins at once — `git -C <tmp> init` then re-inits the
+        # SHARED repo and `git -C <tmp> config user.email` writes the real
+        # .git/config. Git exports GIT_DIR to hooks in a linked worktree, which is
+        # how this suite runs as a pre-push gate. `env=` is the fix, not optional
+        # hardening: the version of this helper landed by #665 omitted it and was
+        # the 4th recurrence.
         return subprocess.run(
             ["git", "-C", str(repo), *args],
             capture_output=True,
             text=True,
             check=False,
+            env=isolated_git_env(repo),
         )
 
     def _init_repo(self, tmp_path):
         self._git(tmp_path, "init", "-q")
-        self._git(tmp_path, "config", "user.email", "t@t")
-        self._git(tmp_path, "config", "user.name", "t")
+        # No `git config user.*`: isolated_git_env supplies an RFC-2606 reserved
+        # identity via GIT_AUTHOR_*/GIT_COMMITTER_*, which outrank every config
+        # file — so there is nothing left for a stray config write to escape with.
         (tmp_path / "README.md").write_text("x")
         self._git(tmp_path, "add", "README.md")
         self._git(tmp_path, "commit", "-qm", "init")

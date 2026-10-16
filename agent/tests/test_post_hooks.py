@@ -6,15 +6,13 @@ The two seams are ``subprocess.run`` (read-only git/gh queries) and
 ``shell.run_cmd`` (mutating git/gh commands) — both faked with recorders.
 """
 
-import os
 import subprocess
 from types import SimpleNamespace
-
-import pytest
 
 import post_hooks
 from models import RepoSetup
 from tests.conftest import FakeRunCmd, make_task_config
+from tests.git_isolation import isolated_git_env
 
 # post_hooks.py keys scripted results off the exact label (FakeRunCmd's default
 # exact-match mode), so e.g. returncodes={"push": 1} does not bleed into the
@@ -279,81 +277,28 @@ class TestReconcileAgentBranch:
     higher confidence than faking subprocess. The two seams (subprocess.run for
     the branch read, run_cmd for the mutating ops) both hit the tmp repo."""
 
-    # Repo-LOCATION vars. An explicit GIT_DIR overrides repository discovery
-    # outright, so it beats cwd, HOME, the GIT_CONFIG_* pins and `--local`
-    # alike. Git exports these to hooks in a LINKED WORKTREE (unset in a normal
-    # repo), which is exactly how this suite runs as a pre-push gate from
-    # .worktrees/.
-    _GIT_LOCATION_VARS = (
-        "GIT_DIR",
-        "GIT_COMMON_DIR",
-        "GIT_WORK_TREE",
-        "GIT_INDEX_FILE",
-        "GIT_OBJECT_DIRECTORY",
-        "GIT_ALTERNATE_OBJECT_DIRECTORIES",
-        "GIT_PREFIX",
-        "GIT_CEILING_DIRECTORIES",
-    )
-
-    @pytest.fixture(autouse=True)
-    def _clear_ambient_git_location(self, monkeypatch):
-        """Strip repo-location vars for the whole class (#720).
-
-        Not just for the fixture helpers: ``post_hooks`` itself shells out to
-        git with the ambient environment (e.g. ``_current_branch``), so an
-        inherited GIT_DIR would point PRODUCTION code at the real repo instead
-        of the tmp one — the assertions would silently describe the wrong
-        repository.
-        """
-        for var in self._GIT_LOCATION_VARS:
-            monkeypatch.delenv(var, raising=False)
+    # The repo-location strip + config pinning that used to live here as a
+    # per-class fixture (#720/#731) now lives in ``tests/git_isolation.py`` and is
+    # applied to EVERY test by conftest's autouse ``_isolate_git_env`` (#855) —
+    # including ``post_hooks``'s own git calls (e.g. ``_current_branch``), which
+    # run with the ambient environment, so an inherited GIT_DIR would point
+    # PRODUCTION code at the real repo and the assertions below would silently
+    # describe the wrong repository.
+    #
+    # ``_GIT_LOCATION_VARS`` is deliberately NOT re-declared here: a second
+    # definition is exactly how the previous fixes drifted (#855 acceptance
+    # criterion — one definition in the tree). Import it if you need it.
 
     @staticmethod
     def _isolated_env(repo):
-        # Hard-isolate from the developer's real git identity (#720). `cwd` alone
-        # is NOT containment: a bare `git config` walks up to the nearest
-        # enclosing repo, and `git init` at a linked-worktree root re-inits the
-        # SHARED .git rather than creating a nested one — so both can write
-        # straight into the real .git/config. Pinning the HOME/config env vars
-        # means even a transcribed `git config user.email` cannot escape tmp.
-        #
-        # Dropping the repo-LOCATION vars first is load-bearing, not tidiness.
-        # An explicit GIT_DIR overrides repository discovery outright, so it
-        # defeats cwd, HOME and the GIT_CONFIG_* pins together — and `--local`
-        # resolves relative to it, so that is no defence either. Git exports
-        # GIT_DIR to hooks in a LINKED WORKTREE (it is unset in a normal repo),
-        # which is exactly how this suite runs as a pre-push gate from
-        # .worktrees/: inheriting it re-opens #720 and additionally stamps
-        # `bare = true` on the real repo.
-        env = {
-            k: v
-            for k, v in os.environ.items()
-            if k
-            not in {
-                "GIT_DIR",
-                "GIT_COMMON_DIR",
-                "GIT_WORK_TREE",
-                "GIT_INDEX_FILE",
-                "GIT_OBJECT_DIRECTORY",
-                "GIT_ALTERNATE_OBJECT_DIRECTORIES",
-                "GIT_PREFIX",
-                "GIT_CEILING_DIRECTORIES",
-            }
-        }
-        env.update(
-            {
-                "HOME": str(repo),
-                "XDG_CONFIG_HOME": str(repo),
-                "GIT_CONFIG_GLOBAL": os.path.join(str(repo), ".gitconfig-test"),
-                "GIT_CONFIG_SYSTEM": os.devnull,
-                "GIT_CONFIG_NOSYSTEM": "1",
-                "GIT_AUTHOR_NAME": "ABCA Test",
-                "GIT_AUTHOR_EMAIL": "abca-test@example.invalid",
-                "GIT_COMMITTER_NAME": "ABCA Test",
-                "GIT_COMMITTER_EMAIL": "abca-test@example.invalid",
-            }
-        )
-        return env
+        # Hard-isolate from the developer's real git identity (#720), now via the
+        # single shared helper (#855). `cwd` alone is NOT containment: a bare
+        # `git config` walks up to the nearest enclosing repo, and `git init` at a
+        # linked-worktree root re-inits the SHARED .git rather than creating a
+        # nested one. Dropping the repo-LOCATION vars *before* overlaying the
+        # HOME/GIT_CONFIG_* pins is load-bearing — GIT_DIR defeats cwd, HOME, the
+        # pins and `--local` simultaneously. See tests/git_isolation.py.
+        return isolated_git_env(repo)
 
     def _git(self, repo, *args):
         subprocess.run(
