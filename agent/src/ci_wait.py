@@ -32,6 +32,10 @@ _FAILED = {"failure", "error", "cancelled", "timed_out", "action_required", "sta
 # repo has no CI on this commit.
 CI_APPEAR_TIMEOUT_S = 300
 CI_POLL_INTERVAL_S = 30
+# After the first red check, how long to keep polling while other checks are still
+# reporting: CI often posts the failure's details (statuses, a report comment) a few
+# seconds after the first red, and the fix-up round or handoff needs them.
+CI_SETTLE_S = 120
 # A ci_wait_progress milestone this often while checks are pending.
 CI_PROGRESS_EVERY_S = 300
 # Cap on the failure report handed to the agent.
@@ -215,6 +219,7 @@ def wait_for_ci(
     on_progress: Callable[[int, list[dict]], None] = lambda _w, _c: None,
     appear_timeout_s: int = CI_APPEAR_TIMEOUT_S,
     required_appear_timeout_s: int | None = None,
+    settle_s: int = CI_SETTLE_S,
     poll_s: int = CI_POLL_INTERVAL_S,
     progress_every_s: int = CI_PROGRESS_EVERY_S,
     sleep: Callable[[float], None] = time.sleep,
@@ -226,10 +231,13 @@ def wait_for_ci(
     ``none``: nothing reported within ``appear_timeout_s`` (or, with
     ``required_appear_timeout_s``, some required name never showed up).
     ``error``: every poll failed (GitHub unreadable) up to the appear window.
+    A ``fail`` is returned once the other checks have settled, or ``settle_s``
+    after the first red, whichever comes first.
     """
     start = clock()
     checks: list[dict] = []
     readable = False
+    first_red: int | None = None
     next_progress = progress_every_s
     while True:
         waited = int(clock() - start)
@@ -241,10 +249,17 @@ def wait_for_ci(
             checks = got if only is None else [c for c in got if c["name"] in only]
         if checks:
             verdict = classify(checks, required)
-            if verdict != "pending":
-                return CiResult(verdict, sha, checks, waited)
             names = {c["name"] for c in checks}
             missing = [r for r in required or [] if r not in names]
+            if verdict == "fail":
+                first_red = waited if first_red is None else first_red
+                settled = not missing and all(c["state"] != "pending" for c in checks)
+                if settled or waited - first_red >= settle_s or waited >= timeout_s:
+                    return CiResult(verdict, sha, checks, waited)
+                sleep(poll_s)
+                continue
+            if verdict != "pending":
+                return CiResult(verdict, sha, checks, waited)
             if (
                 missing
                 and required_appear_timeout_s is not None

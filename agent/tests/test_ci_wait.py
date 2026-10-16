@@ -175,6 +175,27 @@ class TestWaitForCi:
         ]
         assert _wait(seq, required=["ci/build", "deploy:Preview"]).state == "pass"
 
+    def test_a_red_check_waits_for_the_others_to_report(self):
+        seq = [
+            [_chk("ci/build", "failure"), _chk("ci/e2e", "pending")],
+            [_chk("ci/build", "failure"), _chk("ci/e2e", "error")],
+        ]
+        r = _wait(seq)
+        assert r.state == "fail" and r.waited_s == 30
+        assert [c["state"] for c in r.checks] == ["failure", "error"]
+
+    def test_a_red_check_waits_for_a_required_check_to_appear(self):
+        seq = [
+            [_chk("ci/build", "failure")],
+            [_chk("ci/build", "failure"), _chk("ci/e2e", "error")],
+        ]
+        r = _wait(seq, required=["ci/build", "ci/e2e"])
+        assert r.state == "fail" and len(r.checks) == 2
+
+    def test_a_red_check_stops_waiting_after_the_settle_window(self):
+        r = _wait([[_chk("ci/build", "failure"), _chk("ci/e2e", "pending")]], settle_s=90)
+        assert r.state == "fail" and r.waited_s == 90
+
     def test_nothing_reported_is_none(self):
         r = _wait([[]], appear=120)
         assert r.state == "none" and r.waited_s == 120
