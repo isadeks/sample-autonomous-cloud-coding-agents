@@ -581,3 +581,11 @@ class TestRegisterGatewayServer:
             "clarification": existing,
             GATEWAY_SERVER_NAME: sentinel,
         }
+
+
+def test_agent_sessions_hide_claude_code_attribution():
+    import json
+
+    from runner import _AGENT_SETTINGS
+
+    assert json.loads(_AGENT_SETTINGS)["attribution"] == {"commit": "", "pr": ""}

@@ -25,6 +25,7 @@ injection does not double-count turns.
 
 from __future__ import annotations
 
+import json
 import os
 import subprocess
 from typing import Any, Literal
@@ -553,6 +554,10 @@ def _register_gateway_server(mcp_servers: dict[str, Any]) -> None:
         log("AGENT", "AgentCore Gateway tool bridge registered (mcp__abca_gateway__*)")
 
 
+# Claude Code settings for every agent session (the CLI's --settings JSON).
+_AGENT_SETTINGS = json.dumps({"attribution": {"commit": "", "pr": ""}})
+
+
 async def run_agent(
     prompt: str,
     system_prompt: str,
@@ -662,6 +667,10 @@ async def run_agent(
     _register_gateway_server(mcp_servers)
 
     options = ClaudeAgentOptions(
+        # No Claude Code attribution footer/trailer in commits and PRs: ABCA's own
+        # commit hook adds Task-Id / Prompt-Version trailers, and the PR carries
+        # ABCA's Verification block. (Newer bundled CLIs add the footer by default.)
+        settings=_AGENT_SETTINGS,
         model=config.anthropic_model,
         system_prompt=system_prompt,
         allowed_tools=allowed_tools,
