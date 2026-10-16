@@ -1,18 +1,32 @@
-# @backgroundagent/cli
+# `bgagent` CLI (`@abca/cli`)
 
 Command-line interface for the ABCA platform. Submit coding tasks, monitor their status, and manage results — all through the deployed REST API with Cognito authentication.
 
 ## Installation
 
-```bash
-npm install -g @backgroundagent/cli
-```
-
-Or run directly from the monorepo:
+**This repository** builds the CLI under `cli/`; it is not published to npm, so there is no registry install. Compile it, then run the entrypoint that `package.json` exposes as `bin`:
 
 ```bash
-node cli/lib/bin/bgagent.js
+mise run install              # from the repo root (yarn workspaces)
+mise //cli:compile            # emits cli/lib/ (needs MISE_EXPERIMENTAL=1)
+
+cd cli
+node lib/bin/bgagent.js --help
 ```
+
+To call a bare `bgagent` on your `PATH` — which every example below assumes — link the package after compiling:
+
+```bash
+cd cli
+npm link                      # symlinks bgagent → cli/lib/bin/bgagent.js
+bgagent --version
+
+npm unlink -g @abca/cli       # to remove it again
+```
+
+Either path runs the same code; only the invocation differs. Substitute `node lib/bin/bgagent.js` (from the `cli` directory) for `bgagent` in the examples if you would rather not link.
+
+> **Not yet on npm.** `cli/package.json` declares `@abca/cli` and is `private`; nothing in this repository publishes it. If a registry install (`npm install -g …`) is offered in future, it will be documented here once published — an earlier version of this file advertised `@backgroundagent/cli`, which has never existed under either name.
 
 ## Quick start
 

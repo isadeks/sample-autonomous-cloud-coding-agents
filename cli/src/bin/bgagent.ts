@@ -52,13 +52,16 @@ import { makeWebhookCommand } from '../commands/webhook';
 import { setVerbose } from '../debug';
 import { CliError } from '../errors';
 import { applyDefaultAppId } from '../ua';
+import { resolveCliVersion } from '../version';
 
 const program = new Command();
 
 program
   .name('bgagent')
   .description('Background Agent CLI — submit and manage coding tasks')
-  .version('0.0.0')
+  // Read from cli/package.json rather than a literal so the two cannot drift
+  // and a bug report's `--version` is attributable to a build (#913).
+  .version(resolveCliVersion())
   .option('--verbose', 'Enable debug output')
   .hook('preAction', (_thisCommand, actionCommand) => {
     // Resolve --verbose from the root program, not the subcommand
