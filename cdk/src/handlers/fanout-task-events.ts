@@ -1002,7 +1002,8 @@ export function renderLinearPrOpenedComment(prUrl: string, prNumber: number | nu
  *
  * The framing flips between three outcomes based on `(eventType, prUrl)`:
  *
- *   1. ``task_completed``                        → ✅ "Task completed"
+ *   1. ``task_completed``                        → ✅ "PR #N ready for review" ("Task completed"
+ *      without a PR) — the PR still has review, merge and delivery ahead of it
  *   2. any non-completed terminal event WITH PR  → ⚠️ "Shipped a PR but stopped early"
  *      (the motivating case is hitting the max-turns cap after opening a PR,
  *      but the same framing applies to any terminal failure — budget cap,
@@ -1050,7 +1051,12 @@ export function renderLinearFinalStatusComment(args: {
 
   let header: string;
   if (isCompleted) {
-    header = '✅ **Task completed**';
+    // Not "Task completed" when there is a PR: on the issue that reads as "done",
+    // while review, merge and delivery are still ahead.
+    const prNumber = args.prUrl?.match(/\/pull\/(\d+)/)?.[1];
+    header = args.prUrl
+      ? `✅ **${prNumber ? `PR #${prNumber}` : 'Pull request'} ready for review**`
+      : '✅ **Task completed**';
   } else if (shippedDespiteFailure) {
     // Append the classifier title (when known) so the requester sees
     // *why* the agent stopped, not just that it shipped a PR. For a

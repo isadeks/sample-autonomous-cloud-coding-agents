@@ -1512,8 +1512,8 @@ describe('fanout-task-events: Linear dispatcher', () => {
       registryTableName: 'LinearWorkspaceRegistry',
     });
     expect(issueId).toBe('issue-uuid-42');
-    expect(body).toContain('✅');
-    expect(body).toContain('Task completed');
+    expect(body).toContain('✅ **PR #13 ready for review**');
+    expect(body).not.toContain('Task completed');
     expect(body).toContain('$0.55');
     expect(body).toContain('27 / 100');
     expect(body).toContain('3m 41s');
