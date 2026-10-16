@@ -64,6 +64,9 @@ export interface PreflightResult {
 // ---------------------------------------------------------------------------
 
 const GITHUB_API_TIMEOUT_MS = 5_000;
+/** Pause before the single retry of a GitHub call that hit a network error or a 502/503/504. */
+export const GITHUB_RETRY_DELAY_MS = 1_000;
+const RETRYABLE_STATUSES = new Set([502, 503, 504]);
 
 /** GitHub GraphQL `viewerPermission` values that allow pushing branches (new_task / pr_iteration). */
 const CONTENTS_WRITE_LEVELS = new Set(['WRITE', 'MAINTAIN', 'ADMIN']);
@@ -80,6 +83,31 @@ function splitRepo(repo: string): { owner: string; name: string } | undefined {
     return undefined;
   }
   return { owner: repo.slice(0, idx), name: repo.slice(idx + 1) };
+}
+
+/**
+ * GET a GitHub REST URL, retrying once after a network error (including the timeout) or a
+ * 502/503/504. A cold Lambda's first connection to GitHub can exceed the timeout, and one
+ * blip should not fail a task that would otherwise start fine. The second attempt's
+ * outcome (response or error) is returned as is.
+ */
+async function getGitHub(url: string, token: string): Promise<Response> {
+  const attempt = () => fetch(url, {
+    headers: {
+      Authorization: `token ${token}`,
+      Accept: 'application/vnd.github.v3+json',
+    },
+    signal: AbortSignal.timeout(GITHUB_API_TIMEOUT_MS),
+  });
+  try {
+    const resp = await attempt();
+    if (!RETRYABLE_STATUSES.has(resp.status)) return resp;
+    logger.warn('GitHub call failed, retrying once', { url, status: resp.status });
+  } catch (err) {
+    logger.warn('GitHub call failed, retrying once', { url, error: err instanceof Error ? err.message : String(err) });
+  }
+  await new Promise((resolve) => setTimeout(resolve, GITHUB_RETRY_DELAY_MS));
+  return attempt();
 }
 
 async function fetchViewerPermission(repo: string, token: string): Promise<string | undefined> {
@@ -121,13 +149,7 @@ async function fetchViewerPermission(repo: string, token: string): Promise<strin
 async function checkGitHubReachability(token: string): Promise<PreflightCheckResult> {
   const start = Date.now();
   try {
-    const resp = await fetch('https://api.github.com/rate_limit', {
-      headers: {
-        Authorization: `token ${token}`,
-        Accept: 'application/vnd.github.v3+json',
-      },
-      signal: AbortSignal.timeout(GITHUB_API_TIMEOUT_MS),
-    });
+    const resp = await getGitHub('https://api.github.com/rate_limit', token);
     const durationMs = Date.now() - start;
     if (resp.ok) {
       return { check: 'github_reachability', passed: true, durationMs };
@@ -156,13 +178,7 @@ async function checkGitHubReachability(token: string): Promise<PreflightCheckRes
 async function checkRepoAccess(repo: string, token: string, readOnly: boolean): Promise<PreflightCheckResult> {
   const start = Date.now();
   try {
-    const resp = await fetch(`https://api.github.com/repos/${repo}`, {
-      headers: {
-        Authorization: `token ${token}`,
-        Accept: 'application/vnd.github.v3+json',
-      },
-      signal: AbortSignal.timeout(GITHUB_API_TIMEOUT_MS),
-    });
+    const resp = await getGitHub(`https://api.github.com/repos/${repo}`, token);
     const durationMs = Date.now() - start;
     if (!resp.ok) {
       if (resp.status === 404 || resp.status === 403) {
@@ -248,13 +264,7 @@ async function checkRepoAccess(repo: string, token: string, readOnly: boolean): 
 async function checkPrAccessible(repo: string, prNumber: number, token: string): Promise<PreflightCheckResult> {
   const start = Date.now();
   try {
-    const resp = await fetch(`https://api.github.com/repos/${repo}/pulls/${prNumber}`, {
-      headers: {
-        Authorization: `token ${token}`,
-        Accept: 'application/vnd.github.v3+json',
-      },
-      signal: AbortSignal.timeout(GITHUB_API_TIMEOUT_MS),
-    });
+    const resp = await getGitHub(`https://api.github.com/repos/${repo}/pulls/${prNumber}`, token);
     const durationMs = Date.now() - start;
     if (!resp.ok) {
       return {

@@ -63,8 +63,31 @@ function githubRepoOk(permissions: { push?: boolean; pull?: boolean } = { push: 
   };
 }
 
+/**
+ * Route fetch by endpoint: each list is consumed per call to that endpoint (the checks run
+ * concurrently, so a single ordered mock queue would be ambiguous once calls retry).
+ */
+function routeFetch(routes: { rateLimit?: unknown[]; repo?: unknown[] }) {
+  const queues = { rateLimit: [...(routes.rateLimit ?? [])], repo: [...(routes.repo ?? [])] };
+  mockFetch.mockImplementation(async (url: string) => {
+    const next = (url.endsWith('/rate_limit') ? queues.rateLimit : queues.repo).shift();
+    if (next instanceof Error) throw next;
+    return next ?? githubRepoOk();
+  });
+}
+
+/** Run the retry pause immediately. */
+function skipRetryDelay() {
+  jest.spyOn(global, 'setTimeout').mockImplementation(((fn: () => void) => {
+    fn();
+    return 0;
+  }) as unknown as typeof setTimeout);
+}
+
 beforeEach(() => {
   jest.clearAllMocks();
+  jest.restoreAllMocks();
+  mockFetch.mockReset();
   clearTokenCache();
   delete process.env.PREFLIGHT_CHECK_RUNTIME;
 });
@@ -146,11 +169,10 @@ describe('runPreflightChecks', () => {
     expect(result.failureDetail).toContain('401');
   });
 
-  test('fails GITHUB_UNREACHABLE on network timeout', async () => {
+  test('fails GITHUB_UNREACHABLE when the network times out twice', async () => {
     mockSmSend.mockResolvedValueOnce({ SecretString: 'ghp_test123' });
-    mockFetch
-      .mockRejectedValueOnce(new Error('The operation was aborted'))
-      .mockResolvedValueOnce(githubRepoOk());
+    skipRetryDelay();
+    routeFetch({ rateLimit: [new Error('The operation was aborted'), new Error('The operation was aborted')] });
 
     const result = await runPreflightChecks('owner/repo', baseBlueprintConfig);
 
@@ -159,11 +181,11 @@ describe('runPreflightChecks', () => {
     expect(result.failureDetail).toContain('aborted');
   });
 
-  test('fails GITHUB_UNREACHABLE on DNS/network error', async () => {
+  test('fails GITHUB_UNREACHABLE on a DNS/network error that persists', async () => {
     mockSmSend.mockResolvedValueOnce({ SecretString: 'ghp_test123' });
-    mockFetch
-      .mockRejectedValueOnce(new Error('getaddrinfo ENOTFOUND api.github.com'))
-      .mockResolvedValueOnce(githubRepoOk());
+    skipRetryDelay();
+    const dns = new Error('getaddrinfo ENOTFOUND api.github.com');
+    routeFetch({ rateLimit: [dns, dns] });
 
     const result = await runPreflightChecks('owner/repo', baseBlueprintConfig);
 
@@ -269,11 +291,10 @@ describe('runPreflightChecks', () => {
     expect(runtimeCheck).toBeUndefined();
   });
 
-  test('fails GITHUB_UNREACHABLE on repo 5xx', async () => {
+  test('fails GITHUB_UNREACHABLE on a repo 5xx that persists', async () => {
     mockSmSend.mockResolvedValueOnce({ SecretString: 'ghp_test123' });
-    mockFetch
-      .mockResolvedValueOnce({ ok: true, status: 200 })
-      .mockResolvedValueOnce({ ok: false, status: 502 });
+    skipRetryDelay();
+    routeFetch({ rateLimit: [{ ok: true, status: 200 }], repo: [{ ok: false, status: 502 }, { ok: false, status: 502 }] });
 
     const result = await runPreflightChecks('owner/repo', baseBlueprintConfig);
 
@@ -283,17 +304,39 @@ describe('runPreflightChecks', () => {
     expect(result.failureDetail).toContain('owner/repo');
   });
 
-  test('fails GITHUB_UNREACHABLE on repo network error', async () => {
+  test('fails GITHUB_UNREACHABLE on a repo network error that persists', async () => {
     mockSmSend.mockResolvedValueOnce({ SecretString: 'ghp_test123' });
-    mockFetch
-      .mockResolvedValueOnce({ ok: true, status: 200 })
-      .mockRejectedValueOnce(new Error('socket hang up'));
+    skipRetryDelay();
+    const hangUp = new Error('socket hang up');
+    routeFetch({ rateLimit: [{ ok: true, status: 200 }], repo: [hangUp, hangUp] });
 
     const result = await runPreflightChecks('owner/repo', baseBlueprintConfig);
 
     expect(result.passed).toBe(false);
     expect(result.failureReason).toBe(PreflightFailureReason.GITHUB_UNREACHABLE);
     expect(result.failureDetail).toContain('socket hang up');
+  });
+
+  test('passes when one GitHub timeout is followed by a good retry', async () => {
+    // The live failure this covers: a cold Lambda's first connection timed out after 5 s.
+    mockSmSend.mockResolvedValueOnce({ SecretString: 'ghp_test123' });
+    skipRetryDelay();
+    routeFetch({ rateLimit: [new Error('The operation was aborted due to timeout'), { ok: true, status: 200 }] });
+
+    const result = await runPreflightChecks('owner/repo', baseBlueprintConfig);
+
+    expect(result.passed).toBe(true);
+    expect(mockFetch).toHaveBeenCalledTimes(3);
+  });
+
+  test('does not retry a 401 or 404', async () => {
+    mockSmSend.mockResolvedValueOnce({ SecretString: 'ghp_test123' });
+    routeFetch({ rateLimit: [{ ok: true, status: 200 }], repo: [{ ok: false, status: 404 }] });
+
+    const result = await runPreflightChecks('owner/repo', baseBlueprintConfig);
+
+    expect(result.failureReason).toBe(PreflightFailureReason.REPO_NOT_FOUND_OR_NO_ACCESS);
+    expect(mockFetch).toHaveBeenCalledTimes(2);
   });
 
   test('handles Promise.allSettled unexpected rejection fail-closed', async () => {
