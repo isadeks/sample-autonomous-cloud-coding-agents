@@ -889,6 +889,13 @@ export class AgentStack extends Stack {
         reason:
           'CDK-generated overflow policy on the Linear webhook processor role carries the kms:GenerateDataKey* that SNS Topic.grantPublish emits for the CMK-encrypted operational-alerts topic. Scoped to that single topic key; the wildcard only spans the GenerateDataKey/GenerateDataKeyWithoutPlaintext pair.',
       },
+      {
+        // With enableLinearIdentityVault the vault mint grants push the stream
+        // reconciler's role over the same limit (synth fails on this path otherwise).
+        pathFragment: '/OrchestrationReconciler/ReconcilerFn/ServiceRole/OverflowPolicy',
+        reason:
+          'CDK-generated overflow policy on the orchestration reconciler role. Its wildcards are the DynamoDB index/* and stream ARNs suppressed on the base policy, and the Linear Identity vault provider ARN, which is scoped to the bgagent-linear-oauth-* prefix (see LinearIdentityVault).',
+      },
     ];
     const overflowSuppressionAspect = {
       visit(node: IConstruct) {
