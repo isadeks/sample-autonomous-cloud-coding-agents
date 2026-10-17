@@ -234,7 +234,10 @@ export class EcsComputeStrategy implements ComputeStrategy {
     const containerEnv = [
       { name: 'TASK_ID', value: taskId },
       { name: 'REPO_URL', value: String(payload.repo_url ?? '') },
-      ...(payload.prompt ? [{ name: 'TASK_DESCRIPTION', value: String(payload.prompt) }] : []),
+      // The task text and the repo's system prompt overrides are the large free-text fields. With the
+      // payload in S3 the agent reads both from it, and repeating them here pushed real tasks past
+      // RunTask's 8192-byte containerOverrides cap (a ~5 KB repo contract plus a ~1 KB issue).
+      ...(payload.prompt && !payloadS3Uri ? [{ name: 'TASK_DESCRIPTION', value: String(payload.prompt) }] : []),
       ...(payload.issue_number ? [{ name: 'ISSUE_NUMBER', value: String(payload.issue_number) }] : []),
       // Single source of truth with the hydrate path in `orchestrator.ts`, which
       // resolves the same default via `DEFAULT_MAX_TURNS`. A literal here would
@@ -243,7 +246,9 @@ export class EcsComputeStrategy implements ComputeStrategy {
       { name: 'MAX_TURNS', value: String(payload.max_turns ?? DEFAULT_MAX_TURNS) },
       ...(payload.max_budget_usd !== undefined ? [{ name: 'MAX_BUDGET_USD', value: String(payload.max_budget_usd) }] : []),
       ...(blueprintConfig.model_id ? [{ name: 'ANTHROPIC_MODEL', value: blueprintConfig.model_id }] : []),
-      ...(blueprintConfig.system_prompt_overrides ? [{ name: 'SYSTEM_PROMPT_OVERRIDES', value: blueprintConfig.system_prompt_overrides }] : []),
+      ...(blueprintConfig.system_prompt_overrides && !payloadS3Uri
+        ? [{ name: 'SYSTEM_PROMPT_OVERRIDES', value: blueprintConfig.system_prompt_overrides }]
+        : []),
       { name: 'CLAUDE_CODE_USE_BEDROCK', value: '1' },
       // Prefer the S3 pointer; fall back to the inline payload when no bucket is
       // configured (keeps small-payload / AgentCore-only deployments working with

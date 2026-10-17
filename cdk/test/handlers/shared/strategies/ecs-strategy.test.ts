@@ -455,6 +455,29 @@ describe('EcsComputeStrategy with ECS_PAYLOAD_BUCKET (S3-pointer path, #502)', (
     expect(envVars.find((e: { name: string }) => e.name === 'AGENT_PAYLOAD')).toBeUndefined();
   });
 
+  test('keeps the large text fields out of the overrides when the payload is in S3', async () => {
+    // Live failure: a ~5 KB repo contract + a ~1 KB issue in env vars exceeded RunTask's 8192-byte cap.
+    mockS3Send.mockResolvedValueOnce({});
+    mockSend.mockResolvedValueOnce({ tasks: [{ taskArn: TASK_ARN }] });
+
+    const { EcsComputeStrategy: Strategy } = loadStrategyWithBucket();
+    const contract = 'c'.repeat(5000);
+    await new Strategy().startSession({
+      taskId: 'TASK001',
+      userId: 'cognito-test',
+      payload: { repo_url: 'org/repo', prompt: 'p'.repeat(1500), system_prompt_overrides: contract },
+      blueprintConfig: { compute_type: 'ecs', runtime_arn: '', system_prompt_overrides: contract },
+    });
+
+    const override = mockSend.mock.calls[0][0].input.overrides.containerOverrides[0];
+    const names = override.environment.map((e: { name: string }) => e.name);
+    expect(names).not.toContain('TASK_DESCRIPTION');
+    expect(names).not.toContain('SYSTEM_PROMPT_OVERRIDES');
+    expect(JSON.stringify(override).length).toBeLessThan(8192);
+    const body = JSON.parse(mockS3Send.mock.calls[0][0].input.Body);
+    expect(body.system_prompt_overrides).toBe(contract);
+  });
+
   test('boot command loads payload from S3 when the URI is set, else inline', async () => {
     mockS3Send.mockResolvedValueOnce({});
     mockSend.mockResolvedValueOnce({ tasks: [{ taskArn: TASK_ARN }] });
