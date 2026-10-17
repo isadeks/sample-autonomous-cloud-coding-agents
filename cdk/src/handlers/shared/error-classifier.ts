@@ -563,6 +563,46 @@ const PATTERNS: readonly ErrorPattern[] = [
     },
   },
   {
+    // The agent's in-session CI loop ended with the PR's checks still red after its fix-up rounds
+    // (agent/src/convergence.py ci_failure_message). The PR exists and a handoff comment on it asks
+    // the one question the owner must answer; without this rule the channel showed "Unexpected error".
+    pattern: /ci_ok=False/i,
+    classification: {
+      category: ErrorCategory.BLOCKED,
+      title: 'Checks still failing on the pull request',
+      description: 'The agent opened the pull request and tried to fix its failing checks in the same session, but some are still red after the fix-up rounds. The pull request has a short handoff comment saying what is failing and what it needs from you.',
+      remedy: 'Read the handoff comment on the pull request. Reply with @bgagent and what to change to let the agent try again, or fix it on the branch yourself.',
+      retryable: true,
+      errorClass: ErrorClass.USER,
+    },
+  },
+  {
+    // The checks that fail on the PR fail the same way on the base branch (the agent's "unrelated"
+    // claim, verified by the platform on the base commit): the base needs fixing, not this change.
+    pattern: /ci_ok=preexisting/i,
+    classification: {
+      category: ErrorCategory.BLOCKED,
+      title: 'Checks also fail on the base branch',
+      description: 'The checks failing on the pull request fail the same way on the base branch, so they were broken before this change. The pull request itself may be fine.',
+      remedy: 'Fix the base branch first (or ask for that as a separate task), then reply here to re-run the checks.',
+      retryable: true,
+      errorClass: ErrorClass.USER,
+    },
+  },
+  {
+    // Required checks never reported a verdict on the PR (CI not configured, not triggered, or still
+    // running when the wait ended).
+    pattern: /ci_ok=(?:unknown|timeout)/i,
+    classification: {
+      category: ErrorCategory.TIMEOUT,
+      title: 'Checks did not finish',
+      description: 'The pull request was opened, but its required checks did not report a result before the agent stopped waiting, so the change is unverified.',
+      remedy: 'Look at the pull request\'s checks. If CI is slow or was not triggered, re-run it; reply here to let the agent wait again.',
+      retryable: true,
+      errorClass: ErrorClass.TRANSIENT,
+    },
+  },
+  {
     // A new-work coding task reported agent-success but no commit
     // reached the branch and no PR was opened — the agent's changes were LOST
     // (observed cause: a stacked child edited a nested working tree that was never

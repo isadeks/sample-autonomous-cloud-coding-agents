@@ -38,6 +38,24 @@ describe('classifyError', () => {
 
   // --- Auth errors ---
 
+  describe('CI convergence outcomes', () => {
+    test('red checks after the fix-up rounds are a handoff, not an unexpected error', () => {
+      const r = classifyError('ci_ok=False: CI checks failing on the PR after 2 fix-up round(s): feval/ui-check');
+      expect(r?.title).toBe('Checks still failing on the pull request');
+      expect(r?.category).toBe(ErrorCategory.BLOCKED);
+    });
+
+    test('a failure that is also on the base branch says so', () => {
+      const r = classifyError('ci_ok=preexisting: feval/e2e also fail on the base branch (not caused by this change)');
+      expect(r?.title).toBe('Checks also fail on the base branch');
+    });
+
+    test('checks without a verdict are a timeout', () => {
+      expect(classifyError('ci_ok=timeout: required checks reached no verdict')?.category).toBe(ErrorCategory.TIMEOUT);
+      expect(classifyError('ci_ok=unknown: CI was not waited on')?.title).toBe('Checks did not finish');
+    });
+  });
+
   describe('auth errors', () => {
     test('classifies insufficient GitHub repo permissions (preflight)', () => {
       const result = classifyError(
