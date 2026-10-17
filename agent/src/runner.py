@@ -567,12 +567,18 @@ async def run_agent(
     resume_session_id: str | None = None,
     max_budget_usd: float | None = None,
     max_turns: int | None = None,
+    prior_turns: int = 0,
+    prior_cost_usd: float = 0.0,
 ) -> AgentResult:
     """Invoke the Claude Agent SDK and stream output.
 
     ``resume_session_id`` continues an earlier session (the convergence fix-up
     turn keeps the agent's full context); ``max_budget_usd`` and ``max_turns``
     override the task's limits for this call (a fix-up gets what is left).
+    ``prior_turns`` / ``prior_cost_usd`` are what the task spent before this call:
+    the SDK counts each call from zero, so the live ``agent_turn`` and
+    ``agent_cost_update`` events add them to report the task's running totals.
+    The returned ``AgentResult`` stays per call (convergence accumulates it).
     """
     from claude_agent_sdk import (
         AssistantMessage,
@@ -788,7 +794,7 @@ async def run_agent(
 
                 # Write progress events for this turn
                 progress.write_agent_turn(
-                    turn=result.turns,
+                    turn=prior_turns + result.turns,
                     model=message.model,
                     thinking=turn_thinking.strip(),
                     text=turn_text.strip(),
@@ -884,11 +890,12 @@ async def run_agent(
                 # Write progress cost update event
                 input_toks = usage.input_tokens if usage else 0
                 output_toks = usage.output_tokens if usage else 0
+                call_cost = getattr(message, "total_cost_usd", None)
                 progress.write_agent_cost_update(
-                    cost_usd=getattr(message, "total_cost_usd", None),
+                    cost_usd=None if call_cost is None else prior_cost_usd + call_cost,
                     input_tokens=input_toks,
                     output_tokens=output_toks,
-                    turn=getattr(message, "num_turns", 0),
+                    turn=prior_turns + (getattr(message, "num_turns", 0) or 0),
                 )
 
             elif isinstance(message, UserMessage):

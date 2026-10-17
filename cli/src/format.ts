@@ -605,10 +605,14 @@ function elapsedDescription(task: TaskDetail, now: number): string {
 
 function describeTurn(task: TaskDetail, turnEvent: TaskEvent | null): string {
   // Prefer the live ``turn`` from the most recent ``agent_turn`` event
-  // over the persisted ``turns_attempted`` — the former updates mid-task
-  // (the latter is written on terminal completion in most paths).
+  // over the persisted ``turns_attempted`` while the task runs — the former
+  // updates mid-task. Once terminal, the persisted value is the session total
+  // across convergence rounds; an older agent's last event counts only the
+  // last round.
   const liveTurn = readNumberField(turnEvent?.metadata, 'turn');
-  const currentTurn = liveTurn ?? task.turns_attempted ?? null;
+  const currentTurn = isTerminalStatus(task.status)
+    ? task.turns_attempted ?? liveTurn ?? null
+    : liveTurn ?? task.turns_attempted ?? null;
   const maxTurns = task.max_turns ?? null;
   if (currentTurn == null && maxTurns == null) return PLACEHOLDER;
   const left = currentTurn == null ? PLACEHOLDER : String(currentTurn);
@@ -655,8 +659,11 @@ function describeCurrent(task: TaskDetail, activity: TaskEvent | null): string {
 }
 
 function describeCost(task: TaskDetail, costEvent: TaskEvent | null): string {
+  // Same precedence as ``describeTurn``: live while running, persisted once terminal.
   const liveCost = readNumberField(costEvent?.metadata, 'cost_usd');
-  const cost = liveCost ?? task.cost_usd ?? null;
+  const cost = isTerminalStatus(task.status)
+    ? task.cost_usd ?? liveCost ?? null
+    : liveCost ?? task.cost_usd ?? null;
   const budget = task.max_budget_usd ?? null;
   const costStr = cost == null ? PLACEHOLDER : `$${cost.toFixed(2)}`;
   const budgetStr = budget == null ? PLACEHOLDER : `$${budget.toFixed(2)}`;

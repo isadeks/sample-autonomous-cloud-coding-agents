@@ -360,6 +360,29 @@ describe('formatStatusSnapshot', () => {
     expect(rendered).toContain('Turn:          7 / ~12');
   });
 
+  test('a terminal task shows the persisted session totals, not the last round\'s events', () => {
+    // After convergence rounds the persisted record carries the whole session;
+    // an older agent's last live events counted only the last resumed round.
+    const task = buildTask({ status: 'COMPLETED', cost_usd: 0.76, turns_attempted: 28 });
+    const events: TaskEvent[] = [
+      mkEvent({
+        event_id: '01ARZ3NDEKTSV4RRFFQ69G5F20',
+        event_type: 'agent_cost_update',
+        timestamp: '2026-04-29T15:30:12Z',
+        metadata: { cost_usd: 0.09, input_tokens: 10, output_tokens: 5, turn: 3 },
+      }),
+      mkEvent({
+        event_id: '01ARZ3NDEKTSV4RRFFQ69G5F21',
+        event_type: 'agent_turn',
+        timestamp: '2026-04-29T15:30:10Z',
+        metadata: { turn: 3 },
+      }),
+    ];
+    const rendered = formatStatusSnapshot(task, events, NOW);
+    expect(rendered).toContain('Cost:          $0.76 / budget $2.00');
+    expect(rendered).toContain('Turn:          28 / ~12');
+  });
+
   test('renders Trace S3 line when trace_s3_uri is non-null', () => {
     // Contract parity with ``formatTaskDetail``: trace-enabled tasks must
     // surface the S3 URI in the default ``bgagent status <id>`` snapshot so

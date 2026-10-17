@@ -177,6 +177,9 @@ class TestCiRounds:
         _ci_rounds(world, _ctx(_config(max_budget_usd=3.0)))
         assert world.resumed_with[0]["max_turns"] == 90
         assert world.resumed_with[0]["max_budget_usd"] == pytest.approx(2.0)
+        # live progress events continue the task's totals instead of restarting at 0
+        assert world.resumed_with[0]["prior_turns"] == 10
+        assert world.resumed_with[0]["prior_cost_usd"] == pytest.approx(1.0)
 
     def test_stays_red_until_the_round_cap(self):
         world = World(ci={"c1": "fail", "c2": "fail", "c3": "fail"}, pushes=["c2", "c3"])

@@ -152,6 +152,8 @@ def _resume(ctx: RoundContext, agent_result: AgentResult, prompt: str) -> str:
                 resume_session_id=agent_result.session_id,
                 max_budget_usd=remaining_budget(config.max_budget_usd, agent_result.cost_usd),
                 max_turns=remaining_turns(config.max_turns, _used_turns(agent_result)),
+                prior_turns=_used_turns(agent_result),
+                prior_cost_usd=agent_result.cost_usd or 0.0,
             )
         )
     except Exception as e:
@@ -552,6 +554,8 @@ def _post_handoff(
                         HANDOFF_MAX_TURNS,
                         remaining_turns(config.max_turns, _used_turns(agent_result)),
                     ),
+                    prior_turns=_used_turns(agent_result),
+                    prior_cost_usd=agent_result.cost_usd or 0.0,
                 )
             )
             _accumulate(agent_result, turn)
