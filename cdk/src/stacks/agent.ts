@@ -896,6 +896,14 @@ export class AgentStack extends Stack {
         reason:
           'CDK-generated overflow policy on the orchestration reconciler role. Its wildcards are the DynamoDB index/* and stream ARNs suppressed on the base policy, and the Linear Identity vault provider ARN, which is scoped to the bgagent-linear-oauth-* prefix (see LinearIdentityVault).',
       },
+      {
+        // With compute_type=ecs AND enableLinearIdentityVault the ECS grants push
+        // the orchestrator's role over the same limit; the vault statements land
+        // in the overflow policy (synth fails on this path otherwise).
+        pathFragment: '/TaskOrchestrator/OrchestratorFn/ServiceRole/OverflowPolicy',
+        reason:
+          'CDK-generated overflow policy on the task orchestrator role. Its wildcards are the bgagent-jira-oauth-* secret prefix suppressed on the base policy (see TaskOrchestrator) and the Linear Identity vault grants: the oauth2credentialprovider/bgagent-linear-oauth-* token-vault provider and its bedrock-agentcore-identity!default/oauth2/bgagent-linear-oauth-* secret (see LinearIdentityVault). Which statements spill over depends on statement order.',
+      },
     ];
     const overflowSuppressionAspect = {
       visit(node: IConstruct) {
