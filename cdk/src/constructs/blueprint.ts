@@ -188,6 +188,13 @@ export interface BlueprintProps {
 
     /** Ask the agent to add tests to the project's own suites for every behaviour change. */
     readonly requireTests?: boolean;
+
+    /**
+     * Check the agent runs before every push and fixes until green, e.g.
+     * ``.abca/preview.sh test`` (feedback only; CI stays the gate). On ECS it can
+     * use the repo's service containers (``bgagent repo onboard --service-containers``).
+     */
+    readonly prepushCommand?: string;
   };
 
   /**
@@ -694,6 +701,7 @@ function convergenceAttributes(pipeline: BlueprintProps['pipeline']): RepoTableA
   const uiDir = pipeline?.uiChecksDir?.trim().replace(/^\/+|\/+$/g, '');
   if (uiDir) attrs.ui_checks_dir = { S: uiDir };
   if (pipeline?.requireTests) attrs.require_tests = { BOOL: true };
+  if (pipeline?.prepushCommand?.trim()) attrs.prepush_command = { S: pipeline.prepushCommand.trim() };
   return attrs;
 }
 

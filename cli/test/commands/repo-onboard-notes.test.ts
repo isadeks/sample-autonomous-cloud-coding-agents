@@ -90,6 +90,22 @@ describe('buildRepoOnboardNotes', () => {
     expect(notes.some((n) => n.includes('abca:microvm-image-p1-smoke-unverified'))).toBe(true);
   });
 
+  test('warns that service containers only run on ecs', () => {
+    const services = { containers: [{ name: 'postgres', image: 'pg:14' }] };
+    const onAgentcore = buildRepoOnboardNotes({
+      config: { repo: 'acme/a', status: 'active', compute_type: 'agentcore', service_containers: services },
+      platformRuntimeArn: PLATFORM_RUNTIME,
+      platformGithubTokenSecretArn: PLATFORM_SECRET,
+    });
+    expect(onAgentcore.some((n) => n.includes('service_containers only run on compute_type=ecs'))).toBe(true);
+    const onEcs = buildRepoOnboardNotes({
+      config: { repo: 'acme/a', status: 'active', compute_type: 'ecs', service_containers: services },
+      platformRuntimeArn: PLATFORM_RUNTIME,
+      platformGithubTokenSecretArn: PLATFORM_SECRET,
+    });
+    expect(onEcs.some((n) => n.includes('service_containers only run'))).toBe(false);
+  });
+
   test('emits no compute note for agentcore', () => {
     const notes = buildRepoOnboardNotes({
       config: { repo: 'acme/a', status: 'active', compute_type: 'agentcore' },

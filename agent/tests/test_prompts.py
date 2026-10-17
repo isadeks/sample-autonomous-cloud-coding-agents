@@ -353,6 +353,22 @@ class TestCrossLanguageHashParity:
             assert actual == v["sha256"], f"Hash mismatch for: {v['note']}"
 
 
+class TestPrepushAddendum:
+    def test_off_without_a_command(self):
+        from prompts.prepush import prepush_addendum
+
+        assert prepush_addendum("  ") == ""
+
+    def test_states_the_contract_without_repo_specifics(self):
+        from prompts.prepush import prepush_addendum
+
+        text = prepush_addendum(" make e2e ")
+        assert "`make e2e`" in text
+        assert "CI on the pull request stays the gate" in text
+        for repo_specific in ("Playwright", "immich", ".abca", "postgres"):
+            assert repo_specific not in text
+
+
 class TestUiCheckAddendum:
     """Per-repo ui_checks_dir asks the agent for a UI check of its change."""
 

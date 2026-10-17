@@ -27,7 +27,15 @@ from config import (
     resolve_linear_api_token,
 )
 from context import assemble_prompt, fetch_github_issue
-from convergence import RoundContext, ci_failure_message, run_ci_rounds, run_fixup_rounds
+from convergence import (
+    PrepushResult,
+    RoundContext,
+    ci_failure_message,
+    render_prepush_summary,
+    run_ci_rounds,
+    run_fixup_rounds,
+    run_prepush_rounds,
+)
 from fixup import max_fixup_rounds
 from jira_reactions import (
     comment_task_started,
@@ -832,6 +840,7 @@ def run_task(
     ui_checks_dir: str = "",
     require_tests: bool = False,
     ci_baseline_probe: bool = False,
+    prepush_command: str = "",
     prompt_version: str = "",
     memory_id: str = "",
     resolved_workflow: dict | None = None,
@@ -889,6 +898,7 @@ def run_task(
         ui_checks_dir=ui_checks_dir,
         require_tests=require_tests,
         ci_baseline_probe=ci_baseline_probe,
+        prepush_command=prepush_command,
         resolved_workflow=resolved_workflow,
         branch_name=branch_name,
         pr_number=pr_number,
@@ -1474,10 +1484,27 @@ def run_task(
                         trajectory=trajectory,
                         progress=progress,
                         max_rounds=max_fixup_rounds(_workflow),
+                        prepush=(
+                            PrepushResult()
+                            if config.prepush_command and not workflow_read_only
+                            else None
+                        ),
                     )
                     build_outcome, fixup = run_fixup_rounds(
                         build_outcome, agent_result, rounds_ctx, read_only=workflow_read_only
                     )
+                    # The repo's pre-push check (feedback only) once the build is
+                    # green. Its fix-ups change the code after the build gate ran,
+                    # so the gate runs again for an honest build verdict.
+                    if rounds_ctx.prepush is not None and (
+                        build_outcome.passed or build_outcome.inert
+                    ):
+                        run_prepush_rounds(rounds_ctx, agent_result)
+                        if rounds_ctx.prepush.rounds:
+                            build_outcome = verify_build(setup.repo_dir, config.build_command)
+                        post_span.set_attribute(
+                            "convergence.prepush_runs", ",".join(rounds_ctx.prepush.runs)
+                        )
                     post_span.set_attribute("convergence.fixup_rounds", fixup.rounds)
                     post_span.set_attribute("convergence.fixup_stopped", fixup.stopped_reason)
                     build_passed = build_outcome.passed
@@ -1547,6 +1574,9 @@ def run_task(
                         # The platform's verdict in the PR, also when the agent
                         # opened it or a later round changed the outcome.
                         ci_summary, ci_details = render_ci_summary(ci_conv)
+                        prepush_summary, prepush_details = render_prepush_summary(
+                            rounds_ctx.prepush, config.prepush_command
+                        )
                         upsert_verification_section(
                             setup.repo_dir,
                             pr_url,
@@ -1559,8 +1589,10 @@ def run_task(
                                 fixup_rounds=fixup.rounds,
                                 fixup_history=fixup.history,
                                 agent_result=agent_result,
-                                extra_lines=ci_details,
-                                ci_summary=ci_summary,
+                                extra_lines=[*prepush_details, *ci_details],
+                                ci_summary=" · ".join(
+                                    s for s in (prepush_summary, ci_summary) if s
+                                ),
                             ),
                         )
                     post_span.set_attribute("build.passed", build_passed)

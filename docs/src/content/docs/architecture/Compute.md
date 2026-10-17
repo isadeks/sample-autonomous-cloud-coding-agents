@@ -100,6 +100,61 @@ The build def's size is measured, not guessed, and the number depends on how muc
 
 Both defs **share one task role, one execution role, one container image, and one base environment** (a single `makeTaskDef` helper + `baseEnvironment` object in `ecs-agent-cluster.ts`), so IAM grants and env vars cannot drift between them — a lesson from ECS-parity bugs where a grant present on one path was missing on another. The only differences are `cpu`/`memoryLimitMiB` and the build-tier-only `BUILD_VERIFY_TIMEOUT_S`. Routing is a fallback-safe boolean: an older deploy without the planning def wired simply runs read-only workflows on the build def (never worse than before). Substrate **family** routing is unchanged — an ECS repo always plans on ECS (never silently downgraded to the AgentCore microVM, which a large repo could OOM just reading); this only picks *which ECS task def*. AgentCore has a single fixed MicroVM size and ignores the read-only flag. See [ECS_RIGHTSIZED_PLANNING.md](/sample-autonomous-cloud-coding-agents/architecture/ecs-rightsized-planning).
 
+## Service containers and the pre-push check (ECS)
+
+A repo on `compute_type: ecs` can declare **service containers** that run next to the agent in its Fargate task: a database, a cache, or the app's own runtime image. Every container in an `awsvpc` task shares `localhost`, so the agent can start the app against them and run its UI checks and end-to-end tests **before it pushes**, instead of learning about a broken e2e test from CI one round later. The repo declares the check as `prepush_command` (for example `.abca/preview.sh test`); the platform runs it before the first push and before every CI fix-up push and hands a failure back to the same session. It is feedback only: CI on the pull request stays the gate.
+
+**Where the containers come from.** RunTask overrides cannot add containers, so they have to be in the task definition. At task start the ECS strategy derives a per-repo task definition from the stack's build task definition (`ecs-service-containers.ts`): same roles, size, network mode and platform, plus the services and the shared volumes. It registers it with `ecs:RegisterTaskDefinition` (family `<build family>-<repo slug>-<hash>`), caches its ARN and a hash of `{build revision, config}` on the repo row (`ecs_task_definition_arn`, `ecs_task_definition_hash`), and deregisters the revision it replaces. A deploy that rebuilds the agent image, or an edit of the config, re-derives it on the next task; otherwise the cache hit costs no AWS call. Read-only workflows keep the planning task definition. Nothing is a CloudFormation resource, because the stack is close to the 500-resource limit and one task definition per repo would not scale. The orchestrator's grants: `ecs:Describe/Register/DeregisterTaskDefinition` (no resource-level permissions exist), `ecs:TagResource` only with `ecs:CreateAction=RegisterTaskDefinition`, `dynamodb:UpdateItem` on RepoTable limited to the two cache attributes, and the existing `iam:PassRole` on the ECS task and execution roles. The derived definition cannot use any other role.
+
+**What the derived task definition contains:**
+
+| Container | Image | Role in the task |
+|---|---|---|
+| `AgentContainer` | ABCA's ECS agent image | Unchanged, plus: mounts each shared volume at its `agent_path`, waits for every service (`HEALTHY` when it has a health check, `START` otherwise), and gets `ABCA_SERVICE_CONTAINERS` (comma-separated names) |
+| `abca-volume-init` | the agent image | Runs as root before the agent and `chown`s the shared volumes to the `agent` user (a fresh Fargate bind volume is root-owned; the agent runs as non-root). Only present when volumes are declared |
+| one per service | the service's image | `essential: false` by default, so a crashing service breaks the checks but not the task; logs to the agent's log group under its own stream prefix |
+
+The services share the build task's CPU and memory (4 vCPU / 16 GB by default). The immich spike peaked at 5.3 GB with Postgres, Valkey, the app server and Chromium running. Fargate allows 10 containers per task, so a repo can declare at most 8. Environment values are plain text in the task definition, so they must not be secrets. Images should come from a private ECR repository with `linux/arm64` manifests (the ECS tasks are ARM64), pulled over the ECR VPC endpoints. The execution role's `AmazonECSTaskExecutionRolePolicy` already allows pulls from any repository in the account.
+
+**The ECS agent image** is the same Dockerfile built with `AGENT_IMAGE_VARIANT=ecs`. It adds `@playwright/test` (pinned, in `/opt/playwright`), Chromium's headless shell with its system libraries and Playwright's ffmpeg (in `/opt/ms-playwright`, linked from the agent user's default browsers path), and `unzip`, `jq`, `procps`. That is about 0.6 GB uncompressed, and it is kept out of the AgentCore image because of AgentCore's 2 GB cap. The agent cannot install these at task time: it runs as a non-root user with HTTPS-only egress.
+
+**Trust.** The services and the pre-push check run repository-controlled code with the same credentials the build command already has: every container in a task can reach the task role. The agent can also forge the check's result. That is why the check is feedback, and why the CodeBuild CI (untrusted runner, trusted reporter) remains the authoritative gate.
+
+**Configuration** (`bgagent repo onboard <repo> --service-containers services.json --prepush-command '.abca/preview.sh test'`; see [REPO_ONBOARDING.md](/sample-autonomous-cloud-coding-agents/architecture/repo-onboarding)):
+
+```json
+{
+  "volumes": [
+    { "name": "workspace", "agent_path": "/workspace" },
+    { "name": "data", "agent_path": "/data" }
+  ],
+  "containers": [
+    {
+      "name": "postgres",
+      "image": "<account>.dkr.ecr.<region>.amazonaws.com/<mirror>:postgres-14-vectorchord",
+      "command": ["-c", "fsync=off", "-c", "port=5435"],
+      "environment": { "POSTGRES_PASSWORD": "postgres", "PGPORT": "5435" },
+      "health_check": { "command": ["CMD-SHELL", "pg_isready -p 5435"], "interval_s": 5, "retries": 10, "start_period_s": 60 }
+    },
+    { "name": "valkey", "image": "<mirror>:valkey-8" },
+    {
+      "name": "app-runtime",
+      "image": "<mirror>:immich-server-v3.0.3",
+      "user": "0",
+      "entry_point": ["bash", "-c"],
+      "command": ["until [ -f /workspace/.abca-preview/sidecar.sh ]; do sleep 1; done; exec bash /workspace/.abca-preview/sidecar.sh"],
+      "mounts": [{ "volume": "workspace", "path": "/workspace" }, { "volume": "data", "path": "/data" }]
+    }
+  ]
+}
+```
+
+Container fields: `name`, `image`, `essential`, `command`, `entry_point`, `environment`, `ports` (informational: everything shares `localhost`), `health_check` (`command` in ECS form, `interval_s` 5-300, `timeout_s` 2-120, `retries` 1-10, `start_period_s` 0-300), `mounts` (`volume`, `path`, `read_only`), `user`, `working_directory`. Volume `agent_path`s may not cover the agent image's own directories (`/app`, `/opt`, `/home`, `/usr`, ...). The CLI and the orchestrator validate against the same cases (`contracts/service-containers/cases.json`).
+
+**A runtime sidecar** (the `app-runtime` container above) runs the agent's own build inside the app's official runtime image, which brings the media libraries a full e2e suite needs. Fargate cannot restart a container on demand, so the repo ships a small supervisor that the sidecar waits for on the shared workspace volume and that starts or restarts the server when a control file changes. That supervisor and the `up | test | restart | down` commands of the pre-push script are the repository's contract, not the platform's.
+
+**Pre-push rounds.** After the build gate passes, the agent's check runs (`PREPUSH_TIMEOUT_S`, default 1800 s). A genuine failure resumes the agent's session with the last lines of the output; the agent fixes, commits and does not push; the check runs again. A timeout, an infrastructure kill or a command that cannot run stops the loop without a round. The rounds come from one budget for the whole task (`PREPUSH_MAX_ROUNDS`, default 3), shared between the pass before the PR opens and the passes before CI fix-up pushes. When a round changed the code, the build gate runs again so the PR's build verdict describes what is pushed. The PR's verification block records each run (`pre-push ✅`).
+
 ## Agent harness
 
 The agent harness is the layer around the LLM that manages the execution loop: context, tools, guardrails, and lifecycle. It is not the agent itself but the infrastructure that makes long-running autonomous agents reliable.

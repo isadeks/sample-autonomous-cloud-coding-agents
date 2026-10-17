@@ -5,6 +5,10 @@ with the failing evidence, within what is left of the task's budget and turns,
 then commit and push and re-check:
 
 - ``run_fixup_rounds``: the post-agent ``verify_build`` gate (``fixup.py``).
+- ``run_prepush_rounds``: the repo's ``prepush_command`` (e.g. its app started
+  against the task's service containers, with UI checks and e2e tests), before
+  the first push and before each CI fix-up push. Feedback only: it never
+  decides the task's verdict, and its rounds come from one task-wide budget.
 - ``run_ci_rounds``: the PR's statuses / check runs / deployments
   (``ci_wait.py``), when the repo sets ``ci_wait_timeout_s``. When the agent
   pushes nothing — its way of saying a failure is not caused by its change — the
@@ -18,9 +22,10 @@ state, not from how a fix-up turn ended.
 from __future__ import annotations
 
 import asyncio
+import os
 import re
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
 import runner
@@ -44,6 +49,7 @@ from fixup import (
     MIN_FIXUP_TURNS,
     FixupResult,
     build_fixup_prompt,
+    build_prepush_prompt,
     fixup_skip_reason,
     log_round,
     remaining_budget,
@@ -62,6 +68,7 @@ from post_hooks import (
     ensure_pushed,
     reconcile_agent_branch,
     verify_build,
+    verify_prepush,
 )
 from shell import log, log_error_cw, try_cmd
 
@@ -74,6 +81,20 @@ if TYPE_CHECKING:
 # The baseline probe never waits longer than this, whatever is left of the CI wait.
 PROBE_MAX_S = 900
 
+# Pre-push fix-up rounds over the whole task (before the PR and every CI round).
+PREPUSH_MAX_ROUNDS = int(os.environ.get("PREPUSH_MAX_ROUNDS") or 3)
+
+
+@dataclass
+class PrepushResult:
+    """What the pre-push check did over the task, for the PR's verification block."""
+
+    # outcome of each run in order: pass, fail, timeout, inert or infra
+    runs: list[str] = field(default_factory=list)
+    # failures handed back to the agent
+    rounds: int = 0
+    stopped_reason: str = ""
+
 
 @dataclass
 class RoundContext:
@@ -85,6 +106,8 @@ class RoundContext:
     trajectory: Any
     progress: Any
     max_rounds: int
+    # set when the repo declares a pre-push check (and the workflow writes code)
+    prepush: PrepushResult | None = None
 
 
 def _resume_blocker(ctx: RoundContext, agent_result: AgentResult) -> str:
@@ -111,11 +134,11 @@ def _accumulate(agent_result: AgentResult, fix: AgentResult) -> None:
         agent_result.session_id = fix.session_id
 
 
-def _resume_and_push(ctx: RoundContext, agent_result: AgentResult, prompt: str) -> str:
-    """Resume the agent with ``prompt``, then commit and push its work.
+def _resume(ctx: RoundContext, agent_result: AgentResult, prompt: str) -> str:
+    """Resume the agent with ``prompt``, then commit its work.
 
-    Returns "" when the round ran and was pushed, else why the loop must stop.
-    Call ``_resume_blocker`` first.
+    Returns "" when the round ran, else why the loop must stop. Call
+    ``_resume_blocker`` first.
     """
     config = ctx.config
     try:
@@ -139,9 +162,98 @@ def _resume_and_push(ctx: RoundContext, agent_result: AgentResult, prompt: str) 
         log("POST", f"Convergence: resumed turn ended with status={fix.status}")
     reconcile_agent_branch(ctx.setup.repo_dir, ctx.setup.branch)
     ensure_committed(ctx.setup.repo_dir)
+    return ""
+
+
+def _resume_and_push(
+    ctx: RoundContext, agent_result: AgentResult, prompt: str, *, prepush: bool = False
+) -> str:
+    """Resume the agent with ``prompt``, commit, optionally run the pre-push check, push.
+
+    Returns "" when the round ran and was pushed, else why the loop must stop.
+    Call ``_resume_blocker`` first.
+    """
+    stop = _resume(ctx, agent_result, prompt)
+    if stop:
+        return stop
+    if prepush:
+        run_prepush_rounds(ctx, agent_result)
     if not ensure_pushed(ctx.setup.repo_dir, ctx.setup.branch):
         return "push failed"
     return ""
+
+
+def _prepush_verdict(outcome: VerifyOutcome) -> str:
+    if outcome.passed:
+        return "pass"
+    if outcome.timed_out:
+        return "timeout"
+    if outcome.inert:
+        return "inert"
+    if outcome.infra_failed:
+        return "infra"
+    return "fail"
+
+
+def run_prepush_rounds(ctx: RoundContext, agent_result: AgentResult) -> None:
+    """Run the repo's pre-push check; hand a genuine failure back to the agent and re-run.
+
+    Commits the agent's fixes but never pushes: the caller pushes afterwards,
+    whatever the check says (CI stays the gate). Only a genuine failure goes back
+    to the agent; a timeout, an infrastructure kill or a command that cannot run
+    stops the loop. Rounds come from one budget for the whole task
+    (``PREPUSH_MAX_ROUNDS``); once it is spent the check is not run again.
+    No-op when the repo declares no check.
+    """
+    state = ctx.prepush
+    if state is None:
+        return
+    command = ctx.config.prepush_command
+    if state.runs and state.rounds >= PREPUSH_MAX_ROUNDS:
+        state.stopped_reason = "max pre-push rounds reached"
+        return
+    while True:
+        outcome = verify_prepush(ctx.setup.repo_dir, command)
+        verdict = _prepush_verdict(outcome)
+        state.runs.append(verdict)
+        ctx.progress.write_agent_milestone(
+            "prepush_check_result", f"run={len(state.runs)} result={verdict}"
+        )
+        if verdict != "fail":
+            state.stopped_reason = "check passed" if verdict == "pass" else f"check {verdict}"
+            break
+        reason = (
+            "max pre-push rounds reached" if state.rounds >= PREPUSH_MAX_ROUNDS else ""
+        ) or _resume_blocker(ctx, agent_result)
+        if reason:
+            state.stopped_reason = reason
+            break
+        state.rounds += 1
+        ctx.progress.write_agent_milestone(
+            "prepush_round_started", f"round={state.rounds}/{PREPUSH_MAX_ROUNDS}"
+        )
+        prompt = build_prepush_prompt(
+            command, outcome.output_tail, state.rounds, PREPUSH_MAX_ROUNDS
+        )
+        stop = _resume(ctx, agent_result, prompt)
+        if stop:
+            state.stopped_reason = stop
+            break
+    log("POST", f"Convergence: pre-push check stopped ({state.stopped_reason})")
+
+
+def render_prepush_summary(state: PrepushResult | None, command: str) -> tuple[str, list[str]]:
+    """The pre-push check's token for the PR's summary line and its details line."""
+    if state is None or not state.runs:
+        return "", []
+    last = state.runs[-1]
+    icon = {"pass": "✅", "fail": "❌"}.get(last, "⚠️")
+    rounds = f"; {state.rounds} fix-up round(s)" if state.rounds else ""
+    detail = (
+        f"- Pre-push check: `{command}` → {last.upper()} (runs: {', '.join(state.runs)}"
+        f"{rounds}; feedback for the agent, CI is the gate)"
+    )
+    return f"pre-push {icon}", [detail]
 
 
 def run_fixup_rounds(
@@ -382,7 +494,7 @@ def run_ci_rounds(
         prompt = build_ci_fixup_prompt(
             f"{evidence}\n\n{report}" if evidence else report, ci.rounds, ctx.max_rounds
         )
-        stop = _resume_and_push(ctx, agent_result, prompt)
+        stop = _resume_and_push(ctx, agent_result, prompt, prepush=True)
         if stop:
             ci.stopped_reason = stop
             break

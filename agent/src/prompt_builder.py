@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING
 
 from config import AGENT_WORKSPACE, NEEDS_INPUT_MARKER
 from prompts import get_system_prompt
+from prompts.prepush import prepush_addendum
 from prompts.repo_requirements import TESTS_REQUIRED_ADDENDUM
 from prompts.ui_check import ui_check_addendum
 from sanitization import sanitize_external_content as sanitize_memory_content
@@ -82,6 +83,8 @@ def build_system_prompt(
         system_prompt += ui_check_addendum(config.ui_checks_dir)
     if not config.read_only and config.require_tests:
         system_prompt += TESTS_REQUIRED_ADDENDUM
+    if not config.read_only and config.prepush_command:
+        system_prompt += prepush_addendum(config.prepush_command)
 
     # Channel-specific guidance (appended last so channel instructions sit
     # close to the end of the prompt, where the model weights recency).

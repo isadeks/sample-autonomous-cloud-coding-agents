@@ -574,6 +574,42 @@ describe('TaskOrchestrator construct', () => {
       });
     });
 
+    describe('per-repo service-container task definitions', () => {
+      let template: Template;
+      beforeAll(() => {
+        template = createStack({ ...ecsOverrides, includeRepoTable: true }).template;
+      });
+      const statements = () => Object.values(template.findResources('AWS::IAM::Policy'))
+        .flatMap(p => p.Properties.PolicyDocument.Statement as Array<Record<string, any>>);
+      const withAction = (action: string) =>
+        statements().find(s => (Array.isArray(s.Action) ? s.Action : [s.Action]).includes(action));
+
+      test('register/describe/deregister (no resource-level permissions exist for them)', () => {
+        const stmt = withAction('ecs:RegisterTaskDefinition')!;
+        expect(stmt.Action).toEqual([
+          'ecs:DescribeTaskDefinition',
+          'ecs:RegisterTaskDefinition',
+          'ecs:DeregisterTaskDefinition',
+        ]);
+        expect(stmt.Resource).toBe('*');
+      });
+
+      test('tagging only while registering', () => {
+        expect(withAction('ecs:TagResource')!.Condition).toEqual({
+          StringEquals: { 'ecs:CreateAction': 'RegisterTaskDefinition' },
+        });
+      });
+
+      test('the repo-row cache write is limited to its two attributes', () => {
+        const stmt = statements().find(st => st.Action === 'dynamodb:UpdateItem')!;
+        expect(stmt.Condition).toEqual({
+          'ForAllValues:StringEquals': {
+            'dynamodb:Attributes': ['repo', 'ecs_task_definition_arn', 'ecs_task_definition_hash'],
+          },
+        });
+      });
+    });
+
     test('does not grant ECS permissions when ECS props are omitted', () => {
       const policies = baseTemplate.findResources('AWS::IAM::Policy');
       for (const [, policy] of Object.entries(policies)) {

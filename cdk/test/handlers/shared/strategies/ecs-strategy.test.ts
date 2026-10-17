@@ -51,6 +51,11 @@ jest.mock('@aws-sdk/client-s3', () => ({
   DeleteObjectCommand: jest.fn((input: unknown) => ({ _type: 'DeleteObject', input })),
 }));
 
+const mockResolveServiceTaskDefinition = jest.fn();
+jest.mock('../../../../src/handlers/shared/ecs-service-containers', () => ({
+  resolveServiceTaskDefinition: (...args: unknown[]) => mockResolveServiceTaskDefinition(...args),
+}));
+
 import { EcsComputeStrategy } from '../../../../src/handlers/shared/strategies/ecs-strategy';
 
 beforeEach(() => {
@@ -276,6 +281,19 @@ describe('EcsComputeStrategy', () => {
         status: 'failed',
         error: 'Exit code 137: OutOfMemoryError',
       });
+    });
+
+    test('judges the agent container, not the first one listed (service containers)', async () => {
+      mockSend.mockResolvedValueOnce({
+        tasks: [{
+          lastStatus: 'STOPPED',
+          stoppedReason: 'Essential container in task exited',
+          containers: [{ name: 'postgres', exitCode: 137 }, { name: 'AgentContainer', exitCode: 0 }],
+        }],
+      });
+
+      const result = await new EcsComputeStrategy().pollSession(makeHandle());
+      expect(result).toEqual({ status: 'completed' });
     });
 
     test('returns failed when task not found', async () => {
@@ -555,5 +573,66 @@ describe('deleteEcsPayload without ECS_PAYLOAD_BUCKET', () => {
     const { deleteEcsPayload } = require('../../../../src/handlers/shared/strategies/ecs-strategy');
     await expect(deleteEcsPayload('TASK001')).resolves.toBeUndefined();
     expect(mockS3Send).not.toHaveBeenCalled();
+  });
+});
+
+describe('EcsComputeStrategy with service containers', () => {
+  const services = { containers: [{ name: 'postgres', image: 'pg:14' }] };
+  const blueprintConfig = {
+    compute_type: 'ecs' as const,
+    runtime_arn: '',
+    service_containers: services,
+    ecs_task_definition_arn: 'arn:aws:ecs:us-east-1:123456789012:task-definition/agent-org-repo-1234abcd:2',
+    ecs_task_definition_hash: 'h1',
+  };
+
+  test('a writable workflow runs on the repo\'s derived task definition family', async () => {
+    mockResolveServiceTaskDefinition.mockResolvedValueOnce({ family: 'agent-org-repo-1234abcd', registered: false });
+    mockSend.mockResolvedValueOnce({ tasks: [{ taskArn: TASK_ARN }] });
+
+    await new EcsComputeStrategy().startSession({
+      taskId: 'TASK001',
+      userId: 'cognito-test',
+      payload: { repo_url: 'org/repo' },
+      blueprintConfig,
+    });
+
+    expect(mockResolveServiceTaskDefinition).toHaveBeenCalledWith(
+      expect.objectContaining({
+        repo: 'org/repo',
+        config: services,
+        baseTaskDefinitionArn: TASK_DEF_ARN,
+        baseFamily: 'agent',
+        agentContainerName: 'AgentContainer',
+        cachedArn: blueprintConfig.ecs_task_definition_arn,
+        cachedHash: 'h1',
+      }),
+      expect.anything(),
+    );
+    expect(mockSend.mock.calls[0][0].input.taskDefinition).toBe('agent-org-repo-1234abcd');
+  });
+
+  test('a read-only workflow ignores the services', async () => {
+    mockSend.mockResolvedValueOnce({ tasks: [{ taskArn: TASK_ARN }] });
+    await new EcsComputeStrategy().startSession({
+      taskId: 'TASK001',
+      userId: 'cognito-test',
+      payload: { repo_url: 'org/repo' },
+      blueprintConfig,
+      readOnly: true,
+    });
+    expect(mockResolveServiceTaskDefinition).not.toHaveBeenCalled();
+    expect(mockSend.mock.calls[0][0].input.taskDefinition).toBe('agent');
+  });
+
+  test('a failed derivation fails the session start before RunTask', async () => {
+    mockResolveServiceTaskDefinition.mockRejectedValueOnce(new Error('Invalid service_containers for org/repo: x'));
+    await expect(new EcsComputeStrategy().startSession({
+      taskId: 'TASK001',
+      userId: 'cognito-test',
+      payload: { repo_url: 'org/repo' },
+      blueprintConfig,
+    })).rejects.toThrow(/Invalid service_containers/);
+    expect(mockSend).not.toHaveBeenCalled();
   });
 });

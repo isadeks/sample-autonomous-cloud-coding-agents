@@ -339,6 +339,15 @@ class TestBuildSystemPrompt:
         )
         assert result.index(overrides) < result.index("## UI check for your change")
 
+    def test_prepush_section_names_the_command_for_writable_workflows_only(self):
+        cfg = self._cfg(prepush_command=".abca/preview.sh test")
+        result = _build_system_prompt(cfg, self._setup, None, "")
+        assert "## Pre-push check (this repository)" in result
+        assert "Run `.abca/preview.sh test` before you finish" in result
+        ro = self._cfg(prepush_command=".abca/preview.sh test", read_only=True)
+        assert "## Pre-push check" not in _build_system_prompt(ro, self._setup, None, "")
+        assert "## Pre-push check" not in _build_system_prompt(self._cfg(), self._setup, None, "")
+
     def test_no_ui_check_section_by_default_or_read_only(self):
         assert "## UI check" not in _build_system_prompt(self._cfg(), self._setup, None, "")
         ro = self._cfg(ui_checks_dir="checks/ui", read_only=True)

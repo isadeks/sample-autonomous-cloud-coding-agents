@@ -59,6 +59,13 @@ export function buildRepoOnboardNotes(input: RepoOnboardNotesInput): readonly st
     );
   }
 
+  if (input.config.service_containers && input.config.compute_type !== 'ecs') {
+    notes.push(
+      'WARNING: service_containers only run on compute_type=ecs; on this repo\'s compute they are '
+      + 'ignored, and a prepush_command that needs them will fail.',
+    );
+  }
+
   if (input.config.compute_type === 'lambda-microvm') {
     // Mirrors the ECS note, plus the one thing that has no ECS analogue: the
     // substrate can be fully deployed and still carry no IMAGE (ADR-021's

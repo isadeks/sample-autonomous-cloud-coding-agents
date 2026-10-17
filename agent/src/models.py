@@ -192,6 +192,10 @@ class TaskConfig(BaseModel):
     # has no CI results for those checks: push abca-baseline/<task_id> at the base
     # commit so the repo's CI builds it (opt-in: it triggers push CI on the repo).
     ci_baseline_probe: bool = False
+    # Repo-declared check run before every push (e.g. ``.abca/preview.sh test``:
+    # start the app against its service containers, run the UI checks and e2e).
+    # Failures go back to the agent's session; CI stays the gate. "" = off.
+    prepush_command: str = ""
     # Repo-relative folder for agent-written UI checks run by CD on the PR
     # preview ("" = off); prompt_builder adds the matching prompt section.
     ui_checks_dir: str = ""

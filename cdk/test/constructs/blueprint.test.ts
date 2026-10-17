@@ -264,6 +264,7 @@ describe('Blueprint construct', () => {
         ciBaselineProbe: true,
         uiChecksDir: '/checks/ui/',
         requireTests: true,
+        prepushCommand: ' .abca/preview.sh test ',
       },
     });
     const created = getCreateJoinParts(template).join('');
@@ -272,8 +273,9 @@ describe('Blueprint construct', () => {
     expect(created).toContain('"ci_baseline_probe":{"BOOL":true}');
     expect(created).toContain('"ui_checks_dir":{"S":"checks/ui"}');
     expect(created).toContain('"require_tests":{"BOOL":true}');
+    expect(created).toContain('"prepush_command":{"S":".abca/preview.sh test"}');
     const updated = getUpdateJoinParts(template).join('');
-    for (const attr of ['ci_wait_timeout_s', 'ci_required_checks', 'ci_baseline_probe', 'ui_checks_dir', 'require_tests']) {
+    for (const attr of ['ci_wait_timeout_s', 'ci_required_checks', 'ci_baseline_probe', 'ui_checks_dir', 'require_tests', 'prepush_command']) {
       expect(updated).toContain(`#${attr} = :${attr}`);
     }
   });
@@ -281,7 +283,7 @@ describe('Blueprint construct', () => {
   test('omits convergence attributes that are unset, zero or false', () => {
     const { template } = createStack({ pipeline: { ciWaitTimeoutSeconds: 0, ciBaselineProbe: false, requireTests: false } });
     const created = getCreateJoinParts(template).join('');
-    for (const attr of ['ci_wait_timeout_s', 'ci_required_checks', 'ci_baseline_probe', 'ui_checks_dir', 'require_tests']) {
+    for (const attr of ['ci_wait_timeout_s', 'ci_required_checks', 'ci_baseline_probe', 'ui_checks_dir', 'require_tests', 'prepush_command']) {
       expect(created).not.toContain(attr);
     }
   });

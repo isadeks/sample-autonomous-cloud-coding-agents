@@ -1,0 +1,65 @@
+{
+  "cases": [
+    {
+      "name": "immich: postgres and valkey with a runtime sidecar on shared volumes",
+      "config": {
+        "volumes": [
+          { "name": "workspace", "agent_path": "/workspace" },
+          { "name": "data", "agent_path": "/data" }
+        ],
+        "containers": [
+          {
+            "name": "postgres",
+            "image": "123456789012.dkr.ecr.us-east-1.amazonaws.com/mirror:postgres-14",
+            "essential": true,
+            "command": ["-c", "fsync=off", "-c", "port=5435"],
+            "environment": { "POSTGRES_PASSWORD": "postgres", "PGPORT": "5435" },
+            "ports": [5435],
+            "health_check": { "command": ["CMD-SHELL", "pg_isready -p 5435"], "interval_s": 5, "timeout_s": 5, "retries": 10, "start_period_s": 60 }
+          },
+          { "name": "valkey", "image": "valkey:8", "ports": [6379] },
+          {
+            "name": "immich-runtime",
+            "image": "immich-server:v3.0.3",
+            "user": "0",
+            "entry_point": ["bash", "-c"],
+            "command": ["while [ ! -f /workspace/.abca-preview/sidecar.sh ]; do sleep 1; done; exec bash /workspace/.abca-preview/sidecar.sh"],
+            "mounts": [
+              { "volume": "workspace", "path": "/workspace" },
+              { "volume": "data", "path": "/data", "read_only": false }
+            ]
+          }
+        ]
+      },
+      "valid": true
+    },
+    { "name": "minimal", "config": { "containers": [{ "name": "redis", "image": "redis:7" }] }, "valid": true },
+    { "name": "not an object", "config": ["redis"], "errors": ["must be an object"] },
+    { "name": "no containers", "config": { "containers": [] }, "errors": ["non-empty list"] },
+    {
+      "name": "too many containers",
+      "config": { "containers": [
+        { "name": "a", "image": "x" }, { "name": "b", "image": "x" }, { "name": "c", "image": "x" },
+        { "name": "d", "image": "x" }, { "name": "e", "image": "x" }, { "name": "f", "image": "x" },
+        { "name": "g", "image": "x" }, { "name": "h", "image": "x" }, { "name": "i", "image": "x" }
+      ] },
+      "errors": ["at most 8 containers"]
+    },
+    { "name": "unknown field (typo)", "config": { "containers": [{ "name": "pg", "image": "x", "healthcheck": {} }] }, "errors": ["unknown field 'healthcheck'"] },
+    { "name": "reserved agent name", "config": { "containers": [{ "name": "AgentContainer", "image": "x" }] }, "errors": ["is reserved"] },
+    { "name": "reserved init name", "config": { "containers": [{ "name": "abca-volume-init", "image": "x" }] }, "errors": ["is reserved"] },
+    { "name": "duplicate name", "config": { "containers": [{ "name": "pg", "image": "x" }, { "name": "pg", "image": "y" }] }, "errors": ["used twice"] },
+    { "name": "bad name", "config": { "containers": [{ "name": "my pg", "image": "x" }] }, "errors": [".name must match"] },
+    { "name": "missing image", "config": { "containers": [{ "name": "pg" }] }, "errors": [".image must be a non-empty string"] },
+    { "name": "env value not a string", "config": { "containers": [{ "name": "pg", "image": "x", "environment": { "PORT": 5432 } }] }, "errors": ["environment.PORT must be a string"] },
+    { "name": "bad env name", "config": { "containers": [{ "name": "pg", "image": "x", "environment": { "1BAD": "v" } }] }, "errors": ["invalid variable name '1BAD'"] },
+    { "name": "bad port", "config": { "containers": [{ "name": "pg", "image": "x", "ports": [70000] }] }, "errors": ["ports must be a list of port numbers"] },
+    { "name": "health check without CMD", "config": { "containers": [{ "name": "pg", "image": "x", "health_check": { "command": ["pg_isready"] } }] }, "errors": ["health_check.command must be"] },
+    { "name": "health check retries over the ECS cap", "config": { "containers": [{ "name": "pg", "image": "x", "health_check": { "command": ["CMD", "true"], "retries": 30 } }] }, "errors": ["retries must be an integer between 1 and 10"] },
+    { "name": "mount of an undeclared volume", "config": { "containers": [{ "name": "pg", "image": "x", "mounts": [{ "volume": "data", "path": "/data" }] }] }, "errors": ["must name a volume declared"] },
+    { "name": "relative mount path", "config": { "volumes": [{ "name": "data", "agent_path": "/data" }], "containers": [{ "name": "pg", "image": "x", "mounts": [{ "volume": "data", "path": "data" }] }] }, "errors": [".path must be an absolute path"] },
+    { "name": "volume over the agent image", "config": { "volumes": [{ "name": "v", "agent_path": "/app/src" }], "containers": [{ "name": "pg", "image": "x" }] }, "errors": ["would hide the agent image's files"] },
+    { "name": "volume path with ..", "config": { "volumes": [{ "name": "v", "agent_path": "/workspace/../etc" }], "containers": [{ "name": "pg", "image": "x" }] }, "errors": ["agent_path must be an absolute path without '..'"] },
+    { "name": "duplicate volume", "config": { "volumes": [{ "name": "v", "agent_path": "/a" }, { "name": "v", "agent_path": "/b" }], "containers": [{ "name": "pg", "image": "x" }] }, "errors": ["declared twice"] }
+  ]
+}

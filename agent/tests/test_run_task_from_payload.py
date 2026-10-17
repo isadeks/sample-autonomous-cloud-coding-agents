@@ -69,6 +69,10 @@ class TestRunTaskFromPayload:
         assert seen["trace"] is True
         assert seen["user_id"] == "user-9"
 
+    def test_forwards_the_prepush_command(self):
+        seen = _capture({"prepush_command": ".abca/preview.sh test"})
+        assert seen["prepush_command"] == ".abca/preview.sh test"
+
     def test_coerces_issue_and_pr_number_to_str_and_max_turns_to_int(self):
         seen = _capture({"issue_number": 42, "pr_number": 7, "max_turns": "50"})
         assert seen["issue_number"] == "42"

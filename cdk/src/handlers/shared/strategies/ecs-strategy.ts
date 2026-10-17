@@ -19,10 +19,12 @@
 
 import { ECSClient, RunTaskCommand, DescribeTasksCommand, StopTaskCommand } from '@aws-sdk/client-ecs';
 import { S3Client, PutObjectCommand, DeleteObjectCommand } from '@aws-sdk/client-s3';
+import type { DynamoDBDocumentClient } from '@aws-sdk/lib-dynamodb';
 import type { ComputeStrategy, SessionHandle, SessionStatus } from '../compute-strategy';
+import { resolveServiceTaskDefinition } from '../ecs-service-containers';
 import { logger } from '../logger';
 import type { BlueprintConfig } from '../repo-config';
-import { makeClient } from '../ua';
+import { makeClient, makeDocClient } from '../ua';
 import { DEFAULT_MAX_TURNS } from '../validation';
 
 let sharedClient: ECSClient | undefined;
@@ -31,6 +33,14 @@ function getClient(): ECSClient {
     sharedClient = makeClient(ECSClient);
   }
   return sharedClient;
+}
+
+let sharedDocClient: DynamoDBDocumentClient | undefined;
+function getDocClient(): DynamoDBDocumentClient {
+  if (!sharedDocClient) {
+    sharedDocClient = makeDocClient();
+  }
+  return sharedDocClient;
 }
 
 let sharedS3Client: S3Client | undefined;
@@ -163,7 +173,25 @@ export class EcsComputeStrategy implements ComputeStrategy {
     // dispatched minutes after a deploy against the stale pinned revision fails
     // with "InvalidParameterException: TaskDefinition is inactive". Using the
     // family is immune to that deploy race.
-    const taskDefinition = toTaskDefinitionFamily(taskDefinitionRef);
+    let taskDefinition = toTaskDefinitionFamily(taskDefinitionRef);
+    // A repo with service containers runs a writable workflow on its own task
+    // definition (the build def + its services), registered here on first use
+    // and after each deploy or config change. Read-only workflows run no checks,
+    // so they keep the planning def.
+    let serviceContainers: string | undefined;
+    if (blueprintConfig.service_containers && !readOnly) {
+      const resolved = await resolveServiceTaskDefinition({
+        repo: String(payload.repo_url ?? ''),
+        config: blueprintConfig.service_containers,
+        baseTaskDefinitionArn: ECS_TASK_DEFINITION_ARN,
+        baseFamily: toTaskDefinitionFamily(ECS_TASK_DEFINITION_ARN),
+        agentContainerName: ECS_CONTAINER_NAME,
+        cachedArn: blueprintConfig.ecs_task_definition_arn,
+        cachedHash: blueprintConfig.ecs_task_definition_hash,
+      }, { ecs: getClient(), ddb: getDocClient(), repoTableName: process.env.REPO_TABLE_NAME });
+      taskDefinition = resolved.family;
+      serviceContainers = blueprintConfig.service_containers.containers.map(c => c.name).join(',');
+    }
 
     // The ECS container's default CMD starts the FastAPI server (uvicorn) which
     // waits for HTTP POST to /invocations — but in standalone ECS nobody sends
@@ -299,9 +327,11 @@ export class EcsComputeStrategy implements ComputeStrategy {
       task_id: taskId,
       ecs_task_arn: ecsTask.taskArn,
       cluster: ECS_CLUSTER_ARN,
-      // Which task def was selected — planning (read-only) vs build.
+      // Which task def was selected — planning (read-only), build, or the
+      // repo's derived def with its service containers.
       task_definition: taskDefinition,
       read_only: Boolean(readOnly),
+      ...(serviceContainers && { service_containers: serviceContainers }),
     });
 
     return {
@@ -331,7 +361,9 @@ export class EcsComputeStrategy implements ComputeStrategy {
     const lastStatus = ecsTask.lastStatus;
 
     if (lastStatus === 'STOPPED') {
-      const container = ecsTask.containers?.[0];
+      // The agent container decides the outcome; with service containers it is
+      // not necessarily the first one listed.
+      const container = ecsTask.containers?.find(c => c.name === ECS_CONTAINER_NAME) ?? ecsTask.containers?.[0];
       const exitCode = container?.exitCode;
       const stoppedReason = ecsTask.stoppedReason ?? container?.reason ?? 'unknown';
 

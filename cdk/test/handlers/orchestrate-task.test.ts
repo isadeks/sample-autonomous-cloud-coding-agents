@@ -207,8 +207,13 @@ describe('hydrateAndTransition', () => {
       ui_checks_dir: '.abca/ui-checks',
       require_tests: true,
       ci_baseline_probe: true,
+      prepush_command: '.abca/preview.sh test',
+      service_containers: { containers: [{ name: 'postgres', image: 'pg:14' }] },
     } as any);
     expect(payload.ui_checks_dir).toBe('.abca/ui-checks');
+    expect(payload.prepush_command).toBe('.abca/preview.sh test');
+    // service containers shape the ECS task (ecs-strategy), not the agent's payload
+    expect(payload).not.toHaveProperty('service_containers');
     expect(payload.require_tests).toBe(true);
     expect(payload.ci_baseline_probe).toBe(true);
     expect(payload.ci_wait_timeout_s).toBe(2700);
@@ -222,6 +227,7 @@ describe('hydrateAndTransition', () => {
     expect(payload).not.toHaveProperty('ci_wait_timeout_s');
     expect(payload).not.toHaveProperty('ci_required_checks');
     expect(payload).not.toHaveProperty('ui_checks_dir');
+    expect(payload).not.toHaveProperty('prepush_command');
     expect(payload).not.toHaveProperty('require_tests');
     expect(payload).not.toHaveProperty('ci_baseline_probe');
   });
@@ -885,10 +891,18 @@ describe('loadBlueprintConfig', () => {
       updated_at: '2024-01-01T00:00:00Z',
       ci_wait_timeout_s: 1800,
       ci_required_checks: ['deployment:Preview'],
+      prepush_command: '.abca/preview.sh test',
+      service_containers: { containers: [{ name: 'postgres', image: 'pg:14' }] },
+      ecs_task_definition_arn: 'arn:aws:ecs:us-east-1:123:task-definition/agent-org-repo-1:2',
+      ecs_task_definition_hash: 'abc',
     });
     const config = await loadBlueprintConfig(baseTask as any);
     expect(config.ci_wait_timeout_s).toBe(1800);
     expect(config.ci_required_checks).toEqual(['deployment:Preview']);
+    expect(config.prepush_command).toBe('.abca/preview.sh test');
+    expect(config.service_containers).toEqual({ containers: [{ name: 'postgres', image: 'pg:14' }] });
+    expect(config.ecs_task_definition_arn).toBe('arn:aws:ecs:us-east-1:123:task-definition/agent-org-repo-1:2');
+    expect(config.ecs_task_definition_hash).toBe('abc');
   });
 
   test('uses per-repo github_token_secret_arn when available', async () => {

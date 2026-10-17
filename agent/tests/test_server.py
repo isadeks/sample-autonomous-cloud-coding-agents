@@ -640,6 +640,17 @@ class _FakeRequest:
         self.headers = headers or {}
 
 
+class TestExtractPrepushCommand:
+    def test_payload_prepush_command_reaches_the_task(self):
+        payload = {"repo_url": "o/r", "task_description": "x", "task_id": "t-1"}
+        request: Any = _FakeRequest()
+        params = server._extract_invocation_params(
+            {**payload, "prepush_command": ".abca/preview.sh test"}, request
+        )
+        assert params["prepush_command"] == ".abca/preview.sh test"
+        assert server._extract_invocation_params(payload, request)["prepush_command"] == ""
+
+
 class TestExtractTrace:
     """_extract_invocation_params is the boundary where the orchestrator's
     ``trace`` payload becomes the agent's ``trace`` kwarg. The flag is

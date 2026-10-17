@@ -12,6 +12,7 @@ from post_hooks import (
     resolve_verify_argv,
     verify_build,
     verify_lint,
+    verify_prepush,
 )
 
 
@@ -116,6 +117,13 @@ class TestVerifyBuildHonorsCommand:
         seen = self._capture_argv(monkeypatch)
         verify_build("/repo", "mise run build")
         assert seen["kw"].get("timeout") == post_hooks.BUILD_VERIFY_TIMEOUT_S
+
+    def test_prepush_check_runs_the_command_under_its_own_timeout(self, monkeypatch):
+        seen = self._capture_argv(monkeypatch)
+        monkeypatch.setattr(post_hooks, "PREPUSH_TIMEOUT_S", 42)
+        assert verify_prepush("/repo", ".abca/preview.sh test").passed is True
+        assert seen["argv"] == [".abca/preview.sh", "test"]
+        assert seen["kw"].get("timeout") == 42
 
     def test_lint_uses_configured_command(self, monkeypatch):
         seen = self._capture_argv(monkeypatch)

@@ -20,6 +20,7 @@
 import { GetCommand, ScanCommand } from '@aws-sdk/lib-dynamodb';
 import { documentClient } from './dynamo-clients';
 import { CliError } from './errors';
+import type { ServiceContainersConfig } from './service-containers';
 
 const REPO_PATTERN = /^[a-zA-Z0-9._-]+\/[a-zA-Z0-9._-]+$/;
 
@@ -50,6 +51,11 @@ export interface RepoConfigRow {
   readonly ui_checks_dir?: string;
   readonly require_tests?: boolean;
   readonly ci_baseline_probe?: boolean;
+  readonly prepush_command?: string;
+  readonly service_containers?: ServiceContainersConfig;
+  /** Written by the orchestrator: the ECS task definition derived for ``service_containers``. */
+  readonly ecs_task_definition_arn?: string;
+  readonly ecs_task_definition_hash?: string;
 }
 
 /**

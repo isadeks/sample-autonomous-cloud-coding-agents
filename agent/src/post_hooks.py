@@ -31,6 +31,9 @@ DEFAULT_LINT_COMMAND = "mise run lint"
 # VerifyOutcome.timed_out → pipeline error_message → platform failure copy)
 # rather than a generic "build failed".
 BUILD_VERIFY_TIMEOUT_S = int(os.environ.get("BUILD_VERIFY_TIMEOUT_S") or 1800)
+# The repo's pre-push check (``prepush_command``) brings up the app and its
+# services before testing it, so it gets its own limit.
+PREPUSH_TIMEOUT_S = int(os.environ.get("PREPUSH_TIMEOUT_S") or 1800)
 
 
 @dataclass
@@ -209,7 +212,9 @@ def resolve_verify_argv(command: str | None, default: str) -> list[str]:
     return shlex.split(cmd)
 
 
-def _run_verify(repo_dir: str, command: str, default: str, label: str) -> VerifyOutcome:
+def _run_verify(
+    repo_dir: str, command: str, default: str, label: str, timeout: int | None = None
+) -> VerifyOutcome:
     """Run a configured verify command and classify the outcome.
 
     Returns a :class:`VerifyOutcome` so callers can distinguish a TIMEOUT (the
@@ -218,6 +223,7 @@ def _run_verify(repo_dir: str, command: str, default: str, label: str) -> Verify
     not-passed for gating, but the pipeline surfaces them as different reasons.
     """
     argv = resolve_verify_argv(command, default)
+    timeout = timeout or BUILD_VERIFY_TIMEOUT_S
     log("POST", f"Running post-agent {label} ({' '.join(argv)})...")
     try:
         result = run_cmd(
@@ -225,7 +231,7 @@ def _run_verify(repo_dir: str, command: str, default: str, label: str) -> Verify
             label=label,
             cwd=repo_dir,
             check=False,
-            timeout=BUILD_VERIFY_TIMEOUT_S,
+            timeout=timeout,
             # Stream the build/lint output live → full log reaches CloudWatch
             # verbatim (a buffered summary would hide which sub-task failed).
             stream=True,
@@ -233,7 +239,7 @@ def _run_verify(repo_dir: str, command: str, default: str, label: str) -> Verify
     except subprocess.TimeoutExpired:
         log(
             "WARN",
-            f"Post-agent {label} TIMED OUT after {BUILD_VERIFY_TIMEOUT_S}s "
+            f"Post-agent {label} TIMED OUT after {timeout}s "
             "— reporting as timed out (not a build failure)",
         )
         return VerifyOutcome(passed=False, timed_out=True)
@@ -283,6 +289,11 @@ def verify_build(repo_dir: str, command: str = "") -> VerifyOutcome:
 def verify_lint(repo_dir: str, command: str = "") -> VerifyOutcome:
     """Run the configured lint command (default ``mise run lint``) to verify lint passes."""
     return _run_verify(repo_dir, command, DEFAULT_LINT_COMMAND, "verify-lint-post")
+
+
+def verify_prepush(repo_dir: str, command: str) -> VerifyOutcome:
+    """Run the repo's pre-push check (``prepush_command``; never a default)."""
+    return _run_verify(repo_dir, command, "", "prepush-check", timeout=PREPUSH_TIMEOUT_S)
 
 
 def ensure_committed(repo_dir: str) -> bool:

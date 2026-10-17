@@ -403,6 +403,7 @@ def _run_task_background(
     ui_checks_dir: str = "",
     require_tests: bool = False,
     ci_baseline_probe: bool = False,
+    prepush_command: str = "",
     prompt_version: str = "",
     memory_id: str = "",
     resolved_workflow: dict | None = None,
@@ -499,6 +500,7 @@ def _run_task_background(
             ui_checks_dir=ui_checks_dir,
             require_tests=require_tests,
             ci_baseline_probe=ci_baseline_probe,
+            prepush_command=prepush_command,
             prompt_version=prompt_version,
             memory_id=memory_id,
             resolved_workflow=resolved_workflow,
@@ -590,6 +592,8 @@ def _extract_invocation_params(inp: dict, request: Request) -> dict:
     ui_checks_dir = str(inp.get("ui_checks_dir") or "")
     # Per-repo: behaviour changes must add tests to the project's own suites.
     require_tests = _payload_bool(inp, "require_tests")
+    # Per-repo: check run before every push, fed back to the agent (CI stays the gate).
+    prepush_command = str(inp.get("prepush_command") or "")
     max_turns = int(inp.get("max_turns", 0)) or int(os.environ.get("MAX_TURNS", "100"))
     max_budget_usd = float(inp.get("max_budget_usd", 0)) or None
     aws_region = inp.get("aws_region") or os.environ.get("AWS_REGION", "")
@@ -717,6 +721,7 @@ def _extract_invocation_params(inp: dict, request: Request) -> dict:
         "ui_checks_dir": ui_checks_dir,
         "require_tests": require_tests,
         "ci_baseline_probe": ci_baseline_probe,
+        "prepush_command": prepush_command,
         "prompt_version": prompt_version,
         "memory_id": memory_id,
         "resolved_workflow": resolved_workflow,

@@ -31,6 +31,7 @@ import {
   RepoConfigRow,
   RepoNotOnboardedError,
 } from './repo-lookup';
+import type { ServiceContainersConfig } from './service-containers';
 
 /** TTL (days) for soft-deleted repo rows — matches Blueprint construct. */
 export const REMOVED_REPO_TTL_DAYS = 30;
@@ -60,6 +61,10 @@ export interface OnboardRepoOptions {
   readonly ciBaselineProbe?: boolean;
   /** Require project tests for behaviour changes (true/false; undefined keeps the stored value). */
   readonly requireTests?: boolean;
+  /** Check the agent runs before every push, e.g. `.abca/preview.sh test` ('' clears). */
+  readonly prepushCommand?: string;
+  /** ECS service containers next to the agent (validated by the caller; null clears). */
+  readonly serviceContainers?: ServiceContainersConfig | null;
 }
 
 export interface OnboardRepoDependencies {
@@ -138,6 +143,18 @@ export async function onboardRepo(
     setOrDelete(item, 'ui_checks_dir', dir || undefined);
   }
   if (options.requireTests !== undefined) setOrDelete(item, 'require_tests', options.requireTests || undefined);
+  if (options.prepushCommand !== undefined) {
+    setOrDelete(item, 'prepush_command', options.prepushCommand.trim() || undefined);
+  }
+  if (options.serviceContainers !== undefined) {
+    setOrDelete(item, 'service_containers', options.serviceContainers ?? undefined);
+    // The orchestrator re-derives the task definition when the config hash
+    // changes; dropping the cache with the config keeps the row honest.
+    if (options.serviceContainers === null) {
+      delete item.ecs_task_definition_arn;
+      delete item.ecs_task_definition_hash;
+    }
+  }
 
   await ddb.send(new PutCommand({
     TableName: tableName,

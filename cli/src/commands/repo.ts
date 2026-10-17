@@ -35,6 +35,7 @@ import {
 } from '../repo-lookup';
 import { offboardRepo, onboardRepo } from '../repo-onboard';
 import { buildRepoOnboardNotes } from '../repo-onboard-notes';
+import { readServiceContainersFile } from '../service-containers';
 import { getStackOutput } from '../stack-outputs';
 
 /**
@@ -173,9 +174,15 @@ export function makeRepoCommand(): Command {
       .option('--clear-system-prompt-overrides', 'Remove the stored repo-specific agent instructions')
       .option('--ci-baseline-probe', 'Verify an agent\'s "unrelated CI failure" claim by running CI on the base branch (pushes abca-baseline/<task-id>)')
       .option('--no-ci-baseline-probe', 'Do not run the baseline probe')
+      .option('--prepush-command <cmd>', 'Check the agent runs before every push and fixes until green, e.g. \'.abca/preview.sh test\' (feedback only; \'\' clears)')
+      .option('--service-containers <path>', 'ECS only: JSON file of containers to run next to the agent (databases, the app\'s runtime image) and shared volumes')
+      .option('--clear-service-containers', 'Remove the stored service containers')
       .option('--output <format>', 'Output format: text or json', 'text')
       .action(async (repoId: string, opts) => {
         assertRepoFormat(repoId);
+        if (opts.serviceContainers && opts.clearServiceContainers) {
+          throw new CliError('Use either --service-containers or --clear-service-containers, not both.');
+        }
         if (opts.computeType
           && opts.computeType !== 'agentcore'
           && opts.computeType !== 'ecs'
@@ -256,6 +263,10 @@ export function makeRepoCommand(): Command {
           uiChecksDir: opts.uiChecksDir,
           requireTests: opts.requireTests,
           ciBaselineProbe: opts.ciBaselineProbe,
+          prepushCommand: opts.prepushCommand,
+          serviceContainers: opts.clearServiceContainers
+            ? null
+            : (opts.serviceContainers !== undefined ? readServiceContainersFile(opts.serviceContainers) : undefined),
           systemPromptOverrides: opts.clearSystemPromptOverrides
             ? ''
             : readOverridesFile(opts.systemPromptOverridesFile),

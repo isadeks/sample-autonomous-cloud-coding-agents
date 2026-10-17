@@ -47,6 +47,10 @@ Use the CLI path for quick day-2 registration with platform defaults (runtime AR
 | `--ui-checks-dir <dir>` (`''` clears) | `ui_checks_dir` |
 | `--require-tests` / `--no-require-tests` | `require_tests` |
 | `--system-prompt-overrides-file <path>` / `--clear-system-prompt-overrides` | `system_prompt_overrides` |
+| `--prepush-command <cmd>` (`''` clears) | `prepush_command` |
+| `--service-containers <file.json>` / `--clear-service-containers` (ECS only) | `service_containers` |
+
+`--service-containers` reads a JSON file of containers and shared volumes and validates it at onboarding (schema and rules: [COMPUTE.md](./COMPUTE.md#service-containers-and-the-pre-push-check-ecs)). The orchestrator derives the repo's Fargate task definition from it at the next task start and records it in `ecs_task_definition_arn` / `ecs_task_definition_hash`; operators do not set those two. A repo that is not `compute_type: ecs` keeps the config but runs without it (the onboard notes warn). The Blueprint construct exposes `pipeline.prepushCommand`; service containers are CLI-only for now.
 
 See also: [Using the CLI — operator commands](../guides/USER_GUIDE.md#operator-commands-stack-admin) and [ADR-017](../decisions/ADR-017-operator-cli-repo-onboarding.md).
 
@@ -140,6 +144,13 @@ interface RepoConfig {
   ci_baseline_probe?: boolean;
   ui_checks_dir?: string;
   require_tests?: boolean;
+  prepush_command?: string;            // run before every push; feedback only
+  service_containers?: {               // ECS only: containers next to the agent
+    containers: ServiceContainerSpec[];
+    volumes?: { name: string; agent_path: string }[];
+  };
+  ecs_task_definition_arn?: string;    // written by the orchestrator
+  ecs_task_definition_hash?: string;   // written by the orchestrator
   custom_steps?: CustomStepConfig[];
   step_sequence?: StepRef[];
 }

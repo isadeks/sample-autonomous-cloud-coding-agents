@@ -18,6 +18,7 @@
  */
 
 import { GetCommand } from '@aws-sdk/lib-dynamodb';
+import type { ServiceContainersConfig } from './ecs-service-containers';
 import { logger } from './logger';
 import { makeDocClient } from './ua';
 
@@ -64,6 +65,22 @@ export interface RepoConfig {
   readonly require_tests?: boolean;
   /** Verify an agent's "unrelated CI failure" claim by running CI on the base commit (opt-in; pushes a probe branch). */
   readonly ci_baseline_probe?: boolean;
+  /**
+   * Repo-declared check the agent runs before every push, e.g. a script that
+   * starts the app against its service containers and runs the UI checks and
+   * e2e tests. Failures go back to the agent's session; CI stays the gate.
+   */
+  readonly prepush_command?: string;
+  /**
+   * ECS only: containers that run next to the agent in its Fargate task (see
+   * ``ecs-service-containers.ts``). Validated at task start, as rows can be
+   * hand-edited.
+   */
+  readonly service_containers?: ServiceContainersConfig;
+  /** Written by the orchestrator: the task definition derived for ``service_containers``. */
+  readonly ecs_task_definition_arn?: string;
+  /** Written by the orchestrator: cache key of ``ecs_task_definition_arn``. */
+  readonly ecs_task_definition_hash?: string;
   readonly egress_allowlist?: string[];
   readonly cedar_policies?: string[];
   /**
@@ -122,6 +139,12 @@ export interface BlueprintConfig {
   readonly require_tests?: boolean;
   /** Verify an agent's "unrelated CI failure" claim by running CI on the base commit (opt-in; pushes a probe branch). */
   readonly ci_baseline_probe?: boolean;
+  /** Check the agent runs before every push (feedback only; CI stays the gate). */
+  readonly prepush_command?: string;
+  /** ECS only: containers next to the agent, and the cached derived task definition. */
+  readonly service_containers?: ServiceContainersConfig;
+  readonly ecs_task_definition_arn?: string;
+  readonly ecs_task_definition_hash?: string;
   readonly egress_allowlist?: string[];
   readonly cedar_policies?: string[];
   /**

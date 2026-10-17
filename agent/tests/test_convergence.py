@@ -10,7 +10,10 @@ the agent pushes per round) rather than call counts:
   the base commit (refuted → another round with the evidence);
 - the baseline probe reads existing base CI first and only pushes (and always
   deletes) ``abca-baseline/<task_id>`` when the repo opts in;
-- the task verdict: red CI, and required checks without a verdict, block success.
+- the task verdict: red CI, and required checks without a verdict, block success;
+- the pre-push check resumes the session on a genuine failure, commits without
+  pushing, draws on one task-wide round budget, and runs again before each CI
+  fix-up push.
 """
 
 from __future__ import annotations
@@ -25,11 +28,15 @@ import pytest
 import convergence
 from ci_wait import BaselineProbe, CiConvergence, CiResult
 from convergence import (
+    PREPUSH_MAX_ROUNDS,
+    PrepushResult,
     RoundContext,
     ci_failure_message,
     probe_baseline,
+    render_prepush_summary,
     run_ci_rounds,
     run_fixup_rounds,
+    run_prepush_rounds,
 )
 from models import AgentResult, RepoSetup, TaskConfig
 from pipeline import _resolve_overall_task_status
@@ -521,3 +528,118 @@ def test_approval_question_for_editing_an_existing_test():
     )
     assert q == "Allow changing the existing test `e2e/a.e2e-spec.ts`? (replaces 2 line(s) with 3)"
     assert approval_question("Bash", {}, ["force_push_any"], "/w") == ""
+
+
+class TestPrepushRounds:
+    FAIL = VerifyOutcome(passed=False, output_tail="UI check library-info: expected 'Lib' got ''")
+    PASS = VerifyOutcome(passed=True)
+
+    def _ctx(self, **config_over) -> RoundContext:
+        ctx = _ctx(_config(prepush_command=".abca/preview.sh test", **config_over))
+        ctx.prepush = PrepushResult()
+        return ctx
+
+    def _run(self, outcomes: list[VerifyOutcome], ctx: RoundContext | None = None, agent=None):
+        world = World()
+        ctx = ctx or self._ctx()
+        agent = agent or _agent()
+        with (
+            patch("runner.run_agent", side_effect=world.run_agent),
+            patch("convergence.verify_prepush", side_effect=outcomes) as check,
+            patch("convergence.reconcile_agent_branch"),
+            patch("convergence.ensure_committed") as commit,
+            patch("convergence.ensure_pushed") as push,
+        ):
+            run_prepush_rounds(ctx, agent)
+        return ctx.prepush, world, check, commit, push
+
+    def test_noop_without_a_check(self):
+        ctx = _ctx()
+        with patch("convergence.verify_prepush") as check:
+            run_prepush_rounds(ctx, _agent())
+        check.assert_not_called()
+
+    def test_green_needs_no_round(self):
+        state, world, _check, _commit, push = self._run([self.PASS])
+        assert state.runs == ["pass"] and state.rounds == 0 and world.prompts == []
+        push.assert_not_called()
+
+    def test_failure_goes_back_to_the_session_and_is_committed_not_pushed(self):
+        state, world, check, commit, push = self._run([self.FAIL, self.PASS])
+        assert state.runs == ["fail", "pass"] and state.rounds == 1
+        assert state.stopped_reason == "check passed"
+        assert world.resumed_with[0]["resume_session_id"] == "s-1"
+        assert "expected 'Lib' got ''" in world.prompts[0]
+        assert "Do not push" in world.prompts[0]
+        assert check.call_args.args == ("/w/repo", ".abca/preview.sh test")
+        commit.assert_called_once()
+        push.assert_not_called()
+
+    def test_only_genuine_failures_go_back(self):
+        for outcome, verdict in (
+            (VerifyOutcome(passed=False, timed_out=True), "timeout"),
+            (VerifyOutcome(passed=False, inert=True), "inert"),
+            (VerifyOutcome(passed=False, infra_failed=True), "infra"),
+        ):
+            state, world, *_ = self._run([outcome])
+            assert state.runs == [verdict] and state.stopped_reason == f"check {verdict}"
+            assert world.prompts == []
+
+    def test_rounds_come_from_one_budget_for_the_task(self):
+        ctx = self._ctx()
+        fails = [self.FAIL] * (PREPUSH_MAX_ROUNDS + 1)
+        state, world, *_ = self._run(fails, ctx)
+        assert state.rounds == PREPUSH_MAX_ROUNDS and len(world.prompts) == PREPUSH_MAX_ROUNDS
+        assert state.stopped_reason == "max pre-push rounds reached"
+        # spent: a later push point does not run the check again
+        state, world, check, *_ = self._run([self.PASS], ctx)
+        check.assert_not_called()
+
+    def test_no_round_without_turns_left(self):
+        state, world, *_ = self._run([self.FAIL], agent=_agent(num_turns=98))
+        assert state.runs == ["fail"] and state.stopped_reason == "turn limit reached"
+        assert world.prompts == []
+
+    def test_runs_before_each_ci_fixup_push(self):
+        world = World(ci={"c1": "fail", "c2": "pass"}, pushes=["c2"])
+        ctx = self._ctx()
+        order: list[str] = []
+
+        def check(*_a):
+            order.append("check")
+            return self.PASS
+
+        def push(*_a):
+            order.append("push")
+            return True
+
+        with (
+            patch("runner.run_agent", side_effect=world.run_agent),
+            patch("convergence.verify_prepush", side_effect=check),
+            patch("convergence.ensure_pushed", side_effect=push),
+            patch("convergence.wait_for_ci", side_effect=world.wait_for_ci),
+            patch("convergence.pr_head_sha", side_effect=lambda *_a: world.head),
+            patch("convergence.reconcile_agent_branch"),
+            patch("convergence.ensure_committed"),
+            patch("convergence.ci_comments_for", return_value=[]),
+            patch("convergence._task_cancelled", return_value=False),
+            patch("convergence._post_handoff"),
+        ):
+            ci = run_ci_rounds(_agent(), ctx, PR_URL)
+        assert ci is not None and ci.final is not None and ci.final.state == "pass"
+        # the push of the open PR, then: CI fix-up -> check -> push
+        assert order == ["push", "check", "push"]
+        assert ctx.prepush is not None and ctx.prepush.runs == ["pass"]
+
+    def test_pr_summary(self):
+        assert render_prepush_summary(None, "x") == ("", [])
+        assert render_prepush_summary(PrepushResult(), "x") == ("", [])
+        summary, details = render_prepush_summary(
+            PrepushResult(runs=["fail", "pass"], rounds=1), ".abca/preview.sh test"
+        )
+        assert summary == "pre-push ✅"
+        assert details == [
+            "- Pre-push check: `.abca/preview.sh test` → PASS (runs: fail, pass; "
+            "1 fix-up round(s); feedback for the agent, CI is the gate)"
+        ]
+        assert render_prepush_summary(PrepushResult(runs=["timeout"]), "x")[0] == "pre-push ⚠️"

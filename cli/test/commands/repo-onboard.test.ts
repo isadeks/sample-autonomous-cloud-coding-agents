@@ -257,6 +257,32 @@ describe('repo onboard/offboard', () => {
     expect(ddbSend).not.toHaveBeenCalled();
   });
 
+  test('onboardRepo stores the pre-push check and service containers; clearing drops the derived task def', async () => {
+    const services = { containers: [{ name: 'postgres', image: 'pg:14' }] };
+    await onboardRepo('us-east-1', 'RepoTable', 'acme/a', {
+      prepushCommand: ' .abca/preview.sh test ',
+      serviceContainers: services,
+    });
+    let item = (ddbSend.mock.calls[0][0] as PutCommand).input.Item!;
+    expect(item.prepush_command).toBe('.abca/preview.sh test');
+    expect(item.service_containers).toEqual(services);
+
+    const { loadRepoConfig } = jest.requireMock('../../src/repo-lookup') as { loadRepoConfig: jest.Mock };
+    loadRepoConfig.mockResolvedValueOnce({
+      repo: 'acme/a',
+      status: 'active',
+      prepush_command: '.abca/preview.sh test',
+      service_containers: services,
+      ecs_task_definition_arn: 'arn:aws:ecs:us-east-1:1:task-definition/agent-acme-a-1:2',
+      ecs_task_definition_hash: 'abc',
+    });
+    await onboardRepo('us-east-1', 'RepoTable', 'acme/a', { prepushCommand: '', serviceContainers: null });
+    item = (ddbSend.mock.calls[1][0] as PutCommand).input.Item!;
+    for (const cleared of ['prepush_command', 'service_containers', 'ecs_task_definition_arn', 'ecs_task_definition_hash']) {
+      expect(item).not.toHaveProperty(cleared);
+    }
+  });
+
   test('onboardRepo clears CI wait with 0 and required checks with an empty list', async () => {
     const { loadRepoConfig } = jest.requireMock('../../src/repo-lookup') as { loadRepoConfig: jest.Mock };
     loadRepoConfig.mockResolvedValueOnce({
