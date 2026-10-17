@@ -285,6 +285,13 @@ def test_ci_prompt_fences_the_report():
     p = build_ci_fixup_prompt("REPORT ```\nbreakout", 1, 2)
     assert "````\nREPORT ```\nbreakout\n````" in p
     assert "round 1 of 2" in p and "untrusted" in p and "Do not weaken" in p
+    assert "commit and push to the same branch" in p
+
+
+def test_ci_prompt_leaves_the_push_to_the_platform_with_a_prepush_check():
+    p = build_ci_fixup_prompt("REPORT", 1, 2, platform_pushes=True)
+    assert "do NOT push" in p and "pre-push check" in p
+    assert "commit and push" not in p
 
 
 class TestJudgeClaim:

@@ -492,7 +492,10 @@ def run_ci_rounds(
             "ci_fixup_round_started", f"round={ci.rounds}/{ctx.max_rounds}"
         )
         prompt = build_ci_fixup_prompt(
-            f"{evidence}\n\n{report}" if evidence else report, ci.rounds, ctx.max_rounds
+            f"{evidence}\n\n{report}" if evidence else report,
+            ci.rounds,
+            ctx.max_rounds,
+            platform_pushes=ctx.prepush is not None,
         )
         stop = _resume_and_push(ctx, agent_result, prompt, prepush=True)
         if stop:

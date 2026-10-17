@@ -629,6 +629,8 @@ class TestPrepushRounds:
         assert ci is not None and ci.final is not None and ci.final.state == "pass"
         # the push of the open PR, then: CI fix-up -> check -> push
         assert order == ["push", "check", "push"]
+        # the agent commits the CI fix and leaves the push to the platform
+        assert "do NOT push" in world.prompts[0]
         assert ctx.prepush is not None and ctx.prepush.runs == ["pass"]
 
     def test_pr_summary(self):
