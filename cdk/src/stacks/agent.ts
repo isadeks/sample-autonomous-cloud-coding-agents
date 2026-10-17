@@ -1101,10 +1101,14 @@ export class AgentStack extends Stack {
         ...(ecsTaskSizing !== undefined && { taskSizing: ecsTaskSizing }),
         ...(linearIdentityVault && { linearIdentityVault }),
         vpc: agentVpc.vpc,
+        // The ECS variant of the agent image adds a headless browser for
+        // pre-push UI checks against a repo's service containers (see the
+        // Dockerfile); the AgentCore image stays without it.
         agentImageAsset: new ecr_assets.DockerImageAsset(this, 'AgentImage', {
           directory: repoRoot,
           file: 'agent/Dockerfile',
           platform: ecr_assets.Platform.LINUX_ARM64,
+          buildArgs: { AGENT_IMAGE_VARIANT: 'ecs' },
         }),
         taskTable: taskTable.table,
         taskEventsTable: taskEventsTable.table,

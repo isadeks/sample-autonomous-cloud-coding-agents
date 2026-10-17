@@ -103,6 +103,34 @@ COPY --from=ghcr.io/astral-sh/uv:0.11.14@sha256:1025398289b62de8269e70c45b91ffa3
 COPY agent/pyproject.toml agent/uv.lock /app/
 RUN uv sync --frozen --no-dev --directory /app
 
+# ECS variant only (``--build-arg AGENT_IMAGE_VARIANT=ecs``, set by the stack for
+# the Fargate task image): a headless browser, so a repo's pre-push check can run
+# its Playwright UI checks against the app it starts next to its service
+# containers. The agent runs as a non-root user with HTTPS-only egress, so none
+# of this can be installed at task time. Kept out of the AgentCore image, which
+# has a 2 GB size cap and no service containers to test against.
+#
+# - @playwright/test (pinned) in /opt/playwright, Chromium + its system libraries
+#   in /opt/ms-playwright (the agent user's default browsers path links there;
+#   the directories are writable so a repo pinned to another Playwright version
+#   can add its own browser build next to this one);
+# - unzip, jq, procps: what preview/e2e scripts commonly shell out to.
+# For the AgentCore variant this layer is empty, so both variants share the
+# cached layers around it.
+ARG AGENT_IMAGE_VARIANT=agentcore
+ARG PLAYWRIGHT_VERSION=1.64.1
+RUN if [ "$AGENT_IMAGE_VARIANT" = "ecs" ]; then \
+        set -eux; \
+        apt-get update; \
+        apt-get install -y --no-install-recommends unzip jq procps; \
+        npm install --prefix /opt/playwright --no-audit --no-fund "@playwright/test@${PLAYWRIGHT_VERSION}"; \
+        PLAYWRIGHT_BROWSERS_PATH=/opt/ms-playwright \
+            /opt/playwright/node_modules/.bin/playwright install --with-deps --only-shell chromium; \
+        find /opt/ms-playwright -maxdepth 1 -type d -exec chmod 1777 {} +; \
+        apt-get clean; \
+        rm -rf /var/lib/apt/lists/* /var/cache/apt/archives/* /root/.npm; \
+    fi
+
 # Copy agent code (ARG busts cache so file edits are always picked up)
 ARG CACHE_BUST=0
 COPY agent/src/ /app/src/
@@ -136,7 +164,11 @@ COPY agent/managed-settings.json /etc/claude-code/managed-settings.json
 # Create non-root user (Claude Code CLI refuses bypassPermissions as root)
 RUN useradd -m -s /bin/bash agent && \
     mkdir -p /workspace && \
-    chown agent:agent /workspace /app
+    chown agent:agent /workspace /app && \
+    if [ -d /opt/ms-playwright ]; then \
+        install -d -o agent -g agent /home/agent/.cache && \
+        ln -s /opt/ms-playwright /home/agent/.cache/ms-playwright; \
+    fi
 
 USER agent
 ENV PATH="/app/.venv/bin:/home/agent/.local/share/mise/shims:/home/agent/.local/bin:${PATH}" \
