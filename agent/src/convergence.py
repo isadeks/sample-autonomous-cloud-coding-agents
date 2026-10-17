@@ -83,6 +83,9 @@ PROBE_MAX_S = 900
 
 # Pre-push fix-up rounds over the whole task (before the PR and every CI round).
 PREPUSH_MAX_ROUNDS = int(os.environ.get("PREPUSH_MAX_ROUNDS") or 3)
+# How long to wait for GitHub to show a just-pushed commit as the PR head.
+PR_HEAD_SYNC_POLLS = 12
+PR_HEAD_SYNC_INTERVAL_S = 5
 
 
 @dataclass
@@ -341,13 +344,29 @@ def pr_head_sha(repo: str, pr_number: str, repo_dir: str) -> str:
     return r.stdout.strip() if r.returncode == 0 else ""
 
 
-def _ci_head(ctx: RoundContext, pr_number: str) -> str:
-    """The commit CI builds: the PR head on GitHub, else (logged) the pushed local HEAD."""
-    sha = pr_head_sha(ctx.config.repo_url, pr_number, ctx.setup.repo_dir)
-    if sha:
-        return sha
-    log("WARN", "CI: could not read the PR head from GitHub; using the pushed local HEAD")
-    return head_sha(ctx.setup.repo_dir)
+def _ci_head(ctx: RoundContext, pr_number: str, *, sleep=time.sleep) -> str:
+    """The commit CI builds: the PR head on GitHub, else (logged) the pushed local HEAD.
+
+    GitHub updates a PR's head a few seconds after a push. Reading it at once returned
+    the previous commit, and the loop took a pushed fix for "the agent pushed nothing"
+    (it then probed the base instead of waiting for CI on the fix). So while GitHub's
+    head differs from what was just pushed, poll briefly before trusting it.
+    """
+    repo_dir = ctx.setup.repo_dir
+    local = head_sha(repo_dir)
+    sha = ""
+    for attempt in range(PR_HEAD_SYNC_POLLS):
+        sha = pr_head_sha(ctx.config.repo_url, pr_number, repo_dir)
+        if not sha or not local or sha == local:
+            break
+        if attempt < PR_HEAD_SYNC_POLLS - 1:
+            sleep(PR_HEAD_SYNC_INTERVAL_S)
+    if not sha:
+        log("WARN", "CI: could not read the PR head from GitHub; using the pushed local HEAD")
+        return local
+    if sha != local:
+        log("WARN", f"CI: PR head on GitHub is {sha[:9]}, local HEAD {local[:9]}; using GitHub's")
+    return sha
 
 
 def _remaining(deadline: float) -> int:

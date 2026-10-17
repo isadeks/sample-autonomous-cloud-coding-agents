@@ -129,6 +129,7 @@ def _ci_rounds(world: World, ctx: RoundContext | None = None, probe: BaselinePro
         patch("runner.run_agent", side_effect=world.run_agent),
         patch("convergence.wait_for_ci", side_effect=world.wait_for_ci),
         patch("convergence.pr_head_sha", side_effect=lambda *_a: world.head),
+        patch("convergence.head_sha", return_value=""),
         patch("convergence.ensure_pushed", side_effect=lambda *_a: world.push_ok),
         patch("convergence.reconcile_agent_branch"),
         patch("convergence.ensure_committed"),
@@ -194,6 +195,7 @@ class TestCiRounds:
         with (
             patch("convergence.wait_for_ci", side_effect=world.wait_for_ci),
             patch("convergence.pr_head_sha", side_effect=lambda *_a: world.head),
+            patch("convergence.head_sha", return_value=""),
             patch("convergence.ensure_pushed", return_value=True),
             patch("convergence._task_cancelled", return_value=False),
         ):
@@ -210,6 +212,7 @@ class TestCiRounds:
                 patch("runner.run_agent", side_effect=world.run_agent),
                 patch("convergence.wait_for_ci", side_effect=world.wait_for_ci),
                 patch("convergence.pr_head_sha", side_effect=lambda *_a: world.head),
+                patch("convergence.head_sha", return_value=""),
                 patch("convergence.reconcile_agent_branch"),
                 patch("convergence.ensure_committed"),
                 patch("convergence.ci_comments_for", return_value=[]),
@@ -622,6 +625,7 @@ class TestPrepushRounds:
             patch("convergence.ensure_pushed", side_effect=push),
             patch("convergence.wait_for_ci", side_effect=world.wait_for_ci),
             patch("convergence.pr_head_sha", side_effect=lambda *_a: world.head),
+            patch("convergence.head_sha", return_value=""),
             patch("convergence.reconcile_agent_branch"),
             patch("convergence.ensure_committed"),
             patch("convergence.ci_comments_for", return_value=[]),
@@ -648,3 +652,30 @@ class TestPrepushRounds:
             "1 fix-up round(s); feedback for the agent, CI is the gate)"
         ]
         assert render_prepush_summary(PrepushResult(runs=["timeout"]), "x")[0] == "pre-push ⚠️"
+
+
+class TestCiHead:
+    """The PR head GitHub reports lags a push by a few seconds."""
+
+    def test_waits_for_github_to_show_the_pushed_commit(self):
+        heads = iter(["old", "old", "new"])
+        sleeps: list[float] = []
+        with (
+            patch("convergence.head_sha", return_value="new"),
+            patch("convergence.pr_head_sha", side_effect=lambda *_a: next(heads)),
+        ):
+            from convergence import _ci_head
+
+            assert _ci_head(_ctx(), "7", sleep=sleeps.append) == "new"
+        assert len(sleeps) == 2
+
+    def test_uses_githubs_head_when_it_never_matches(self):
+        sleeps: list[float] = []
+        with (
+            patch("convergence.head_sha", return_value="local"),
+            patch("convergence.pr_head_sha", return_value="remote"),
+        ):
+            from convergence import PR_HEAD_SYNC_POLLS, _ci_head
+
+            assert _ci_head(_ctx(), "7", sleep=sleeps.append) == "remote"
+        assert len(sleeps) == PR_HEAD_SYNC_POLLS - 1

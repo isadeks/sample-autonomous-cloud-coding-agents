@@ -335,14 +335,16 @@ def judge_claim(head: CiResult, base: CiResult) -> str:
     """Verdict on "the failing checks are not caused by my change", from the same checks on base.
 
     refuted: every check failing on the PR head passes on the base commit.
-    confirmed: at least one of them also fails on the base (pre-existing).
-    unverified: the base did not report them.
+    confirmed: at least one of them fails on the base in the same way (same state).
+    unverified: the base did not report them, or reported something else, such as an
+    ``error`` where the PR has a ``failure``: a UI check the PR adds reports "no UI
+    checks" (error) on a base without any, which says nothing about the PR's failure.
     """
-    failing = {c["name"] for c in head.failed}
+    failing = {c["name"]: c["state"] for c in head.failed}
     if not failing or base.state in ("none", "timeout", "cancelled", "error"):
         return "unverified"
     on_base = {c["name"]: c["state"] for c in base.checks}
-    if any(on_base.get(n) in _FAILED for n in failing):
+    if any(on_base.get(n) == state for n, state in failing.items()):
         return "confirmed"
     if all(on_base.get(n) == "success" for n in failing):
         return "refuted"

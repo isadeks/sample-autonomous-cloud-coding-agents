@@ -309,6 +309,11 @@ class TestJudgeClaim:
 
     def test_unverified_without_base_ci(self):
         assert judge_claim(self.head, CiResult("none", "b", [])) == "unverified"
+
+    def test_a_different_failure_on_base_is_not_a_confirmation(self):
+        # live: a UI check the PR adds reports "no UI checks" (error) on a base without any
+        no_checks = CiResult("fail", "b", [_chk("ci/e2e", "error")])
+        assert judge_claim(self.head, no_checks) == "unverified"
         assert (
             judge_claim(self.head, CiResult("timeout", "b", [_chk("ci/e2e", "pending")]))
             == "unverified"
