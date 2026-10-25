@@ -142,8 +142,9 @@ describe('awaitOauthCallback', () => {
   });
 
   test('CALLBACK_URL constant matches the documented localhost URL', () => {
-    // Regression-lock: the URL is also baked into the CDK construct's
-    // allowlist (cdk/src/constructs/cli-workload-identity.ts default).
+    // Regression-lock: the URL is also baked into the vault's return-URL
+    // allowlist (`LinearIdentityVault`'s `allowedReturnUrls` in
+    // cdk/src/stacks/agent.ts).
     // Drift here = silent OAuth failure at runtime ("redirect_uri not allowlisted").
     // RFC 8252 §7.3: http://localhost is the right shape for native-app OAuth
     // callbacks (no TLS required, no cert warnings). Port 8080 is conventional.
