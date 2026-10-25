@@ -760,7 +760,7 @@ export interface CreateTaskRequest {
   readonly approval_timeout_s?: number;
   /** Cedar HITL: pre-approved scopes that skip the gate (§7.3 step 4).
    *  Typed as ``ApprovalScope[]`` (the strict union accepted by the
-   *  agent's ``parse_approval_scope``); CDK validates the parse result
+   *  agent's ``ApprovalAllowlist.add``); CDK validates the parse result
    *  before forwarding. */
   readonly initial_approvals?: readonly ApprovalScope[];
 }
@@ -1060,7 +1060,7 @@ export interface NudgeRequest {
  * Nudge response body. Returned with HTTP 202 Accepted — the nudge has
  * been persisted but has not yet reached the agent; it will be injected
  * at the next between-turns seam. Callers wanting confirmation that the
- * agent saw the nudge should watch task events for `nudge_consumed`.
+ * agent saw the nudge should watch task events for `nudge_acknowledged`.
  */
 export interface NudgeResponse {
   readonly task_id: string;
@@ -1278,8 +1278,11 @@ export function toTaskSummary(record: TaskRecord): TaskSummary {
  * - `bash_pattern:...`   — allow Bash commands matching the pattern (fnmatch).
  * - `write_path:...`     — allow Write/Edit against paths matching the pattern.
  * - `rule:<rule_id>`     — allow soft-deny hits whose rule_id matches.
- * - `all_session`        — allow anything for the rest of the session. Gated
- *                          by blueprint `maxPreApprovalScope` (§7.5).
+ * - `all_session`        — allow anything for the rest of the session. The
+ *                          design also reserves a blueprint
+ *                          `maxPreApprovalScope` cap on this (§7.5); that
+ *                          field is not implemented yet, so today the only
+ *                          brake is the CLI's `--yes` confirmation.
  *
  * Keep in sync with ``cli/src/types.ts``.
  */

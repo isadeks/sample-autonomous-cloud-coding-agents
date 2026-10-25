@@ -181,9 +181,9 @@ export class AgentStack extends Stack {
     // Build context is repo root (not agent/) so the Dockerfile can COPY
     // sibling trees the agent reads at runtime — currently
     // ``contracts/constants.json`` (S9 cross-language constants — see
-    // ``contracts/README.md``). Future shared assets (parity fixtures,
+    // ``contracts/constants.md``). Further shared assets (parity fixtures,
     // schema files) drop into ``contracts/`` without further build-context
-    // changes. Pattern lifted from ``merge/akw-integration``.
+    // changes.
     const repoRoot = path.join(__dirname, '..', '..', '..');
 
     const computeTypes = resolveComputeBackends(

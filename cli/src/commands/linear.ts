@@ -258,8 +258,8 @@ export async function resolveTemplateCallbackUrls(args: {
       return null;
     })
     : null;
-  // Needs a slug: the provider is per-workspace. Inferring it from the registry belongs with
-  // #917's `listOnboardedWorkspaceSlugs` rather than in a second copy here.
+  // Needs a slug: the provider is per-workspace. Inferring it from the registry belongs
+  // in a shared registry-listing helper (#917) rather than in a second copy here.
   const probe = args.slug ? await probeLinearVaultCallbackUrl({ region, workspaceSlug: args.slug }) : null;
   if (probe?.kind === 'unreadable') failures.push(`vault provider for '${args.slug}' (${probe.errorName})`);
 

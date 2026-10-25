@@ -350,7 +350,7 @@ describe('classifyError', () => {
     });
 
     test('classifies the runner.py "Agent session error (subtype=...)" wrapper, not just agent_status=', () => {
-      // runner.py:515 emits ``Agent session error (subtype='error_max_turns')``
+      // runner.py emits ``Agent session error (subtype='error_max_turns')``
       // — a DIFFERENT wrapper from pipeline.py's ``agent_status=``. Matching only
       // the ``agent_status=`` form let this fall through to UNKNOWN → "Unexpected
       // error" even though the task hit the 100-turn cap (observed: a 1-line
