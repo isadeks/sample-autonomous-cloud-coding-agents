@@ -619,7 +619,8 @@ describe('dispatchSlackEvent', () => {
     // task_stranded is one of the 5 terminals that share
     // ``slack_notified_terminal``. The reconciler emits
     // task_stranded + task_failed back-to-back when a heartbeat
-    // expires (handlers/reconcile-stranded-tasks.ts:170+); whichever
+    // expires (`failStrandedTask` in handlers/reconcile-stranded-tasks.ts);
+    // whichever
     // arrives first claims the slot and posts a Slack message.
     ddbSend
       .mockResolvedValueOnce({

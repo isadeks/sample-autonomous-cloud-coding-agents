@@ -600,11 +600,10 @@ def setup_repo(config: TaskConfig, progress: Any = None) -> RepoSetup:
     _install_commit_hook(repo_dir)
 
     # Ensure the cloned HEAD sha is captured for NON-PR workflows too (the PR
-    # branch above already set it). A read-only planner echoes this
-    # into its plan's ``repo_digest_sha`` so a later revise run can tell if the
-    # repo moved since the digest was built. Best-effort: a read failure leaves it
-    # '' (the platform's sha-shape guard then just treats the digest as
-    # un-versioned — trust-but-reverify).
+    # branch above already set it), so a read-only workflow still reports the
+    # commit its output was derived from. Best-effort: a read failure leaves it
+    # '' and downstream consumers treat the result as un-versioned
+    # (trust-but-reverify).
     if not head_sha_before:
         head_res = run_cmd(
             ["git", "rev-parse", "HEAD"],

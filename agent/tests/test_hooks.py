@@ -1914,7 +1914,8 @@ class TestStuckGuardHookIntegration:
 
     def test_between_turns_hook_latches_stuck_summary_from_the_guard(self):
         # Pin the PRODUCTION write path for the _LAST_STUCK_SUMMARY latch
-        # (hooks.py:1464-1465). The enrichment tests monkeypatch the getter, so
+        # (the ``global _LAST_STUCK_SUMMARY`` assignment in the between-turns
+        # hook in ``hooks.py``). The enrichment tests monkeypatch the getter, so
         # without this test deleting those two lines would leave the latch
         # permanently None and every test would still pass. Drive the real hook
         # with a failure-dominated guard and assert the module latch is populated.

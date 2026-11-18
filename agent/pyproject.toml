@@ -8,7 +8,7 @@ dependencies = [
     # Vestigial from the parked AgentCore Identity flow (Phase 2.0a).
     # Phase 2.0b reads per-workspace Linear OAuth tokens directly from
     # Secrets Manager because AgentCore Identity's USER_FEDERATION
-    # flow has an open service-side bug (see memory/project_oauth_2_0b.md).
+    # flow has an open service-side bug.
     # Kept here so the workload-token bridge in `server.py` still
     # imports cleanly when Phase 2.0c eventually resumes the
     # AgentCore Identity path. The bridge is now wrapped in

@@ -871,14 +871,14 @@ describe('watch command — polling', () => {
   test('SIGINT after terminal status lands still honors exit 130 (POSIX contract)', async () => {
     // If the user Ctrl+Cs between onTerminal firing and the command
     // resolving, their intent to interrupt is the load-bearing signal.
-    // The ``signal.aborted`` check must come before ``finalStatus`` so
+    // The ``signal.aborted`` check must come before ``finalTask`` so
     // shells see 130, not 0.
     mockGetTaskEvents
       .mockResolvedValueOnce({ data: [], pagination: { next_token: null, has_more: false } }) // snapshot
       .mockResolvedValueOnce({ data: [], pagination: { next_token: null, has_more: false } }); // first poll
 
     // Task returns COMPLETED on first poll; we abort during the
-    // task-detail call so ``finalStatus`` AND ``signal.aborted`` are
+    // task-detail call so ``finalTask`` AND ``signal.aborted`` are
     // both set by the time runPolling evaluates its exit-code block.
     mockGetTask
       .mockResolvedValueOnce({ status: 'RUNNING' }) // snapshot

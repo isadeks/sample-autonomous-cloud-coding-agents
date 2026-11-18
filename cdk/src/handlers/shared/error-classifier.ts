@@ -498,7 +498,7 @@ const PATTERNS: readonly ErrorPattern[] = [
   //   - ``agent_status=error_max_turns`` — ``agent/src/pipeline.py``
   //     (``_resolve_overall_task_status``); and
   //   - ``Agent session error (subtype='error_max_turns')`` —
-  //     ``agent/src/runner.py:515`` (the terminal-error path).
+  //     ``agent/src/runner.py`` (the terminal-error path in ``run_agent``).
   // Keying on only ``agent_status=`` missed the ``subtype=`` wrapper, so a
   // real max-turns failure fell through to UNKNOWN → "Unexpected error"
   // (observed in practice: a task hit the 100-turn cap but the reply

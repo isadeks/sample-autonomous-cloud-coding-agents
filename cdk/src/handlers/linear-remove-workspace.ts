@@ -33,10 +33,12 @@ const ddb = makeDocClient();
 const sm = makeClient(SecretsManagerClient);
 
 // Left `string | undefined` — matching every other reader of this same var
-// (`linear-webhook.ts:41`, `linear-webhook-processor.ts:88`,
-// `orchestration-reconciler.ts:96`, `github-webhook-processor.ts:61`) — and
-// guarded once inside the handler. A `!` would assert away a deploy misconfig
-// and surface it as an opaque `TableName: undefined` SDK error instead.
+// (`linear-webhook.ts`, `linear-webhook-processor.ts`,
+// `orchestration-reconciler.ts`, `github-webhook-processor.ts`, each via its own
+// module-level `const` off `process.env.LINEAR_WORKSPACE_REGISTRY_TABLE_NAME`) —
+// and guarded once inside the handler. A `!` would assert away a deploy
+// misconfig and surface it as an opaque `TableName: undefined` SDK error
+// instead.
 const WORKSPACE_REGISTRY_TABLE = process.env.LINEAR_WORKSPACE_REGISTRY_TABLE_NAME;
 
 /** Same slug shape the CLI enforces (`SLUG_RE` in cli/src/commands/linear.ts). */
@@ -67,10 +69,10 @@ const ADMIN_REMOVED_REVOCATION_REASON: LinearRevocationReason = 'admin_removed';
  * Duplicated as a literal rather than imported, and that is deliberate — the
  * three other definitions live in places a bundled Lambda handler must not
  * import from: `cli/src/linear-oauth.ts` (`LINEAR_OAUTH_SECRET_PREFIX`, a
- * different package), `cdk/src/constructs/linear-identity-vault.ts:51`
+ * different package), `cdk/src/constructs/linear-identity-vault.ts`
  * (`LINEAR_CREDENTIAL_PROVIDER_PREFIX`, would drag `aws-cdk-lib` into the
  * function bundle), and the IAM resource pattern
- * `bgagent-linear-oauth-*` at `linear-integration.ts:519`, which is what
+ * `bgagent-linear-oauth-*` in `linear-integration.ts`, which is what
  * makes the by-name delete permitted. Changing the convention means changing
  * all four.
  */
@@ -111,8 +113,9 @@ interface RemoveWorkspaceResponseBody {
  *      `revoked_reason='admin_removed'`. The OAuth resolver refuses any
  *      non-active row (`shared/linear-oauth-resolver.ts`) with one documented
  *      exception — a `revoked` row whose reason is `vault_consent_required` is
- *      re-probed rather than refused (`:392-394`). `admin_removed` is
- *      deliberately not that reason, so an admin removal is terminal: the
+ *      re-probed rather than refused (`clearWorkspaceRevocation`).
+ *      `admin_removed` is deliberately not that reason, so an admin removal is
+ *      terminal: the
  *      workspace stops resolving tokens and routing webhooks the instant this
  *      write lands, and no later vault probe can un-latch it.
  *   2. Delete the per-workspace `bgagent-linear-oauth-<slug>` secret so no
@@ -203,13 +206,13 @@ export async function handler(event: APIGatewayProxyEvent): Promise<APIGatewayPr
     // the registry holds more than one row). We follow the continuation key
     // until a match or key exhaustion (not to completion — the loop stops on
     // the first match), matching the paginated small-table scan of this same
-    // registry shape in `shared/jira-tenant-registry.ts:32-46`, which is
-    // also where the `ConsistentRead` precedent comes from. The registry
-    // holds one row per onboarded workspace and stays small (tens of rows at
-    // most); if it ever grows large, add a GSI on `workspace_slug` and Query
-    // it. (`shared/linear-issue-lookup.ts:131-136` scans this table
-    // *without* pagination — a counter-example, not the precedent, and worth
-    // its own fix.)
+    // registry shape in `shared/jira-tenant-registry.ts`
+    // (`resolveSoleActiveJiraTenant`), which is also where the `ConsistentRead`
+    // precedent comes from. The registry holds one row per onboarded workspace
+    // and stays small (tens of rows at most); if it ever grows large, add a GSI
+    // on `workspace_slug` and Query it. (`findLinearIssueByIdentifier` in
+    // `shared/linear-issue-lookup.ts` scans this table *without* pagination — a
+    // counter-example, not the precedent, and worth its own fix.)
     let row: Record<string, unknown> | undefined;
     let scanKey: Record<string, unknown> | undefined;
     let pages = 0;
@@ -275,8 +278,9 @@ export async function handler(event: APIGatewayProxyEvent): Promise<APIGatewayPr
     // deleting the secret, rather than deleting the row outright. This is
     // deliberate: the OAuth resolver refuses a non-active row — and
     // `revoked_reason='admin_removed'` is specifically not the one reason it
-    // re-probes instead of refusing (`linear-oauth-resolver.ts:392-394`) — so
-    // the workspace stops resolving tokens and routing webhooks the instant
+    // re-probes instead of refusing (see `clearWorkspaceRevocation` in
+    // `linear-oauth-resolver.ts`) — so the workspace stops resolving tokens
+    // and routing webhooks the instant
     // this write lands, terminally. It also keeps the row present through the
     // secret-delete step, so a failure there can persist a durable
     // orphaned-secret marker on the row (see `markSecretDeletionFailed`).

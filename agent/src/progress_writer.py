@@ -733,9 +733,9 @@ class _ProgressWriter:
     # Lambda-side audit event (written by ApproveTaskFn / DenyTaskFn directly
     # to TaskEventsTable in Chunk 5). See IMPL-6.
     #
-    # ``approval_timeout_capped_at_submit`` is emitted by CreateTaskFn and
-    # also lives on the Lambda side (Chunk 5). Agent-side helpers cover the
-    # 14 events the agent runtime emits.
+    # ``approval_timeout_capped_at_submit`` is assigned to CreateTaskFn by the
+    # design (§11.1) and would live on the Lambda side; it is not implemented
+    # yet. Agent-side helpers cover the 14 events the agent runtime emits.
 
     def _put_approval_milestone(self, milestone: str, metadata: dict) -> None:
         """Emit an ``agent_milestone`` with ``milestone`` + extra metadata.
